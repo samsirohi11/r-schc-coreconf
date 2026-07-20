@@ -15,7 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 RSCHC = ROOT / "deps" / "r-schc"
 OUT = ROOT / "fixtures" / "managed"
 PINNED_RSCHC = "cf0b9bc"
-PINNED_RUSTCONF = "5dd52d4"
+PINNED_RUSTCONF = "1611ec1"
 FIXTURES = {
     "ietf-schc@2026-05-07.sid": (
         "fixtures/core/ietf-schc@2026-05-07.sid",
