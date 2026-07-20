@@ -1,0 +1,6 @@
+[submodule "deps/r-schc"]
+	path = deps/r-schc
+	url = https://github.com/samsirohi11/r-schc.git
+[submodule "deps/rustconf"]
+	path = deps/rustconf
+	url = https://github.com/samsirohi11/rustconf.git

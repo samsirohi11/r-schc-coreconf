@@ -1,0 +1,7 @@
+{
+  "protected_rule_ids": [
+    {"value": 16, "bit_len": 8},
+    {"value": 17, "bit_len": 8}
+  ],
+  "note": "Foundation fixture policy only. These slots exercise immutable policy; this is not the final four-M-Rule Work Order 1 SoR."
+}
