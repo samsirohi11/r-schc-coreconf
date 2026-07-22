@@ -7,9 +7,9 @@ use crate::{ContextError, Result};
 /// Explicit protected `RuleIDs` in addition to rules whose nature is management.
 ///
 /// The default policy derives protected IDs from `nature-management` rules.
-/// Explicit IDs are useful for the deterministic foundation fixture, which uses
-/// current dependency rules as protected slots without claiming to be the final
-/// four-M-Rule Work Order 1 `SoR`.
+/// Explicit IDs are useful for the deterministic demonstration fixture because
+/// rule2sor 0.1.0 emits compression nature for its `OpenSCHC` `Compression`
+/// entries and has no management-nature JSON key.
 #[derive(Debug, Clone, Default, Eq, PartialEq)]
 pub struct ProtectionPolicy {
     pub(crate) ids: Vec<RuleId>,

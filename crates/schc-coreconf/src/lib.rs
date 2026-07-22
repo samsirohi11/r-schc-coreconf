@@ -139,8 +139,8 @@ pub fn derive_protected_management_rule_ids(sid_json: &str, sor: &[u8]) -> Resul
 mod tests {
     use super::*;
 
-    const SID: &str = include_str!("../../../fixtures/managed/ietf-schc@2026-05-07.sid");
-    const SOR: &[u8] = include_bytes!("../../../fixtures/managed/core.sor");
+    const SID: &str = include_str!("../../../fixtures/demo/ietf-schc@2026-05-07.sid");
+    const SOR: &[u8] = include_bytes!("../../../fixtures/demo/initial.sor");
 
     #[test]
     fn fixture_loads_through_both_models_and_is_deterministic() {

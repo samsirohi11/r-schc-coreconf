@@ -1,4 +1,4 @@
-//! Integration coverage for the managed-context foundation.
+//! Integration coverage for the deterministic demonstration contexts.
 
 use std::sync::{Arc, Barrier};
 use std::thread;
@@ -18,30 +18,18 @@ use sha2::Digest;
 
 type Mutation = Box<dyn Fn(&mut Value)>;
 
-const SID: &str = include_str!("../../../fixtures/managed/ietf-schc@2026-05-07.sid");
-const SOR: &[u8] = include_bytes!("../../../fixtures/managed/core.sor");
+const SID: &str = include_str!("../../../fixtures/demo/ietf-schc@2026-05-07.sid");
+const SOR: &[u8] = include_bytes!("../../../fixtures/demo/initial.sor");
 
 fn device() -> DeviceId {
     DeviceId::new("foundation-integration-device").expect("device")
 }
 
 fn policy() -> ProtectionPolicy {
-    let document: Value =
-        serde_json::from_str(include_str!("../../../fixtures/managed/policy.json"))
-            .expect("fixture policy");
-    ProtectionPolicy::from_rule_ids(
-        document["protected_rule_ids"]
-            .as_array()
-            .expect("protected_rule_ids array")
-            .iter()
-            .map(|entry| {
-                RuleId::new(
-                    entry["value"].as_u64().expect("RuleID value"),
-                    usize::try_from(entry["bit_len"].as_u64().expect("RuleID bit length"))
-                        .expect("RuleID bit length fits usize"),
-                )
-            }),
-    )
+    // rule2sor 0.1.0 emits compression nature for every OpenSCHC
+    // Compression rule, including management traffic. Protection is therefore
+    // an integration policy over the exact 16/8 and 17/8 identities.
+    ProtectionPolicy::from_rule_ids([RuleId::new(16, 8), RuleId::new(17, 8)])
 }
 
 fn prepared() -> PreparedContext {
@@ -73,7 +61,7 @@ fn binary_values_round_trip_losslessly_through_both_models() {
     let (tree, canonical_sor) = canonicalize_sor(SID, SOR).expect("canonical");
     let rebuilt = canonical_sor_from_tree(SID, &tree).expect("re-encode");
     assert_eq!(canonical_sor, rebuilt);
-    assert!(tree["ietf-schc:schc"]["rule"][0]["entry"][22]["target-value"][0]["value"].is_string());
+    assert!(tree["ietf-schc:schc"]["rule"][0]["entry"][19]["target-value"][0]["value"].is_string());
 }
 
 #[test]
@@ -97,7 +85,7 @@ fn management_nature_derives_immutable_protected_rule_ids() {
     let sor = canonical_sor_from_tree(SID, &tree).expect("managed SoR");
     assert_eq!(
         derive_protected_management_rule_ids(SID, &sor).expect("derived IDs"),
-        vec![RuleId::new(18, 8)]
+        vec![RuleId::new(20, 8)]
     );
 }
 
