@@ -1,8 +1,9 @@
 use std::fmt;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use arc_swap::ArcSwap;
-use coreconf_model::CoreconfModel;
+use coreconf_model::{CoreconfError, CoreconfModel};
+use coreconf_runtime::Backend;
 use schc_core::{RuleContext, RuleId, SidRegistry};
 use schc_runtime::{DeviceId, DeviceProfile, Runtime};
 use serde_json::Value;
@@ -11,7 +12,6 @@ use crate::codec::{
     digest_context, encode_tree, ensure_schc_root, normalize_tree, strict_cbor_value,
 };
 use crate::policy::{ProtectedRules, ProtectionPolicy};
-use crate::transaction::TransactionState;
 use crate::{ContextError, Result};
 
 /// A fully loaded, canonical SCHC/rustconf context before runtime binding.
@@ -134,7 +134,7 @@ pub(crate) struct ContextRecipe {
 }
 
 /// A prepared context bound to one canonical tree, `SoR`, runtime, and digest.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct PreparedContext {
     pub(crate) recipe: ContextRecipe,
     pub(crate) tree: Arc<Value>,
@@ -142,21 +142,6 @@ pub struct PreparedContext {
     runtime: Arc<Runtime>,
     pub(crate) protected: ProtectedRules,
     digest: [u8; 32],
-    pub(crate) base_digest: Option<[u8; 32]>,
-}
-
-impl Clone for PreparedContext {
-    fn clone(&self) -> Self {
-        Self {
-            recipe: self.recipe.clone(),
-            tree: Arc::clone(&self.tree),
-            sor: Arc::clone(&self.sor),
-            runtime: Arc::clone(&self.runtime),
-            protected: self.protected.clone(),
-            digest: self.digest,
-            base_digest: self.base_digest,
-        }
-    }
 }
 
 impl PreparedContext {
@@ -209,8 +194,8 @@ impl PreparedContext {
     /// Builds a prepared context from an identifier-keyed canonical tree.
     ///
     /// A candidate must already use canonical list ordering. This strictness
-    /// prevents the rustconf committed tree from diverging from the active
-    /// SCHC snapshot after a successful transaction.
+    /// prevents the rustconf datastore tree from diverging from the active
+    /// SCHC snapshot after a successful publication.
     ///
     /// # Errors
     ///
@@ -261,7 +246,6 @@ impl PreparedContext {
             runtime: Arc::new(runtime),
             protected: loaded.protected,
             digest,
-            base_digest: None,
         })
     }
 
@@ -317,11 +301,6 @@ impl PreparedContext {
             write!(&mut output, "{byte:02x}").expect("writing to String cannot fail");
         }
         output
-    }
-
-    pub(crate) fn with_base_digest(mut self, digest: [u8; 32]) -> Self {
-        self.base_digest = Some(digest);
-        self
     }
 }
 
@@ -391,15 +370,16 @@ impl ContextSnapshot {
     }
 }
 
-/// Atomic immutable active-context publisher.
+/// Atomic immutable active-context publisher and rustconf backend source.
 ///
-/// The `ArcSwap` is private by design. The only mutation path is the shared
-/// transaction coordinator used by local participants, which publishes after
-/// rustconf has committed the matching candidate tree.
+/// The `ArcSwap` is private by design. An [`ActiveContextBackend`] reads from
+/// this publisher and validates complete candidate trees while holding the
+/// writer lock, then publishes one immutable tuple. There is no detached
+/// datastore tree or pending transaction state.
 pub struct ActiveContext {
     snapshot: ArcSwap<ContextSnapshot>,
     recipe: ContextRecipe,
-    pub(crate) transaction: Mutex<TransactionState>,
+    pub(crate) writer: Mutex<()>,
 }
 
 impl fmt::Debug for ActiveContext {
@@ -422,7 +402,7 @@ impl ActiveContext {
         Self {
             snapshot: ArcSwap::from_pointee(snapshot),
             recipe,
-            transaction: Mutex::new(TransactionState::Idle),
+            writer: Mutex::new(()),
         }
     }
 
@@ -456,10 +436,18 @@ impl ActiveContext {
         self.snapshot.load().sor().to_vec()
     }
 
-    /// Creates a participant sharing this context's transaction reservation.
+    /// Creates a rustconf backend whose datastore tree is this active context.
+    ///
+    /// Construct a rustconf [`coreconf_runtime::Datastore`] with the returned
+    /// backend, rather than copying [`Self::tree`]. Each backend handle tracks
+    /// the snapshot it read and rejects a stale replacement, so concurrent
+    /// request handlers cannot overwrite a later publication.
     #[must_use]
-    pub fn participant(self: &Arc<Self>) -> crate::ContextParticipant {
-        crate::ContextParticipant::new(Arc::clone(self))
+    pub fn backend(self: &Arc<Self>) -> ActiveContextBackend {
+        ActiveContextBackend {
+            active: Arc::clone(self),
+            observed: Mutex::new(Some(self.digest())),
+        }
     }
 
     pub(crate) fn publish_locked(&self, prepared: &PreparedContext) {
@@ -478,24 +466,97 @@ impl ActiveContext {
         &self.recipe
     }
 
-    pub(crate) fn validate_prepared(&self, prepared: &PreparedContext) -> Result<()> {
-        if prepared.base_digest != Some(self.digest()) {
-            return Err(ContextError::StalePreparation);
-        }
+    pub(crate) fn validate_candidate(
+        &self,
+        current: &ContextSnapshot,
+        prepared: &PreparedContext,
+    ) -> Result<()> {
         if prepared.recipe.sid_json != self.recipe.sid_json
             || prepared.recipe.device_id != self.recipe.device_id
             || prepared.recipe.profile != self.recipe.profile
             || prepared.recipe.policy != self.recipe.policy
         {
-            return Err(ContextError::StalePreparation);
+            return Err(ContextError::CandidateRecipeMismatch);
         }
         let canonical_sor = crate::canonical_sor_from_tree(&self.recipe.sid_json, prepared.tree())?;
         if canonical_sor != prepared.sor() {
             return Err(ContextError::NonCanonicalCandidate);
         }
-        self.snapshot
-            .load()
+        current
             .protected_rules()
-            .enforce(&prepared.protected)
+            .enforce(prepared.protected_rules())
     }
+}
+
+/// A rustconf [`coreconf_runtime::Backend`] backed by one [`ActiveContext`].
+///
+/// Reads return the active snapshot's canonical tree. Replacements use
+/// compare-and-swap semantics: the backend records the digest observed by its
+/// last read (or at backend construction), acquires the active writer lock,
+/// rebuilds and validates the full candidate context, and publishes only after
+/// all checks and runtime construction succeed. A failed replacement records no
+/// pending candidate and leaves the previous immutable tuple untouched.
+pub struct ActiveContextBackend {
+    active: Arc<ActiveContext>,
+    observed: Mutex<Option<[u8; 32]>>,
+}
+
+impl fmt::Debug for ActiveContextBackend {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ActiveContextBackend")
+            .field("active_generation", &self.active.generation())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Backend for ActiveContextBackend {
+    fn read_tree(&self) -> Value {
+        let snapshot = self.active.snapshot();
+        *lock_observed(&self.observed) = Some(snapshot.digest());
+        snapshot.tree().clone()
+    }
+
+    fn replace_tree(&mut self, next: Value) -> coreconf_model::Result<()> {
+        let mut observed = lock_observed(&self.observed);
+        let _writer = lock_writer(&self.active.writer);
+        let current = self.active.snapshot();
+        if *observed != Some(current.digest()) {
+            return Err(CoreconfError::ValidationError(
+                "active context changed while candidate was being built".to_owned(),
+            ));
+        }
+
+        let recipe = self.active.recipe();
+        let prepared = PreparedContext::from_tree(
+            &recipe.sid_json,
+            next,
+            recipe.device_id.clone(),
+            recipe.profile.clone(),
+            recipe.policy.clone(),
+        )
+        .map_err(|error| backend_error(&error))?;
+        self.active
+            .validate_candidate(&current, &prepared)
+            .map_err(|error| backend_error(&error))?;
+        self.active.publish_locked(&prepared);
+        *observed = Some(prepared.digest());
+        Ok(())
+    }
+}
+
+fn backend_error(error: &ContextError) -> CoreconfError {
+    CoreconfError::ValidationError(format!("schc-coreconf backend rejected candidate: {error}"))
+}
+
+fn lock_observed(state: &Mutex<Option<[u8; 32]>>) -> MutexGuard<'_, Option<[u8; 32]>> {
+    state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn lock_writer(state: &Mutex<()>) -> MutexGuard<'_, ()> {
+    state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }

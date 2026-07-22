@@ -10,11 +10,11 @@
 mod codec;
 mod context;
 mod policy;
-mod transaction;
 
-pub use context::{ActiveContext, ContextSnapshot, LoadedContext, PreparedContext};
+pub use context::{
+    ActiveContext, ActiveContextBackend, ContextSnapshot, LoadedContext, PreparedContext,
+};
 pub use policy::{ProtectedRule, ProtectedRules, ProtectionPolicy};
-pub use transaction::ContextParticipant;
 
 use coreconf_model::{CoreconfError, SidFile};
 use schc_core::{RuleId, SidRegistry};
@@ -42,15 +42,10 @@ pub enum ContextError {
     /// A protected rule was added, removed, re-identified, re-natured, or changed.
     #[error("protected management rule changed: {0}")]
     ProtectedRuleChanged(String),
-    /// A transaction was not the local root iPATCH shape supported here.
-    #[error("unsupported transaction: {0}")]
-    UnsupportedTransaction(String),
-    /// A preparation or backend-pending reservation is already occupied.
-    #[error("a prepared context is already pending")]
-    PreparationBusy,
-    /// Publication was attempted after the active context changed.
-    #[error("prepared context is stale")]
-    StalePreparation,
+    /// Candidate runtime or construction parameters differ from the active
+    /// context's immutable construction parameters.
+    #[error("candidate construction parameters differ from the active context")]
+    CandidateRecipeMismatch,
     /// A rustconf operation failed.
     #[error("rustconf error: {0}")]
     Rustconf(#[from] CoreconfError),

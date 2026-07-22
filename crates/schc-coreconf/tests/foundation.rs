@@ -3,14 +3,14 @@
 use std::sync::{Arc, Barrier};
 use std::thread;
 
-use coreconf_model::{CoreconfError, CoreconfModel, Instance, InstancePath};
+use coreconf_model::{CoreconfModel, Instance, InstancePath};
 use coreconf_runtime::{
-    Backend, ContentFormat, Datastore, Interface, Method, Request, RequestHandler, ResponseCode,
+    ContentFormat, Datastore, Interface, Method, Request, RequestHandler, ResponseCode,
 };
 use schc_core::{RuleContext, RuleId, SidRegistry};
 use schc_coreconf::{
     canonical_sor_from_tree, canonicalize_sor, derive_protected_management_rule_ids, tree_from_sor,
-    ActiveContext, ContextError, ContextParticipant, PreparedContext, ProtectionPolicy,
+    ActiveContext, ContextError, PreparedContext, ProtectionPolicy,
 };
 use schc_runtime::{DeviceId, DeviceProfile};
 use serde_json::Value;
@@ -62,23 +62,10 @@ fn root_ipatch_payload(tree: &Value) -> Vec<u8> {
         .expect("root iPATCH payload")
 }
 
-fn handler_with_participant(active: &Arc<ActiveContext>) -> (RequestHandler, ContextParticipant) {
-    let participant = active.participant();
-    (
-        handler_for_participant(active, participant.clone()),
-        participant,
-    )
-}
-
-fn handler_for_participant(
-    active: &Arc<ActiveContext>,
-    participant: ContextParticipant,
-) -> RequestHandler {
+fn handler_for_active(active: &Arc<ActiveContext>) -> RequestHandler {
     let model = CoreconfModel::from_sid_str(SID).expect("model");
-    let datastore = Datastore::with_data(model, active.tree());
-    let mut handler = RequestHandler::new(datastore);
-    handler.register_transaction_participant(Box::new(participant));
-    handler
+    let datastore = Datastore::with_backend(model.composite_model().clone(), active.backend());
+    RequestHandler::new(datastore)
 }
 
 #[test]
@@ -148,12 +135,9 @@ fn rejected_protected_commit_leaves_everything_unchanged() {
     let initial = prepared();
     let active = Arc::new(ActiveContext::new(initial.clone()));
     let before = active.snapshot();
-    let (mut handler, participant) = handler_with_participant(&active);
+    let mut handler = handler_for_active(&active);
     let mut candidate = initial.tree().clone();
     candidate["ietf-schc:schc"]["rule"][0]["entry"][0]["field-position"] = Value::from(2);
-    participant
-        .prepare_tree(candidate.clone())
-        .expect("prepare");
     let request = Request::new(Method::IPatch)
         .with_interface(Interface::Management)
         .with_payload(
@@ -161,13 +145,12 @@ fn rejected_protected_commit_leaves_everything_unchanged() {
             ContentFormat::YangInstancesCborSeq,
         );
     let response = handler.handle(&request);
-    assert_eq!(response.code, ResponseCode::Conflict);
+    assert_eq!(response.code, ResponseCode::InternalServerError);
     assert_eq!(handler.datastore().get_all(), initial.tree().clone());
     assert_eq!(active.tree(), initial.tree().clone());
     assert_eq!(active.generation(), 1);
     assert_eq!(active.digest(), initial.digest());
     assert!(Arc::ptr_eq(&before, &active.snapshot()));
-    assert!(!participant.has_prepared());
 }
 
 #[test]
@@ -187,13 +170,7 @@ fn mixed_root_ipatch_failure_is_atomic() {
     payload.extend(
         coreconf_model::instance_id::encode_instances(&[invalid]).expect("invalid payload"),
     );
-    let mut handler = RequestHandler::new(Datastore::with_data(
-        CoreconfModel::from_sid_str(SID).expect("model"),
-        initial.tree().clone(),
-    ));
-    let participant = active.participant();
-    participant.prepare(initial.clone()).expect("preparation");
-    handler.register_transaction_participant(Box::new(participant));
+    let mut handler = handler_for_active(&active);
     let response = handler.handle(
         &Request::new(Method::IPatch)
             .with_interface(Interface::Management)
@@ -252,22 +229,20 @@ fn every_protected_lifecycle_mutation_is_rejected() {
     for (name, mutate) in cases {
         let initial = prepared();
         let active = Arc::new(ActiveContext::new(initial.clone()));
-        let (mut handler, participant) = handler_with_participant(&active);
+        let mut handler = handler_for_active(&active);
         let mut candidate = initial.tree().clone();
         mutate(&mut candidate);
-        if participant.prepare_tree(candidate.clone()).is_ok() {
-            let request = Request::new(Method::IPatch)
-                .with_interface(Interface::Management)
-                .with_payload(
-                    root_ipatch_payload(&candidate),
-                    ContentFormat::YangInstancesCborSeq,
-                );
-            assert_eq!(
-                handler.handle(&request).code,
-                ResponseCode::Conflict,
-                "{name}"
+        let request = Request::new(Method::IPatch)
+            .with_interface(Interface::Management)
+            .with_payload(
+                root_ipatch_payload(&candidate),
+                ContentFormat::YangInstancesCborSeq,
             );
-        }
+        assert_eq!(
+            handler.handle(&request).code,
+            ResponseCode::InternalServerError,
+            "{name}"
+        );
         assert_eq!(active.generation(), 1, "{name}");
         assert_eq!(active.tree(), initial.tree().clone(), "{name}");
         assert_eq!(active.digest(), initial.digest(), "{name}");
@@ -280,16 +255,29 @@ fn every_protected_lifecycle_mutation_is_rejected() {
 }
 
 #[test]
-fn valid_local_root_ipatch_publishes_once_as_one_tuple() {
+fn active_backend_datastore_is_live_source_of_truth() {
     let initial = prepared();
     let active = Arc::new(ActiveContext::new(initial.clone()));
-    let (mut handler, participant) = handler_with_participant(&active);
+    let model = CoreconfModel::from_sid_str(SID).expect("model");
+    let mut datastore = Datastore::with_backend(model.composite_model().clone(), active.backend());
+    assert_eq!(datastore.get_all(), initial.tree().clone());
     let mut candidate = initial.tree().clone();
     candidate["ietf-schc:schc"]["rule"][2]["entry"][0]["target-value"][0]["value"] =
         Value::String("Bw==".to_owned());
-    participant
-        .prepare_tree(candidate.clone())
-        .expect("prepare");
+    datastore.replace_tree(candidate.clone()).expect("publish");
+    assert_eq!(datastore.get_all(), candidate);
+    assert_eq!(active.tree(), candidate);
+    assert_eq!(active.generation(), 2);
+}
+
+#[test]
+fn valid_local_root_ipatch_publishes_once_as_one_tuple() {
+    let initial = prepared();
+    let active = Arc::new(ActiveContext::new(initial.clone()));
+    let mut handler = handler_for_active(&active);
+    let mut candidate = initial.tree().clone();
+    candidate["ietf-schc:schc"]["rule"][2]["entry"][0]["target-value"][0]["value"] =
+        Value::String("Bw==".to_owned());
     let request = Request::new(Method::IPatch)
         .with_interface(Interface::Management)
         .with_payload(
@@ -309,10 +297,8 @@ fn valid_local_root_ipatch_publishes_once_as_one_tuple() {
         canonical_sor_from_tree(SID, &candidate).unwrap()
     );
     assert_eq!(snapshot.runtime().device_id().as_str(), device().as_str());
-    assert!(!participant.has_prepared());
 
-    // There is no second prepared slot and no second publication from the
-    // already-consumed commit.
+    // A successful request publishes one complete tuple exactly once.
     assert_eq!(active.generation(), 2);
 }
 
@@ -338,127 +324,51 @@ fn digest_changes_only_when_canonical_context_changes() {
 }
 
 fn run_competing_writer(
-    handler: RequestHandler,
-    participant: ContextParticipant,
+    active: Arc<ActiveContext>,
     candidate: Value,
     barrier: Arc<Barrier>,
-) -> thread::JoinHandle<(bool, ResponseCode, Value, String)> {
+) -> thread::JoinHandle<(bool, Value, String)> {
     thread::spawn(move || {
+        let model = CoreconfModel::from_sid_str(SID).expect("model");
+        let mut datastore =
+            Datastore::with_backend(model.composite_model().clone(), active.backend());
+        let _base = datastore.get_all();
         barrier.wait();
-        let prepared = participant.prepare_tree(candidate.clone()).is_ok();
         barrier.wait();
-        let response = handler_with_request(handler, &candidate);
-        (prepared, response.code, response.datastore, response.error)
+        let result = datastore.replace_tree(candidate);
+        let success = result.is_ok();
+        let error = result.map_or_else(|error| error.to_string(), |()| String::new());
+        (success, datastore.get_all(), error)
     })
 }
 
-fn handler_with_request(mut handler: RequestHandler, candidate: &Value) -> HandlerResult {
-    let response = handler.handle(
-        &Request::new(Method::IPatch)
-            .with_interface(Interface::Management)
-            .with_payload(
-                root_ipatch_payload(candidate),
-                ContentFormat::YangInstancesCborSeq,
-            ),
-    );
-    HandlerResult {
-        code: response.code,
-        datastore: handler.datastore().get_all(),
-        error: String::from_utf8_lossy(&response.payload).into_owned(),
-    }
-}
-
-struct HandlerResult {
-    code: ResponseCode,
-    datastore: Value,
-    error: String,
-}
-
-struct FailingBackend {
-    tree: Value,
-}
-
-impl Backend for FailingBackend {
-    fn read_tree(&self) -> Value {
-        self.tree.clone()
-    }
-
-    fn replace_tree(&mut self, _next: Value) -> coreconf_model::Result<()> {
-        Err(CoreconfError::Io(std::io::Error::other(
-            "backend publication failed",
-        )))
-    }
-}
-
 #[test]
-fn failed_backend_commit_stays_pending_until_manual_reset() {
+fn invalid_backend_candidate_has_no_hidden_pending_state() {
     let initial = prepared();
     let active = Arc::new(ActiveContext::new(initial.clone()));
-    let participant = active.participant();
-    let mut candidate = initial.tree().clone();
-    candidate["ietf-schc:schc"]["rule"][2]["entry"][0]["target-value"][0]["value"] =
-        Value::String("Bw==".to_owned());
-    participant
-        .prepare_tree(candidate.clone())
-        .expect("prepare candidate");
-
     let model = CoreconfModel::from_sid_str(SID).expect("model");
-    let datastore = Datastore::with_backend(
-        model.composite_model().clone(),
-        FailingBackend {
-            tree: initial.tree().clone(),
-        },
-    );
-    let mut handler = RequestHandler::new(datastore);
-    handler.register_transaction_participant(Box::new(participant.clone()));
-    let response = handler.handle(
-        &Request::new(Method::IPatch)
-            .with_interface(Interface::Management)
-            .with_payload(
-                root_ipatch_payload(&candidate),
-                ContentFormat::YangInstancesCborSeq,
-            ),
-    );
-
-    assert_eq!(response.code, ResponseCode::InternalServerError);
-    assert_eq!(handler.datastore().get_all(), initial.tree().clone());
-    assert_eq!(active.tree(), initial.tree().clone());
+    let mut datastore = Datastore::with_backend(model.composite_model().clone(), active.backend());
+    let mut invalid = initial.tree().clone();
+    invalid["ietf-schc:schc"]["rule"][0]["entry"][0]["field-position"] = Value::from(2);
+    assert!(datastore.replace_tree(invalid).is_err());
     assert_eq!(active.generation(), 1);
-    assert!(!participant.has_prepared());
-    assert!(participant.has_pending());
-    assert!(matches!(
-        participant.prepare_tree(candidate.clone()),
-        Err(ContextError::PreparationBusy)
-    ));
+    assert_eq!(active.tree(), initial.tree().clone());
+    assert_eq!(active.digest(), initial.digest());
 
-    participant.clear_prepared();
-    assert!(participant.has_pending());
-    participant.reset_transaction();
-    assert!(!participant.has_pending());
-    participant
-        .prepare_tree(candidate)
-        .expect("manual reset releases pending reservation");
+    let mut valid = initial.tree().clone();
+    valid["ietf-schc:schc"]["rule"][2]["entry"][0]["target-value"][0]["value"] =
+        Value::String("Bw==".to_owned());
+    datastore
+        .replace_tree(valid.clone())
+        .expect("failed backend candidate leaves no pending state");
+    assert_eq!(active.generation(), 2);
+    assert_eq!(active.tree(), valid);
 }
 
 #[test]
-fn cloned_participants_have_one_barrier_controlled_publication() {
-    assert_shared_reservation_is_serialized(true);
-}
-
-#[test]
-fn separately_created_participants_have_one_barrier_controlled_publication() {
-    assert_shared_reservation_is_serialized(false);
-}
-
-fn assert_shared_reservation_is_serialized(clone_participant: bool) {
+fn concurrent_backend_writers_reject_stale_candidates_without_lost_updates() {
     let initial = prepared();
     let active = Arc::new(ActiveContext::new(initial.clone()));
-    let first = active.participant();
-    let second = if clone_participant {
-        first.clone()
-    } else {
-        active.participant()
-    };
     let mut first_candidate = initial.tree().clone();
     first_candidate["ietf-schc:schc"]["rule"][2]["entry"][0]["target-value"][0]["value"] =
         Value::String("Bw==".to_owned());
@@ -466,82 +376,20 @@ fn assert_shared_reservation_is_serialized(clone_participant: bool) {
     second_candidate["ietf-schc:schc"]["rule"][2]["entry"][0]["target-value"][0]["value"] =
         Value::String("CA==".to_owned());
     let barrier = Arc::new(Barrier::new(2));
-    let first_handler = handler_for_participant(&active, first.clone());
-    let second_handler = handler_for_participant(&active, second.clone());
     let first_thread =
-        run_competing_writer(first_handler, first, first_candidate, Arc::clone(&barrier));
-    let second_thread = run_competing_writer(
-        second_handler,
-        second,
-        second_candidate,
-        Arc::clone(&barrier),
-    );
-    let first_result = first_thread.join().expect("first writer");
-    let second_result = second_thread.join().expect("second writer");
-    let results = [first_result, second_result];
-    assert_eq!(
-        results.iter().filter(|result| result.0).count(),
-        1,
-        "results: {:?}",
-        results
-            .iter()
-            .map(|result| (&result.0, &result.1, &result.3))
-            .collect::<Vec<_>>()
-    );
-    assert_eq!(
-        results
-            .iter()
-            .filter(|result| result.1 == ResponseCode::Changed)
-            .count(),
-        1,
-        "results: {:?}",
-        results
-            .iter()
-            .map(|result| (&result.0, &result.1, &result.3))
-            .collect::<Vec<_>>()
-    );
-    assert_eq!(
-        results
-            .iter()
-            .filter(|result| result.1 == ResponseCode::Conflict)
-            .count(),
-        1
-    );
-    let winner = results
-        .iter()
-        .find(|result| result.1 == ResponseCode::Changed)
-        .expect("winner");
-    let loser = results
-        .iter()
-        .find(|result| result.1 == ResponseCode::Conflict)
-        .expect("busy loser");
-    assert!(winner.0);
-    assert!(!loser.0);
-    assert_eq!(loser.2, initial.tree().clone());
+        run_competing_writer(Arc::clone(&active), first_candidate, Arc::clone(&barrier));
+    let second_thread = run_competing_writer(active.clone(), second_candidate, barrier);
+    let results = [
+        first_thread.join().expect("first writer"),
+        second_thread.join().expect("second writer"),
+    ];
+    assert_eq!(results.iter().filter(|result| result.0).count(), 1);
+    assert_eq!(results.iter().filter(|result| !result.0).count(), 1);
     assert_eq!(active.generation(), 2);
-    assert_eq!(active.tree(), winner.2);
-    let snapshot = active.snapshot();
-    assert_eq!(snapshot.generation(), 2);
-    assert_eq!(snapshot.tree(), &winner.2);
-    assert_eq!(
-        snapshot.sor(),
-        canonical_sor_from_tree(SID, snapshot.tree()).unwrap()
-    );
-
-    // A later transaction proves that generation publication is monotonic and
-    // that the shared reservation was released exactly once by post_commit.
-    let mut next = active.tree();
-    next["ietf-schc:schc"]["rule"][2]["entry"][0]["target-value"][0]["value"] =
-        Value::String("CQ==".to_owned());
-    let next_participant = active.participant();
-    next_participant
-        .prepare_tree(next.clone())
-        .expect("next prepare");
-    let next_handler = handler_for_participant(&active, next_participant);
-    let next_result = handler_with_request(next_handler, &next);
-    assert_eq!(next_result.code, ResponseCode::Changed);
-    assert_eq!(active.generation(), 3);
-    assert_eq!(active.tree(), next_result.datastore);
+    let winner = results.iter().find(|result| result.0).expect("winner");
+    let loser = results.iter().find(|result| !result.0).expect("loser");
+    assert_eq!(active.tree(), winner.1);
+    assert!(loser.2.contains("active context changed"));
 }
 
 #[test]
