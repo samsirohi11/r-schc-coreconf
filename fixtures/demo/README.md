@@ -17,7 +17,7 @@ The optimized rule carries only the request residue, so later work can prove few
 
 The fixed logical addresses are `2001:db8::1` for the device and `2001:db8::2` for the application/core.
 Application traffic uses UDP port 5683.
-Protected management traffic uses UDP port 5684.
+Protected management requests use core/application-side UDP port 5683 and device-side UDP port 5684; responses reverse those endpoints.
 Application requests use CoAP GET code 1 and path `demo`.
 Management requests use path `schc`; their CoAP method code is carried so inspection and iPATCH share one protected request rule.
 Management response codes are also carried so content, changed, and error responses share one protected response rule.

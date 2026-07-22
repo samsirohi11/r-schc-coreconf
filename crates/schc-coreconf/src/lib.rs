@@ -9,10 +9,16 @@
 
 mod codec;
 mod context;
+mod packet;
 mod policy;
 
 pub use context::{
     ActiveContext, ActiveContextBackend, ContextSnapshot, LoadedContext, PreparedContext,
+};
+pub use packet::{
+    CoapMessage, CoapOption, Ipv6UdpCoapPacket, PacketError, PacketMetadata, PacketResult,
+    DEFAULT_FLOW_LABEL, DEFAULT_HOP_LIMIT, DEFAULT_TRAFFIC_CLASS, IPV6_HEADER_LEN, IPV6_VERSION,
+    MAX_COAP_DATAGRAM_LEN, UDP_HEADER_LEN, UDP_NEXT_HEADER,
 };
 pub use policy::{ProtectedRule, ProtectedRules, ProtectionPolicy};
 
