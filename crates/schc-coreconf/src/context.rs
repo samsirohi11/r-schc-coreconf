@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use arc_swap::ArcSwap;
 use coreconf_model::{CoreconfError, CoreconfModel};
 use coreconf_runtime::Backend;
-use schc_core::{RuleContext, RuleId, SidRegistry};
+use schc_core::{Rule, RuleContext, RuleId, SidRegistry};
 use schc_runtime::{DeviceId, DeviceProfile, Runtime};
 use serde_json::Value;
 
@@ -141,6 +141,7 @@ pub struct PreparedContext {
     pub(crate) sor: Arc<[u8]>,
     runtime: Arc<Runtime>,
     pub(crate) protected: ProtectedRules,
+    pub(crate) rule_ids: Arc<[RuleId]>,
     digest: [u8; 32],
 }
 
@@ -239,12 +240,22 @@ impl PreparedContext {
         )
         .map_err(|error| ContextError::Runtime(error.to_string()))?;
         let digest = digest_context(&loaded.tree, &loaded.sor)?;
+        let rule_ids = Arc::from(
+            loaded
+                .rule_context
+                .rules()
+                .rules()
+                .iter()
+                .map(Rule::id)
+                .collect::<Vec<_>>(),
+        );
         Ok(Self {
             recipe,
             tree: Arc::new(loaded.tree),
             sor: Arc::from(loaded.sor),
             runtime: Arc::new(runtime),
             protected: loaded.protected,
+            rule_ids,
             digest,
         })
     }
@@ -313,6 +324,7 @@ pub struct ContextSnapshot {
     generation: u64,
     digest: [u8; 32],
     protected: ProtectedRules,
+    rule_ids: Arc<[RuleId]>,
 }
 
 impl ContextSnapshot {
@@ -324,6 +336,7 @@ impl ContextSnapshot {
             generation,
             digest: prepared.digest,
             protected: prepared.protected.clone(),
+            rule_ids: Arc::clone(&prepared.rule_ids),
         }
     }
 
@@ -367,6 +380,12 @@ impl ContextSnapshot {
     #[must_use]
     pub const fn protected_rules(&self) -> &ProtectedRules {
         &self.protected
+    }
+
+    /// Returns whether this snapshot contains the exact `RuleID`.
+    #[must_use]
+    pub fn contains_rule_id(&self, id: RuleId) -> bool {
+        self.rule_ids.contains(&id)
     }
 }
 

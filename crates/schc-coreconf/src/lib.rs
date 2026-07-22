@@ -4,16 +4,23 @@
 //! Atomic, domain-oriented managed SCHC context construction.
 //!
 //! This crate binds the r-schc rule context, a rustconf model/tree, and a
-//! schc-runtime runtime in one immutable snapshot. Transport and management
-//! RPC semantics are outside this crate.
+//! schc-runtime runtime in one immutable snapshot, then carries validated
+//! logical packets over a raw localhost UDP SCHC link. Management RPC
+//! semantics are added by higher-level components.
 
 mod codec;
 mod context;
+mod link;
 mod packet;
 mod policy;
 
 pub use context::{
     ActiveContext, ActiveContextBackend, ContextSnapshot, LoadedContext, PreparedContext,
+};
+pub use link::{
+    temporary_ordinary_response, LinkDecoded, LinkEncoding, LinkError, LinkOperation, LinkReport,
+    LinkRole, RawDatagram, RawUdpLink, SchcLink, TrafficClass, TrafficOrigin, TrafficRoute,
+    APPLICATION_PORT, CORE_LOGICAL_ADDRESS, DEVICE_LOGICAL_ADDRESS, MANAGEMENT_PORT,
 };
 pub use packet::{
     CoapMessage, CoapOption, Ipv6UdpCoapPacket, PacketError, PacketMetadata, PacketResult,

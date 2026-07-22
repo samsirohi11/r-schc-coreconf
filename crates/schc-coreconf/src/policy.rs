@@ -104,6 +104,12 @@ impl ProtectedRules {
         self.rules.iter().map(|rule| rule.id).collect()
     }
 
+    /// Returns whether the exact `RuleID`, including its bit length, is protected.
+    #[must_use]
+    pub fn contains(&self, id: RuleId) -> bool {
+        self.rules.iter().any(|rule| rule.id == id)
+    }
+
     pub(crate) fn enforce(&self, candidate: &Self) -> Result<()> {
         if self.rules.len() != candidate.rules.len() {
             return Err(ContextError::ProtectedRuleChanged(format!(
