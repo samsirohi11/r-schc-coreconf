@@ -8,12 +8,14 @@
 //! logical packets over a raw localhost UDP SCHC link. Management RPC
 //! semantics are added by higher-level components.
 
+mod application;
 mod codec;
 mod context;
 mod link;
 mod packet;
 mod policy;
 
+pub use application::{schema_lines, ApplicationError, DataClient, GenericDataService};
 pub use context::{
     ActiveContext, ActiveContextBackend, ContextSnapshot, LoadedContext, PreparedContext,
 };

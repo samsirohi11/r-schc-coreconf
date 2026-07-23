@@ -19,6 +19,8 @@ pub(crate) struct Args {
     pub(crate) link_bind: SocketAddr,
     pub(crate) link_peer: SocketAddr,
     pub(crate) once: bool,
+    app_sid: Vec<PathBuf>,
+    app_data: Option<PathBuf>,
     sid: Option<PathBuf>,
     sor: Option<PathBuf>,
     device_id: String,
@@ -31,6 +33,8 @@ impl Args {
     ) -> Result<Option<(Self, Option<SocketAddr>)>, String> {
         let mut sid = None;
         let mut sor = None;
+        let mut app_sid = Vec::new();
+        let mut app_data = None;
         let mut device_id = "demo-device".to_owned();
         let mut link_bind = None;
         let mut link_peer = None;
@@ -42,6 +46,8 @@ impl Args {
             match argument.as_str() {
                 "--sid" => sid = Some(PathBuf::from(next(&mut arguments, "--sid")?)),
                 "--sor" => sor = Some(PathBuf::from(next(&mut arguments, "--sor")?)),
+                "--app-sid" => app_sid.push(PathBuf::from(next(&mut arguments, "--app-sid")?)),
+                "--app-data" => app_data = Some(PathBuf::from(next(&mut arguments, "--app-data")?)),
                 "--device-id" => device_id = next(&mut arguments, "--device-id")?,
                 "--link-bind" => {
                     link_bind = Some(parse_addr(
@@ -76,8 +82,21 @@ impl Args {
         if !requires_app_bind && app_bind.is_some() {
             return Err("--app-bind is valid only for the core process".to_owned());
         }
+        if requires_app_bind && (!app_sid.is_empty() || app_data.is_some()) {
+            return Err(
+                "--app-sid and --app-data are valid only for the device process".to_owned(),
+            );
+        }
+        if !requires_app_bind && app_sid.is_empty() {
+            return Err("missing required --app-sid".to_owned());
+        }
+        if !requires_app_bind && app_data.is_none() {
+            return Err("missing required --app-data".to_owned());
+        }
         Ok(Some((
             Self {
+                app_sid,
+                app_data,
                 sid,
                 sor,
                 device_id,
@@ -87,6 +106,10 @@ impl Args {
             },
             app_bind,
         )))
+    }
+
+    pub(crate) fn application_inputs(&self) -> (&[PathBuf], Option<&Path>) {
+        (&self.app_sid, self.app_data.as_deref())
     }
 
     pub(crate) fn active_context(&self) -> Result<Arc<ActiveContext>, String> {
@@ -156,7 +179,7 @@ fn print_usage(process_name: &str, requires_app_bind: bool) {
     let app = if requires_app_bind {
         " --app-bind ADDR"
     } else {
-        ""
+        " --app-sid PATH --app-data PATH"
     };
     println!(
         "Usage: {process_name} --link-bind ADDR --link-peer ADDR{app} [--once] [--sid PATH] [--sor PATH] [--device-id ID]"

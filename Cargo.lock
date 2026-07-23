@@ -428,6 +428,7 @@ version = "0.1.0"
 dependencies = [
  "arc-swap",
  "ciborium",
+ "coap-lite",
  "coreconf-model",
  "coreconf-runtime",
  "schc-core",

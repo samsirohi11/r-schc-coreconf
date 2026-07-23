@@ -7,8 +7,8 @@ use std::net::UdpSocket;
 
 use common::{bind_raw_link, print_report, Args, OPERATION_TIMEOUT};
 use schc_coreconf::{
-    temporary_ordinary_response, Ipv6UdpCoapPacket, LinkRole, SchcLink, TrafficOrigin,
-    TrafficRoute, APPLICATION_PORT, CORE_LOGICAL_ADDRESS, DEVICE_LOGICAL_ADDRESS,
+    Ipv6UdpCoapPacket, LinkRole, SchcLink, TrafficOrigin, TrafficRoute, APPLICATION_PORT,
+    CORE_LOGICAL_ADDRESS, DEVICE_LOGICAL_ADDRESS,
 };
 
 fn main() {
@@ -23,6 +23,10 @@ fn run() -> Result<(), String> {
         return Ok(());
     };
     let link = SchcLink::new(args.active_context()?, LinkRole::Core);
+    let (app_sid, app_data) = args.application_inputs();
+    if !app_sid.is_empty() || app_data.is_some() {
+        return Err("--app-sid and --app-data are valid only for the device process".to_owned());
+    }
     let app_bind = app_bind.ok_or("core arguments require --app-bind")?;
     let app_socket = UdpSocket::bind(app_bind)
         .map_err(|error| format!("bind application socket {app_bind}: {error}"))?;
@@ -70,11 +74,15 @@ fn run() -> Result<(), String> {
         if decoded.route() != TrafficRoute::Application {
             return Err("protected response reached the ordinary core path".to_owned());
         }
-        let expected_response = temporary_ordinary_response(&request)
-            .map_err(|error| format!("construct expected ordinary response: {error}"))?;
         let response = decoded.packet();
-        if response.as_bytes() != expected_response.as_bytes() {
-            return Err("uplink response did not reconstruct the exact logical packet".to_owned());
+        if response.source() != DEVICE_LOGICAL_ADDRESS
+            || response.destination() != CORE_LOGICAL_ADDRESS
+            || response.source_port() != APPLICATION_PORT
+            || response.destination_port() != APPLICATION_PORT
+        {
+            return Err(
+                "uplink response had unexpected logical address or port orientation".to_owned(),
+            );
         }
         let response_datagram = response.coap_datagram();
         let sent = app_socket

@@ -9,6 +9,7 @@ description = "Atomic SCHC CORECONF active-context backend"
 [dependencies]
 arc-swap = "1.7"
 ciborium = "0.2"
+coap-lite = "0.13"
 # Gitlinks pin these path dependencies to the recorded submodule revisions.
 # rustconf: 1611ec1; r-schc: cf0b9bc.
 coreconf-model = { path = "../../deps/rustconf/crates/coreconf-model" }

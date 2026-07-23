@@ -1,0 +1,8 @@
+{
+  "demo-data:config": {
+    "count": 7,
+    "enabled": true,
+    "name": "sample-device",
+    "threshold": -2
+  }
+}

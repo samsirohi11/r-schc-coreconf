@@ -1,19 +1,130 @@
 //! Coverage for the real raw UDP SCHC link and rule-derived routing.
 
+use std::io::{BufRead, BufReader, Write};
 use std::net::{Ipv6Addr, SocketAddr, UdpSocket};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
-use std::time::Duration;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use schc_core::{RuleId, SidRegistry};
 use schc_coreconf::{
-    temporary_ordinary_response, ActiveContext, Ipv6UdpCoapPacket, LinkError, LinkRole,
-    PreparedContext, ProtectionPolicy, RawUdpLink, SchcLink, TrafficClass, TrafficOrigin,
+    temporary_ordinary_response, ActiveContext, GenericDataService, Ipv6UdpCoapPacket, LinkError,
+    LinkRole, PreparedContext, ProtectionPolicy, RawUdpLink, SchcLink, TrafficClass, TrafficOrigin,
     TrafficRoute, APPLICATION_PORT, CORE_LOGICAL_ADDRESS, DEVICE_LOGICAL_ADDRESS, MANAGEMENT_PORT,
 };
 use schc_runtime::{DeviceId, DeviceProfile};
 
 const SID: &str = include_str!("../../../fixtures/demo/ietf-schc@2026-05-07.sid");
 const SOR: &[u8] = include_bytes!("../../../fixtures/demo/initial.sor");
+
+struct TestProcess {
+    child: Child,
+    ready: Receiver<String>,
+    stdout: Arc<std::sync::Mutex<String>>,
+    stderr: Arc<std::sync::Mutex<String>>,
+    stdout_thread: Option<thread::JoinHandle<()>>,
+    stderr_thread: Option<thread::JoinHandle<()>>,
+}
+
+impl TestProcess {
+    fn spawn(program: &str, args: &[String]) -> Self {
+        let mut child = Command::new(program)
+            .args(args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn demonstration process");
+        let stdout = Arc::new(std::sync::Mutex::new(String::new()));
+        let stderr = Arc::new(std::sync::Mutex::new(String::new()));
+        let (sender, ready) = mpsc::channel();
+        let stdout_value = Arc::clone(&stdout);
+        let stdout_pipe = child.stdout.take().expect("child stdout");
+        let stdout_thread = thread::spawn(move || {
+            for line in BufReader::new(stdout_pipe).lines() {
+                let Ok(line) = line else { break };
+                if line.starts_with("READY ") {
+                    let _ = sender.send(line.clone());
+                }
+                if let Ok(mut output) = stdout_value.lock() {
+                    output.push_str(&line);
+                    output.push('\n');
+                }
+            }
+        });
+        let stderr_value = Arc::clone(&stderr);
+        let stderr_pipe = child.stderr.take().expect("child stderr");
+        let stderr_thread = thread::spawn(move || {
+            for line in BufReader::new(stderr_pipe).lines() {
+                let Ok(line) = line else { break };
+                if let Ok(mut output) = stderr_value.lock() {
+                    output.push_str(&line);
+                    output.push('\n');
+                }
+            }
+        });
+        Self {
+            child,
+            ready,
+            stdout,
+            stderr,
+            stdout_thread: Some(stdout_thread),
+            stderr_thread: Some(stderr_thread),
+        }
+    }
+
+    fn wait_timeout(&mut self, timeout: Duration) -> ExitStatus {
+        let start = Instant::now();
+        loop {
+            if let Some(status) = self.child.try_wait().expect("poll child") {
+                self.join_readers();
+                return status;
+            }
+            assert!(
+                start.elapsed() < timeout,
+                "child did not exit before timeout"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn kill(&mut self) {
+        if self.child.try_wait().expect("poll child").is_none() {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+        self.join_readers();
+    }
+
+    fn join_readers(&mut self) {
+        if let Some(thread) = self.stdout_thread.take() {
+            thread.join().expect("stdout reader");
+        }
+        if let Some(thread) = self.stderr_thread.take() {
+            thread.join().expect("stderr reader");
+        }
+    }
+
+    fn output(&self) -> (String, String) {
+        (
+            self.stdout.lock().expect("stdout lock").clone(),
+            self.stderr.lock().expect("stderr lock").clone(),
+        )
+    }
+}
+
+impl Drop for TestProcess {
+    fn drop(&mut self) {
+        self.kill();
+    }
+}
+
+fn reserve_address() -> (UdpSocket, SocketAddr) {
+    let socket = UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).expect("reserve UDP port");
+    let address = socket.local_addr().expect("reserved address");
+    (socket, address)
+}
 
 fn active(name: &str) -> Arc<ActiveContext> {
     Arc::new(ActiveContext::new(
@@ -184,6 +295,74 @@ fn protected_rules_authorize_management_and_application_origin_cannot_impersonat
 }
 
 #[test]
+fn dispatch_seam_uses_rule_route_not_management_looking_coap_details() {
+    let core = SchcLink::new(active("core-dispatch"), LinkRole::Core);
+    let device = SchcLink::new(active("device-dispatch"), LinkRole::Device);
+    let mut service = GenericDataService::from_files(
+        &[std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/demo/demo-data.sid")],
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/demo/app-data.json"),
+        "c",
+    )
+    .expect("application service");
+
+    // FETCH on /c resembles management traffic at the CoAP layer, but the
+    // ordinary logical ports select the ordinary RuleID and application route.
+    let ordinary_request = packet(
+        CORE_LOGICAL_ADDRESS,
+        DEVICE_LOGICAL_ADDRESS,
+        APPLICATION_PORT,
+        APPLICATION_PORT,
+        &coap(0, 5, 0x2401, &[], Some(b"c")),
+    );
+    let ordinary_frame = core
+        .encode(TrafficOrigin::Application, &ordinary_request)
+        .expect("ordinary management-looking request");
+    assert_eq!(ordinary_frame.report().rule_id, RuleId::new(25, 8));
+    let ordinary_decoded = device
+        .decode(ordinary_frame.frame().bytes())
+        .expect("ordinary request decodes");
+    assert_eq!(ordinary_decoded.route(), TrafficRoute::Application);
+    let ordinary_response = match ordinary_decoded.route() {
+        TrafficRoute::Application => service
+            .handle_datagram(ordinary_decoded.packet().coap_datagram())
+            .expect("application service response"),
+        TrafficRoute::ProtectedManagement => panic!("ordinary request reached management route"),
+    };
+    let ordinary_response =
+        schc_coreconf::CoapMessage::parse(&ordinary_response).expect("ordinary service response");
+    assert_eq!(ordinary_response.code(), 69);
+
+    // The exact protected RuleID takes the protected route and therefore has
+    // no call site into GenericDataService.
+    let protected_request = packet(
+        CORE_LOGICAL_ADDRESS,
+        DEVICE_LOGICAL_ADDRESS,
+        APPLICATION_PORT,
+        MANAGEMENT_PORT,
+        &coap(0, 1, 0x2402, &[], Some(b"schc")),
+    );
+    let protected_frame = core
+        .encode(TrafficOrigin::Management, &protected_request)
+        .expect("protected request");
+    assert_eq!(protected_frame.report().rule_id, RuleId::new(16, 8));
+    let protected_decoded = device
+        .decode(protected_frame.frame().bytes())
+        .expect("protected request decodes");
+    assert_eq!(protected_decoded.rule_id(), RuleId::new(16, 8));
+    assert_eq!(protected_decoded.route(), TrafficRoute::ProtectedManagement);
+    let reached_application = match protected_decoded.route() {
+        TrafficRoute::Application => {
+            let _ = service.handle_datagram(protected_decoded.packet().coap_datagram());
+            true
+        }
+        TrafficRoute::ProtectedManagement => false,
+    };
+    assert!(!reached_application);
+}
+
+#[test]
 fn malformed_frames_are_rejected_and_rule_identity_includes_bit_length() {
     let core = SchcLink::new(active("core-invalid"), LinkRole::Core);
     let device = SchcLink::new(active("device-invalid"), LinkRole::Device);
@@ -272,124 +451,22 @@ fn raw_udp_link_delivers_only_frame_bytes_in_both_directions() {
 #[test]
 #[allow(clippy::too_many_lines)]
 fn real_core_and_device_processes_complete_one_ordinary_operation() {
-    use std::io::{BufRead, BufReader};
-    use std::process::{Child, Command, ExitStatus, Stdio};
-    use std::sync::mpsc::{self, Receiver};
-    use std::thread;
-    use std::time::Instant;
-
-    struct Process {
-        child: Child,
-        ready: Receiver<String>,
-        stdout: Arc<std::sync::Mutex<String>>,
-        stderr: Arc<std::sync::Mutex<String>>,
-        stdout_thread: Option<thread::JoinHandle<()>>,
-        stderr_thread: Option<thread::JoinHandle<()>>,
-    }
-
-    impl Process {
-        fn spawn(program: &str, args: &[String]) -> Self {
-            let mut child = Command::new(program)
-                .args(args)
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .expect("spawn demonstration process");
-            let stdout = Arc::new(std::sync::Mutex::new(String::new()));
-            let stderr = Arc::new(std::sync::Mutex::new(String::new()));
-            let (sender, ready) = mpsc::channel();
-            let stdout_value = Arc::clone(&stdout);
-            let stdout_pipe = child.stdout.take().expect("child stdout");
-            let stdout_thread = thread::spawn(move || {
-                for line in BufReader::new(stdout_pipe).lines() {
-                    let Ok(line) = line else { break };
-                    if line.starts_with("READY ") {
-                        let _ = sender.send(line.clone());
-                    }
-                    if let Ok(mut output) = stdout_value.lock() {
-                        output.push_str(&line);
-                        output.push('\n');
-                    }
-                }
-            });
-            let stderr_value = Arc::clone(&stderr);
-            let stderr_pipe = child.stderr.take().expect("child stderr");
-            let stderr_thread = thread::spawn(move || {
-                for line in BufReader::new(stderr_pipe).lines() {
-                    let Ok(line) = line else { break };
-                    if let Ok(mut output) = stderr_value.lock() {
-                        output.push_str(&line);
-                        output.push('\n');
-                    }
-                }
-            });
-            Self {
-                child,
-                ready,
-                stdout,
-                stderr,
-                stdout_thread: Some(stdout_thread),
-                stderr_thread: Some(stderr_thread),
-            }
-        }
-
-        fn wait_timeout(&mut self, timeout: Duration) -> ExitStatus {
-            let start = Instant::now();
-            loop {
-                if let Some(status) = self.child.try_wait().expect("poll child") {
-                    self.join_readers();
-                    return status;
-                }
-                assert!(
-                    start.elapsed() < timeout,
-                    "child did not exit before timeout"
-                );
-                thread::sleep(Duration::from_millis(10));
-            }
-        }
-
-        fn join_readers(&mut self) {
-            if let Some(thread) = self.stdout_thread.take() {
-                thread.join().expect("stdout reader");
-            }
-            if let Some(thread) = self.stderr_thread.take() {
-                thread.join().expect("stderr reader");
-            }
-        }
-
-        fn output(&self) -> (String, String) {
-            (
-                self.stdout.lock().expect("stdout lock").clone(),
-                self.stderr.lock().expect("stderr lock").clone(),
-            )
-        }
-    }
-
-    impl Drop for Process {
-        fn drop(&mut self) {
-            if self.child.try_wait().expect("poll child on drop").is_none() {
-                let _ = self.child.kill();
-                let _ = self.child.wait();
-            }
-            self.join_readers();
-        }
-    }
-
-    fn reserve_address() -> (UdpSocket, SocketAddr) {
-        let socket =
-            UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).expect("reserve UDP port");
-        let address = socket.local_addr().expect("reserved address");
-        (socket, address)
-    }
-
     let (device_reservation, device_link) = reserve_address();
     let (core_reservation, core_link) = reserve_address();
     let (app_reservation, core_app) = reserve_address();
+    let app_sid = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/demo/demo-data.sid");
+    let app_data = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/demo/app-data.json");
     let device_args = vec![
         "--link-bind".to_owned(),
         device_link.to_string(),
         "--link-peer".to_owned(),
         core_link.to_string(),
+        "--app-sid".to_owned(),
+        app_sid.to_string_lossy().into_owned(),
+        "--app-data".to_owned(),
+        app_data.to_string_lossy().into_owned(),
         "--once".to_owned(),
     ];
     let core_args = vec![
@@ -402,14 +479,14 @@ fn real_core_and_device_processes_complete_one_ordinary_operation() {
         "--once".to_owned(),
     ];
     drop(device_reservation);
-    let mut device = Process::spawn(env!("CARGO_BIN_EXE_schc-coreconf-device"), &device_args);
+    let mut device = TestProcess::spawn(env!("CARGO_BIN_EXE_schc-coreconf-device"), &device_args);
     device
         .ready
         .recv_timeout(Duration::from_secs(5))
         .expect("device readiness");
     drop(core_reservation);
     drop(app_reservation);
-    let mut core = Process::spawn(env!("CARGO_BIN_EXE_schc-coreconf-core"), &core_args);
+    let mut core = TestProcess::spawn(env!("CARGO_BIN_EXE_schc-coreconf-core"), &core_args);
     core.ready
         .recv_timeout(Duration::from_secs(5))
         .expect("core readiness");
@@ -418,7 +495,7 @@ fn real_core_and_device_processes_complete_one_ordinary_operation() {
     application
         .set_read_timeout(Some(Duration::from_secs(5)))
         .expect("application timeout");
-    let request = coap(0, 1, 0x3010, &[0x55], Some(b"demo"));
+    let request = coap(0, 1, 0x3010, &[0x55], Some(b"c"));
     application
         .send_to(&request, core_app)
         .expect("send application request");
@@ -426,7 +503,12 @@ fn real_core_and_device_processes_complete_one_ordinary_operation() {
     let (length, _) = application
         .recv_from(&mut response)
         .expect("receive application response");
-    assert_eq!(&response[..length], &[0x61, 69, 0x30, 0x10, 0x55]);
+    let response_message =
+        schc_coreconf::CoapMessage::parse(&response[..length]).expect("response CoAP message");
+    assert_eq!(response_message.message_id(), 0x3010);
+    assert_eq!(response_message.token(), &[0x55]);
+    assert_eq!(response_message.code(), 69);
+    assert!(!response_message.payload().is_empty());
 
     let core_status = core.wait_timeout(Duration::from_secs(5));
     let device_status = device.wait_timeout(Duration::from_secs(5));
@@ -436,8 +518,87 @@ fn real_core_and_device_processes_complete_one_ordinary_operation() {
     let (device_stdout, device_stderr) = device.output();
     assert!(core_stderr.is_empty(), "core stderr: {core_stderr}");
     assert!(device_stderr.is_empty(), "device stderr: {device_stderr}");
-    assert!(core_stdout.contains("CORE TX class=Ordinary rule=25/8 packet_bytes=58"));
-    assert!(core_stdout.contains("CORE RX class=Ordinary rule=21/8 packet_bytes=53"));
-    assert!(device_stdout.contains("DEVICE RX class=Ordinary rule=25/8 packet_bytes=58"));
-    assert!(device_stdout.contains("DEVICE TX class=Ordinary rule=21/8 packet_bytes=53"));
+    assert!(core_stdout.contains("CORE TX class=Ordinary rule=25/8 packet_bytes="));
+    assert!(core_stdout.contains("CORE RX class=Ordinary rule=25/8 packet_bytes="));
+    assert!(device_stdout.contains("DEVICE RX class=Ordinary rule=25/8 packet_bytes="));
+    assert!(device_stdout.contains("DEVICE TX class=Ordinary rule=25/8 packet_bytes="));
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn real_three_process_data_client_discovers_and_fetches() {
+    let (device_reservation, device_link) = reserve_address();
+    let (core_reservation, core_link) = reserve_address();
+    let (app_reservation, core_app) = reserve_address();
+    let app_sid = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/demo/demo-data.sid");
+    let app_data = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/demo/app-data.json");
+    let device_args = vec![
+        "--link-bind".to_owned(),
+        device_link.to_string(),
+        "--link-peer".to_owned(),
+        core_link.to_string(),
+        "--app-sid".to_owned(),
+        app_sid.to_string_lossy().into_owned(),
+        "--app-data".to_owned(),
+        app_data.to_string_lossy().into_owned(),
+    ];
+    let core_args = vec![
+        "--link-bind".to_owned(),
+        core_link.to_string(),
+        "--link-peer".to_owned(),
+        device_link.to_string(),
+        "--app-bind".to_owned(),
+        core_app.to_string(),
+    ];
+    drop(device_reservation);
+    let mut device = TestProcess::spawn(env!("CARGO_BIN_EXE_schc-coreconf-device"), &device_args);
+    device
+        .ready
+        .recv_timeout(Duration::from_secs(5))
+        .expect("device readiness");
+    drop(core_reservation);
+    drop(app_reservation);
+    let mut core = TestProcess::spawn(env!("CARGO_BIN_EXE_schc-coreconf-core"), &core_args);
+    core.ready
+        .recv_timeout(Duration::from_secs(5))
+        .expect("core readiness");
+
+    let mut client = Command::new(env!("CARGO_BIN_EXE_schc-data-client"))
+        .args([
+            "--sid",
+            app_sid.to_str().expect("SID path"),
+            "--server",
+            &core_app.to_string(),
+            "--path",
+            "c",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn data client");
+    let mut input = client.stdin.take().expect("client stdin");
+    input
+        .write_all(b"discover d=0\nschema demo-data\nfetch /demo-data:config/count\nquit\n")
+        .expect("write client commands");
+    drop(input);
+    let client_output = client.wait_with_output().expect("wait data client");
+    assert!(client_output.status.success());
+    let client_stdout = String::from_utf8_lossy(&client_output.stdout);
+    let client_stderr = String::from_utf8_lossy(&client_output.stderr);
+    assert!(client_stderr.is_empty(), "client stderr: {client_stderr}");
+    assert!(client_stdout.contains("core.c.ds"));
+    assert!(client_stdout.contains("/demo-data:config/count (sid 60002)"));
+    assert!(client_stdout.contains('7'));
+
+    core.kill();
+    device.kill();
+    let (core_stdout, core_stderr) = core.output();
+    let (device_stdout, device_stderr) = device.output();
+    assert!(core_stderr.is_empty(), "core stderr: {core_stderr}");
+    assert!(device_stderr.is_empty(), "device stderr: {device_stderr}");
+    assert!(core_stdout.contains("CORE TX class=Ordinary"));
+    assert!(device_stdout.contains("DEVICE RX class=Ordinary"));
 }
