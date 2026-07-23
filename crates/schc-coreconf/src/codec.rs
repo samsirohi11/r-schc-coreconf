@@ -242,3 +242,9 @@ pub(crate) fn digest_context(tree: &Value, sor: &[u8]) -> Result<[u8; 32]> {
     hasher.update(sor);
     Ok(hasher.finalize().into())
 }
+
+pub(crate) fn context_tag(digest: [u8; 32]) -> crate::ContextTag {
+    let mut bytes = [0_u8; crate::CONTEXT_TAG_LEN];
+    bytes.copy_from_slice(&digest[..crate::CONTEXT_TAG_LEN]);
+    crate::ContextTag::from_bytes(bytes)
+}

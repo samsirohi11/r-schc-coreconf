@@ -14,6 +14,60 @@ use crate::codec::{
 use crate::policy::{ProtectedRules, ProtectionPolicy};
 use crate::{ContextError, Result};
 
+/// Number of bytes in a compact context tag.
+pub const CONTEXT_TAG_LEN: usize = 8;
+
+/// A compact stable identifier for one canonical SCHC context.
+#[derive(Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ContextTag([u8; CONTEXT_TAG_LEN]);
+
+impl ContextTag {
+    pub(crate) const fn from_bytes(bytes: [u8; CONTEXT_TAG_LEN]) -> Self {
+        Self(bytes)
+    }
+
+    /// Creates a tag from its exact eight-byte representation.
+    #[must_use]
+    pub const fn new(bytes: [u8; CONTEXT_TAG_LEN]) -> Self {
+        Self(bytes)
+    }
+
+    /// Returns the exact bytes of this tag.
+    #[must_use]
+    pub const fn bytes(self) -> [u8; CONTEXT_TAG_LEN] {
+        self.0
+    }
+
+    /// Returns the lowercase hexadecimal representation.
+    #[must_use]
+    pub fn to_hex(self) -> String {
+        use std::fmt::Write as _;
+        let mut output = String::with_capacity(CONTEXT_TAG_LEN * 2);
+        for byte in self.0 {
+            write!(&mut output, "{byte:02x}").expect("writing to String cannot fail");
+        }
+        output
+    }
+}
+
+impl fmt::Display for ContextTag {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for byte in self.0 {
+            write!(formatter, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Debug for ContextTag {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_tuple("ContextTag")
+            .field(&self.to_hex())
+            .finish()
+    }
+}
+
 /// A fully loaded, canonical SCHC/rustconf context before runtime binding.
 #[derive(Debug, Clone)]
 pub struct LoadedContext {
@@ -142,7 +196,9 @@ pub struct PreparedContext {
     runtime: Arc<Runtime>,
     pub(crate) protected: ProtectedRules,
     pub(crate) rule_ids: Arc<[RuleId]>,
+    pub(crate) rules: Arc<[Rule]>,
     digest: [u8; 32],
+    tag: ContextTag,
 }
 
 impl PreparedContext {
@@ -240,15 +296,9 @@ impl PreparedContext {
         )
         .map_err(|error| ContextError::Runtime(error.to_string()))?;
         let digest = digest_context(&loaded.tree, &loaded.sor)?;
-        let rule_ids = Arc::from(
-            loaded
-                .rule_context
-                .rules()
-                .rules()
-                .iter()
-                .map(Rule::id)
-                .collect::<Vec<_>>(),
-        );
+        let tag = crate::codec::context_tag(digest);
+        let rules: Arc<[Rule]> = Arc::from(loaded.rule_context.rules().rules().to_vec());
+        let rule_ids = Arc::from(rules.iter().map(Rule::id).collect::<Vec<_>>());
         Ok(Self {
             recipe,
             tree: Arc::new(loaded.tree),
@@ -256,7 +306,9 @@ impl PreparedContext {
             runtime: Arc::new(runtime),
             protected: loaded.protected,
             rule_ids,
+            rules,
             digest,
+            tag,
         })
     }
 
@@ -288,6 +340,12 @@ impl PreparedContext {
     #[must_use]
     pub const fn digest(&self) -> [u8; 32] {
         self.digest
+    }
+
+    /// Returns the compact eight-byte context tag.
+    #[must_use]
+    pub const fn tag(&self) -> ContextTag {
+        self.tag
     }
 
     /// Returns protected rules captured by this preparation.
@@ -325,6 +383,8 @@ pub struct ContextSnapshot {
     digest: [u8; 32],
     protected: ProtectedRules,
     rule_ids: Arc<[RuleId]>,
+    rules: Arc<[Rule]>,
+    tag: ContextTag,
 }
 
 impl ContextSnapshot {
@@ -337,6 +397,8 @@ impl ContextSnapshot {
             digest: prepared.digest,
             protected: prepared.protected.clone(),
             rule_ids: Arc::clone(&prepared.rule_ids),
+            rules: Arc::clone(&prepared.rules),
+            tag: prepared.tag,
         }
     }
 
@@ -374,6 +436,18 @@ impl ContextSnapshot {
     #[must_use]
     pub const fn digest(&self) -> [u8; 32] {
         self.digest
+    }
+
+    /// Returns the compact eight-byte context tag.
+    #[must_use]
+    pub const fn tag(&self) -> ContextTag {
+        self.tag
+    }
+
+    /// Returns all rules in deterministic canonical order.
+    #[must_use]
+    pub fn rules(&self) -> &[Rule] {
+        &self.rules
     }
 
     /// Returns protected rules in this snapshot.
@@ -441,6 +515,12 @@ impl ActiveContext {
     #[must_use]
     pub fn digest(&self) -> [u8; 32] {
         self.snapshot.load().digest()
+    }
+
+    /// Returns the current compact eight-byte context tag.
+    #[must_use]
+    pub fn tag(&self) -> ContextTag {
+        self.snapshot.load().tag()
     }
 
     /// Returns the current canonical tree as a detached value.

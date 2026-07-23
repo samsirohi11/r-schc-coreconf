@@ -12,17 +12,26 @@ mod application;
 mod codec;
 mod context;
 mod link;
+mod management;
 mod packet;
 mod policy;
 
 pub use application::{schema_lines, ApplicationError, DataClient, GenericDataService};
 pub use context::{
-    ActiveContext, ActiveContextBackend, ContextSnapshot, LoadedContext, PreparedContext,
+    ActiveContext, ActiveContextBackend, ContextSnapshot, ContextTag, LoadedContext,
+    PreparedContext, CONTEXT_TAG_LEN,
 };
 pub use link::{
     temporary_ordinary_response, LinkDecoded, LinkEncoding, LinkError, LinkOperation, LinkReport,
     LinkRole, RawDatagram, RawUdpLink, SchcLink, TrafficClass, TrafficOrigin, TrafficRoute,
     APPLICATION_PORT, CORE_LOGICAL_ADDRESS, DEVICE_LOGICAL_ADDRESS, MANAGEMENT_PORT,
+};
+pub use management::{
+    context_check_request, context_check_response, decode_context_check_payload,
+    decode_rule_detail_payload, decode_rule_list_payload, exchange_management, format_rule_detail,
+    format_rule_list, parse_rule_selector, rule_get_request, rule_list_request, ContextCheckResult,
+    ContextStatus, InspectionError, InspectionService, ManagementExchange, RuleDetail, RuleEntry,
+    RuleSelector, RuleSummary, CONTEXT_CHECK_MARKER,
 };
 pub use packet::{
     CoapMessage, CoapOption, Ipv6UdpCoapPacket, PacketError, PacketMetadata, PacketResult,

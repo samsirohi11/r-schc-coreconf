@@ -1,12 +1,13 @@
 //! Coverage for the real raw UDP SCHC link and rule-derived routing.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::Write;
 use std::net::{Ipv6Addr, SocketAddr, UdpSocket};
-use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::mpsc::{self, Receiver};
+use std::process::{Command, Stdio};
 use std::sync::Arc;
-use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+mod support;
+use support::TestProcess;
 
 use schc_core::{RuleId, SidRegistry};
 use schc_coreconf::{
@@ -18,107 +19,6 @@ use schc_runtime::{DeviceId, DeviceProfile};
 
 const SID: &str = include_str!("../../../fixtures/demo/ietf-schc@2026-05-07.sid");
 const SOR: &[u8] = include_bytes!("../../../fixtures/demo/initial.sor");
-
-struct TestProcess {
-    child: Child,
-    ready: Receiver<String>,
-    stdout: Arc<std::sync::Mutex<String>>,
-    stderr: Arc<std::sync::Mutex<String>>,
-    stdout_thread: Option<thread::JoinHandle<()>>,
-    stderr_thread: Option<thread::JoinHandle<()>>,
-}
-
-impl TestProcess {
-    fn spawn(program: &str, args: &[String]) -> Self {
-        let mut child = Command::new(program)
-            .args(args)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn demonstration process");
-        let stdout = Arc::new(std::sync::Mutex::new(String::new()));
-        let stderr = Arc::new(std::sync::Mutex::new(String::new()));
-        let (sender, ready) = mpsc::channel();
-        let stdout_value = Arc::clone(&stdout);
-        let stdout_pipe = child.stdout.take().expect("child stdout");
-        let stdout_thread = thread::spawn(move || {
-            for line in BufReader::new(stdout_pipe).lines() {
-                let Ok(line) = line else { break };
-                if line.starts_with("READY ") {
-                    let _ = sender.send(line.clone());
-                }
-                if let Ok(mut output) = stdout_value.lock() {
-                    output.push_str(&line);
-                    output.push('\n');
-                }
-            }
-        });
-        let stderr_value = Arc::clone(&stderr);
-        let stderr_pipe = child.stderr.take().expect("child stderr");
-        let stderr_thread = thread::spawn(move || {
-            for line in BufReader::new(stderr_pipe).lines() {
-                let Ok(line) = line else { break };
-                if let Ok(mut output) = stderr_value.lock() {
-                    output.push_str(&line);
-                    output.push('\n');
-                }
-            }
-        });
-        Self {
-            child,
-            ready,
-            stdout,
-            stderr,
-            stdout_thread: Some(stdout_thread),
-            stderr_thread: Some(stderr_thread),
-        }
-    }
-
-    fn wait_timeout(&mut self, timeout: Duration) -> ExitStatus {
-        let start = Instant::now();
-        loop {
-            if let Some(status) = self.child.try_wait().expect("poll child") {
-                self.join_readers();
-                return status;
-            }
-            assert!(
-                start.elapsed() < timeout,
-                "child did not exit before timeout"
-            );
-            thread::sleep(Duration::from_millis(10));
-        }
-    }
-
-    fn kill(&mut self) {
-        if self.child.try_wait().expect("poll child").is_none() {
-            let _ = self.child.kill();
-            let _ = self.child.wait();
-        }
-        self.join_readers();
-    }
-
-    fn join_readers(&mut self) {
-        if let Some(thread) = self.stdout_thread.take() {
-            thread.join().expect("stdout reader");
-        }
-        if let Some(thread) = self.stderr_thread.take() {
-            thread.join().expect("stderr reader");
-        }
-    }
-
-    fn output(&self) -> (String, String) {
-        (
-            self.stdout.lock().expect("stdout lock").clone(),
-            self.stderr.lock().expect("stderr lock").clone(),
-        )
-    }
-}
-
-impl Drop for TestProcess {
-    fn drop(&mut self) {
-        self.kill();
-    }
-}
 
 fn reserve_address() -> (UdpSocket, SocketAddr) {
     let socket = UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).expect("reserve UDP port");
