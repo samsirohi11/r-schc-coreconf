@@ -1,6 +1,7 @@
-//! Protected, inspection-only SCHC context management.
+//! Protected SCHC context inspection and targeted management updates.
 //!
-//! The wire service uses ordinary CORECONF FETCH payloads for rule inspection.
+//! The wire service uses ordinary CORECONF FETCH payloads for rule inspection
+//! and one strict root iPATCH shape for detached, validated target updates.
 //! Context checks use a compact marker and eight-byte tag because the fixed
 //! management rules do not describe an `ETag` option.
 
@@ -9,10 +10,14 @@ use std::sync::Arc;
 
 use ciborium::value::Value as CborValue;
 use coap_lite::{CoapOption, MessageClass, MessageType, Packet, RequestType, ResponseType};
-use coreconf_model::instance_id::{decode_instances_with_model, PathComponent};
+use coreconf_model::instance_id::{
+    decode_instances_with_model, Instance, InstancePath, PathComponent,
+};
 use coreconf_model::{CompositeModel, CoreconfModel};
+use coreconf_runtime::coap_types::{ContentFormat, Interface, Method, Request};
 use coreconf_runtime::request_handler::RequestHandler;
 use coreconf_runtime::transport::coap_lite::{packet_to_request, response_to_packet};
+use coreconf_runtime::PredicatePath;
 use coreconf_runtime::{Datastore, ResponseCode};
 use schc_core::{
     Cda, DirectionSelector, FieldLength, FieldRef, MatchingOperator, Rule, RuleContext, RuleId,
@@ -23,18 +28,25 @@ use thiserror::Error;
 
 use crate::{
     ActiveContext, ContextSnapshot, ContextTag, Ipv6UdpCoapPacket, LinkError, LinkReport,
-    RawUdpLink, SchcLink, TrafficOrigin, TrafficRoute, APPLICATION_PORT, CORE_LOGICAL_ADDRESS,
-    DEVICE_LOGICAL_ADDRESS, MANAGEMENT_PORT,
+    PreparedContext, RawUdpLink, SchcLink, TrafficOrigin, TrafficRoute, APPLICATION_PORT,
+    CORE_LOGICAL_ADDRESS, DEVICE_LOGICAL_ADDRESS, MANAGEMENT_PORT,
 };
 
 /// Marker used as the first byte of the compact context-check FETCH payload.
 pub const CONTEXT_CHECK_MARKER: u8 = 0xC6;
 const CONTEXT_CHECK_EQUAL: u8 = 0;
 const CONTEXT_CHECK_MISMATCH: u8 = 1;
+const SCHC_ROOT_SID: i64 = 2574;
 const RULE_LIST_SID: i64 = 2597;
 const RULE_ID_LENGTH_SID: i64 = 2598;
 const RULE_ID_VALUE_SID: i64 = 2599;
 const RULE_NATURE_SID: i64 = 2600;
+const RULE_ENTRY_LIST_SID: i64 = 2620;
+const RULE_ENTRY_INDEX_SID: i64 = 2621;
+const FIELD_LENGTH_SID: i64 = 2625;
+const TARGET_VALUE_LIST_SID: i64 = 2629;
+const TARGET_VALUE_INDEX_SID: i64 = 2630;
+const TARGET_VALUE_VALUE_SID: i64 = 2631;
 
 /// Errors returned by context inspection and its protected exchange.
 #[derive(Debug, Error)]
@@ -60,6 +72,34 @@ pub enum InspectionError {
         /// Number of matching rules.
         matches: usize,
     },
+    /// A targeted rule-update command was malformed.
+    #[error("invalid rule update command: {0}")]
+    InvalidUpdate(String),
+    /// No entry matched a targeted update selector.
+    #[error("RuleID {rule} has no entry matching {selector}")]
+    MissingEntry {
+        /// Exact `RuleID` of the rule searched.
+        rule: RuleSelector,
+        /// Human-readable selector description.
+        selector: String,
+    },
+    /// More than one entry matched a targeted update selector.
+    #[error(
+        "RuleID {rule} selector {selector} was ambiguous; matching entries:\n{readable_matches}"
+    )]
+    AmbiguousEntry {
+        /// Exact `RuleID` of the rule searched.
+        rule: RuleSelector,
+        /// Human-readable selector description.
+        selector: String,
+        /// Complete entries that matched, in canonical order.
+        matches: Vec<RuleEntry>,
+        /// Stable formatted representation of the matching entries.
+        readable_matches: String,
+    },
+    /// A target-value update could not be converted to the selected shape.
+    #[error("invalid targeted rule update: {0}")]
+    InvalidTarget(String),
     /// The local management datastore or model rejected a request.
     #[error("management datastore error: {0}")]
     Datastore(String),
@@ -114,6 +154,12 @@ impl RuleSelector {
     }
 }
 
+impl fmt::Display for RuleSelector {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}/{}", self.value, self.bits)
+    }
+}
+
 /// Parses the exact `<value>/<bit-length>` syntax used by the console.
 ///
 /// # Errors
@@ -146,6 +192,167 @@ pub fn parse_rule_selector(input: &str) -> Result<RuleSelector, InspectionError>
     RuleSelector::new(value, bits)
 }
 
+/// Parses a complete targeted rule-update command.
+///
+/// The accepted syntax is `rule update <value>/<bits>` followed by exactly
+/// one selector (`entry=<index>` or `fid=<name>` with optional `fp=<position>`
+/// and `di=<direction>`), exactly one `tv=<value>`, and optional
+/// `--if-match`. Arguments are single whitespace-delimited tokens; target
+/// value type conversion is deliberately deferred to the update layer.
+///
+/// # Errors
+///
+/// Returns an error for a malformed `RuleID`, missing or duplicate arguments,
+/// unknown keys, malformed numeric or direction values, or mixed exact and
+/// human selector forms.
+#[allow(clippy::too_many_lines)]
+pub fn parse_rule_update_command(input: &str) -> Result<RuleUpdateRequest, InspectionError> {
+    let mut words = input.split_whitespace();
+    if words.next() != Some("rule") || words.next() != Some("update") {
+        return Err(invalid_update("expected 'rule update <value>/<bits> ...'"));
+    }
+    let rule_token = words
+        .next()
+        .ok_or_else(|| invalid_update("missing RuleID; expected <value>/<bits>"))?;
+    let rule = parse_rule_selector(rule_token)
+        .map_err(|error| invalid_update(format!("invalid RuleID: {error}")))?;
+
+    let mut entry_index = None;
+    let mut fid = None;
+    let mut field_position = None;
+    let mut direction = None;
+    let mut target_value = None;
+    let mut if_match = false;
+
+    for argument in words {
+        if argument == "--if-match" {
+            if if_match {
+                return Err(invalid_update("duplicate '--if-match' flag"));
+            }
+            if_match = true;
+            continue;
+        }
+        let Some((key, value)) = argument.split_once('=') else {
+            return Err(invalid_update(format!(
+                "malformed argument '{argument}'; expected key=value"
+            )));
+        };
+        if key.is_empty() || value.is_empty() || value.contains('=') {
+            return Err(invalid_update(format!(
+                "malformed argument '{argument}'; expected one non-empty key and value"
+            )));
+        }
+        match key {
+            "entry" => {
+                if entry_index.is_some() {
+                    return Err(invalid_update("duplicate 'entry' argument"));
+                }
+                entry_index = Some(parse_unsigned_argument(value, "entry")?);
+            }
+            "fid" => {
+                if fid.is_some() {
+                    return Err(invalid_update("duplicate 'fid' argument"));
+                }
+                if !valid_fid_token(value) {
+                    return Err(invalid_update(
+                        "fid must be a readable non-empty field name",
+                    ));
+                }
+                fid = Some(value.to_owned());
+            }
+            "fp" => {
+                if field_position.is_some() {
+                    return Err(invalid_update("duplicate 'fp' argument"));
+                }
+                let position = parse_unsigned_argument(value, "fp")?;
+                if position == 0 {
+                    return Err(invalid_update("fp must be a one-based field position"));
+                }
+                field_position = Some(position);
+            }
+            "di" => {
+                if direction.is_some() {
+                    return Err(invalid_update("duplicate 'di' argument"));
+                }
+                if !matches!(value, "bi" | "up" | "down") {
+                    return Err(invalid_update("di must be one of 'bi', 'up', or 'down'"));
+                }
+                direction = Some(value.to_owned());
+            }
+            "tv" => {
+                if target_value.is_some() {
+                    return Err(invalid_update("duplicate 'tv' argument"));
+                }
+                if value.chars().any(char::is_control) {
+                    return Err(invalid_update("tv must not contain control characters"));
+                }
+                target_value = Some(value.to_owned());
+            }
+            _ => return Err(invalid_update(format!("unknown update argument '{key}'"))),
+        }
+    }
+
+    let target_value =
+        target_value.ok_or_else(|| invalid_update("exactly one 'tv' is required"))?;
+    let entry = match (entry_index, fid) {
+        (Some(entry_index), None) => {
+            if field_position.is_some() || direction.is_some() {
+                return Err(invalid_update(
+                    "exact 'entry' cannot be combined with 'fp' or 'di'",
+                ));
+            }
+            RuleEntrySelector::Entry { entry_index }
+        }
+        (None, Some(fid)) => RuleEntrySelector::Field {
+            fid,
+            field_position,
+            direction,
+        },
+        (Some(_), Some(_)) => {
+            return Err(invalid_update("entry and fid selectors cannot be combined"));
+        }
+        (None, None) => {
+            if field_position.is_some() || direction.is_some() {
+                return Err(invalid_update("fp and di require a fid selector"));
+            }
+            return Err(invalid_update(
+                "exactly one of 'entry' or 'fid' is required",
+            ));
+        }
+    };
+
+    Ok(RuleUpdateRequest {
+        rule,
+        entry,
+        target_value,
+        if_match,
+    })
+}
+
+fn invalid_update(message: impl Into<String>) -> InspectionError {
+    InspectionError::InvalidUpdate(message.into())
+}
+
+fn parse_unsigned_argument(value: &str, key: &str) -> Result<usize, InspectionError> {
+    if !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(invalid_update(format!(
+            "{key} must be an unsigned decimal number"
+        )));
+    }
+    value.parse::<usize>().map_err(|_| {
+        invalid_update(format!(
+            "{key} is out of range for a canonical entry position"
+        ))
+    })
+}
+
+fn valid_fid_token(value: &str) -> bool {
+    !value.is_empty()
+        && !value
+            .chars()
+            .any(|character| character.is_whitespace() || character.is_control())
+}
+
 /// A rule summary intentionally omitting all field entries and target values.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct RuleSummary {
@@ -176,6 +383,389 @@ pub struct RuleEntry {
     pub cda: String,
 }
 
+/// A selector for one entry in a complete rule.
+///
+/// `Entry` addresses the canonical zero-based entry index directly. `Field`
+/// addresses the readable FID and optionally narrows repeated FIDs by field
+/// position and direction.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum RuleEntrySelector {
+    /// Selects exactly one canonical zero-based entry index.
+    Entry {
+        /// Canonical zero-based entry index.
+        entry_index: usize,
+    },
+    /// Selects an entry by readable FID and optional discriminators.
+    Field {
+        /// Readable field identifier as entered by the operator.
+        fid: String,
+        /// Optional one-based field position.
+        field_position: Option<usize>,
+        /// Optional stable direction identifier (`bi`, `up`, or `down`).
+        direction: Option<String>,
+    },
+}
+
+impl RuleEntrySelector {
+    /// Constructs an exact canonical entry selector.
+    #[must_use]
+    pub const fn entry(entry_index: usize) -> Self {
+        Self::Entry { entry_index }
+    }
+
+    /// Constructs a human FID selector.
+    #[must_use]
+    pub fn field(
+        fid: impl Into<String>,
+        field_position: Option<usize>,
+        direction: Option<String>,
+    ) -> Self {
+        Self::Field {
+            fid: fid.into(),
+            field_position,
+            direction,
+        }
+    }
+
+    /// Returns a stable readable representation suitable for errors and logs.
+    #[must_use]
+    pub fn description(&self) -> String {
+        use std::fmt::Write as _;
+
+        match self {
+            Self::Entry { entry_index } => format!("entry={entry_index}"),
+            Self::Field {
+                fid,
+                field_position,
+                direction,
+            } => {
+                let mut result = format!("fid={fid}");
+                if let Some(position) = field_position {
+                    let _ = write!(result, " fp={position}");
+                }
+                if let Some(direction) = direction {
+                    let _ = write!(result, " di={direction}");
+                }
+                result
+            }
+        }
+    }
+}
+
+/// A parsed, not-yet-applied targeted rule update command.
+///
+/// This type intentionally stores the target value in its command spelling.
+/// Its field-specific conversion and validation belong to the later iPATCH
+/// and candidate-publication layer.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct RuleUpdateRequest {
+    /// Exact `RuleID` containing both numeric value and encoded bit length.
+    pub rule: RuleSelector,
+    /// Exact or human entry selector.
+    pub entry: RuleEntrySelector,
+    /// The one target-value change requested by `tv=`.
+    pub target_value: String,
+    /// Whether the later exchange must use the current context tag as a
+    /// precondition.
+    pub if_match: bool,
+}
+
+impl RuleUpdateRequest {
+    /// Resolves this request against one complete inspected rule.
+    ///
+    /// The returned value is the canonical zero-based entry index. No update,
+    /// value conversion, transport, or context mutation is performed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the detail has a different `RuleID`, no entry
+    /// matches, or the human selector matches more than one entry.
+    pub fn resolve_entry_index(&self, detail: &RuleDetail) -> Result<usize, InspectionError> {
+        if detail.id != self.rule {
+            return Err(InspectionError::InvalidUpdate(format!(
+                "rule detail is {}/{} but update targets {}/{}",
+                detail.id.value, detail.id.bits, self.rule.value, self.rule.bits
+            )));
+        }
+        detail.resolve_entry_index(&self.entry)
+    }
+
+    /// Resolves and converts this request into one SID-based update.
+    ///
+    /// The returned value and path are ready for a root CORECONF iPATCH
+    /// request. The operation remains detached and does not mutate `tree` or
+    /// any active context.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when entry resolution, model shape, or target-value
+    /// conversion fails.
+    pub fn resolve_target_value(
+        &self,
+        detail: &RuleDetail,
+        tree: &Value,
+        model: &CoreconfModel,
+    ) -> Result<ResolvedRuleUpdate, InspectionError> {
+        let entry_index = self.resolve_entry_index(detail)?;
+        ResolvedRuleUpdate::from_request(self, entry_index, tree, model)
+    }
+}
+
+/// One resolved target-value update in generic CORECONF instance form.
+///
+/// `value` is the SID-level wire value, not the identifier-level tree value.
+/// For the SCHC binary target-value leaf this is a CBOR/JSON array of byte
+/// numbers. `path` contains every list key required by the pinned SCHC SID
+/// model: `RuleID` value, `RuleID` bit length, entry index, and target-value
+/// index.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResolvedRuleUpdate {
+    /// Original parsed request, including the optional If-Match flag.
+    pub request: RuleUpdateRequest,
+    /// Canonical zero-based entry index selected by the request.
+    pub entry_index: usize,
+    /// Existing target-value list index selected from the complete tree.
+    pub target_value_index: usize,
+    /// Exact SID-based CORECONF instance path to `target-value/value`.
+    pub path: InstancePath,
+    /// Exactly one replacement value in SID-level wire representation.
+    pub value: Value,
+}
+
+impl ResolvedRuleUpdate {
+    /// Builds one resolved update from an already resolved entry index.
+    ///
+    /// This constructor performs no mutation. It validates the complete tree,
+    /// requires one existing target-value list member, and converts the
+    /// operator's decimal `tv=` spelling to the existing binary width without
+    /// truncation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the pinned model shape is unavailable, the rule
+    /// or entry is absent or duplicated, the target list is not one member,
+    /// or the target value is not a valid unsigned value for its shape.
+    #[allow(clippy::too_many_lines)]
+    pub fn from_request(
+        request: &RuleUpdateRequest,
+        entry_index: usize,
+        tree: &Value,
+        model: &CoreconfModel,
+    ) -> Result<Self, InspectionError> {
+        let composite = model.composite_model();
+        validate_update_model_shape(composite)?;
+        let root_key = tree_key_for_sid(composite, SCHC_ROOT_SID)?;
+        let rule_key = tree_key_for_sid(composite, RULE_LIST_SID)?;
+        let entry_key = tree_key_for_sid(composite, RULE_ENTRY_LIST_SID)?;
+        let target_value_key = tree_key_for_sid(composite, TARGET_VALUE_LIST_SID)?;
+        let rule_value_key = tree_key_for_sid(composite, RULE_ID_VALUE_SID)?;
+        let rule_length_key = tree_key_for_sid(composite, RULE_ID_LENGTH_SID)?;
+        let entry_index_key = tree_key_for_sid(composite, RULE_ENTRY_INDEX_SID)?;
+        let target_index_key = tree_key_for_sid(composite, TARGET_VALUE_INDEX_SID)?;
+        let target_value_leaf_key = tree_key_for_sid(composite, TARGET_VALUE_VALUE_SID)?;
+
+        let root = tree
+            .get(&root_key)
+            .and_then(Value::as_object)
+            .ok_or_else(|| invalid_target("complete tree is missing the SCHC root"))?;
+        let rules = root
+            .get(&rule_key)
+            .and_then(Value::as_array)
+            .ok_or_else(|| invalid_target("complete tree is missing the rule list"))?;
+        let matching_rules = rules
+            .iter()
+            .filter(|rule| {
+                rule.get(&rule_value_key).and_then(Value::as_u64) == Some(request.rule.value)
+                    && rule.get(&rule_length_key).and_then(Value::as_u64)
+                        == Some(request.rule.bits as u64)
+            })
+            .collect::<Vec<_>>();
+        let rule = match matching_rules.as_slice() {
+            [] => {
+                return Err(InspectionError::MissingRule {
+                    value: request.rule.value,
+                    bits: request.rule.bits,
+                });
+            }
+            [rule] => *rule,
+            _ => {
+                return Err(InspectionError::AmbiguousRule {
+                    value: request.rule.value,
+                    bits: request.rule.bits,
+                    matches: matching_rules.len(),
+                });
+            }
+        };
+        let entries = rule
+            .get(&entry_key)
+            .and_then(Value::as_array)
+            .ok_or_else(|| invalid_target("selected rule is missing the entry list"))?;
+        let matching_entries = entries
+            .iter()
+            .filter(|entry| {
+                entry.get(&entry_index_key).and_then(Value::as_u64) == Some(entry_index as u64)
+            })
+            .collect::<Vec<_>>();
+        let entry = match matching_entries.as_slice() {
+            [] => {
+                return Err(InspectionError::MissingEntry {
+                    rule: request.rule,
+                    selector: format!("entry={entry_index}"),
+                });
+            }
+            [entry] => *entry,
+            _ => {
+                return Err(InspectionError::InvalidTarget(format!(
+                    "entry {entry_index} occurs more than once in RuleID {}",
+                    request.rule
+                )));
+            }
+        };
+        let target_values = entry
+            .get(&target_value_key)
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                invalid_target(format!(
+                    "entry {entry_index} is missing its target-value list"
+                ))
+            })?;
+        if target_values.len() != 1 {
+            return Err(invalid_target(format!(
+                "entry {entry_index} target-value list has {} members; exactly one is required",
+                target_values.len()
+            )));
+        }
+        let target_member = &target_values[0];
+        let target_value_index = target_member
+            .get(&target_index_key)
+            .and_then(Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+            .ok_or_else(|| invalid_target("target-value member has no numeric index"))?;
+        let current_identifier_value = target_member
+            .get(&target_value_leaf_key)
+            .ok_or_else(|| invalid_target("target-value member has no value"))?;
+        let current_wire_value = composite
+            .identifier_value_to_sid_value_at_path(
+                current_identifier_value.clone(),
+                composite
+                    .get_identifier(TARGET_VALUE_VALUE_SID)
+                    .ok_or_else(|| invalid_target("target-value/value SID is unavailable"))?,
+            )
+            .map_err(|error| invalid_target(format!("current target value is invalid: {error}")))?;
+        let current_bytes = binary_bytes(&current_wire_value)?;
+        let field_length = entry
+            .get(&tree_key_for_sid(composite, FIELD_LENGTH_SID)?)
+            .ok_or_else(|| invalid_target("selected entry has no field-length"))?;
+        let replacement =
+            numeric_target_value(&request.target_value, &current_bytes, field_length)?;
+        let value_path = composite
+            .get_identifier(TARGET_VALUE_VALUE_SID)
+            .ok_or_else(|| invalid_target("target-value/value SID is unavailable"))?;
+        composite
+            .sid_value_to_identifier_value_at_path(replacement.clone(), value_path)
+            .map_err(|error| {
+                invalid_target(format!("replacement target value is invalid: {error}"))
+            })?;
+
+        let path = target_value_path(request.rule, entry_index, target_value_index);
+        Ok(Self {
+            request: request.clone(),
+            entry_index,
+            target_value_index,
+            path,
+            value: replacement,
+        })
+    }
+
+    /// Returns the one CORECONF instance operation represented by this update.
+    #[must_use]
+    pub fn instance(&self) -> Instance {
+        Instance::new(self.path.clone(), self.value.clone())
+    }
+
+    /// Encodes exactly one root iPATCH instance operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the generic CORECONF instance encoder rejects the
+    /// path or value.
+    pub fn ipatch_payload(&self) -> Result<Vec<u8>, InspectionError> {
+        let path = serde_value_to_cbor(&self.path.to_cbor_value())?;
+        let value = CborValue::Bytes(binary_bytes(&self.value)?);
+        let instance = CborValue::Map(vec![(path, value)]);
+        let mut payload = Vec::new();
+        ciborium::ser::into_writer(&instance, &mut payload)
+            .map_err(|error| invalid_target(format!("iPATCH instance encoding failed: {error}")))?;
+        Ok(payload)
+    }
+
+    /// Constructs the generic root iPATCH request for this update.
+    ///
+    /// The request uses `YangDataCbor` and an empty root path, as required by
+    /// the runtime's instance-sequence iPATCH handler.
+    ///
+    /// This request abstraction cannot carry CoAP options. Updates parsed
+    /// with `--if-match` must use [`Self::ipatch_datagram`] instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the instance payload cannot be encoded or this
+    /// update requires an If-Match option.
+    pub fn ipatch_request(&self) -> Result<Request, InspectionError> {
+        if self.request.if_match {
+            return Err(invalid_target(
+                "--if-match requires the CoAP ipatch_datagram builder",
+            ));
+        }
+        Ok(Request::new(Method::IPatch)
+            .with_payload(self.ipatch_payload()?, ContentFormat::YangDataCbor)
+            .with_interface(Interface::Management))
+    }
+
+    /// Builds a complete CoAP datagram for this root iPATCH update.
+    ///
+    /// The datagram targets `/schc`, uses the management iPATCH method, and
+    /// carries the exact payload from [`Self::ipatch_payload`]. If the parsed
+    /// command included `--if-match`, `base_tag` is required and is encoded
+    /// as exactly one If-Match option containing its eight raw tag bytes. A
+    /// tag supplied for a default update is rejected rather than ignored.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the precondition argument is inconsistent, the
+    /// payload is invalid, or the CoAP datagram cannot be serialized.
+    pub fn ipatch_datagram(
+        &self,
+        message_id: u16,
+        token: &[u8],
+        base_tag: Option<ContextTag>,
+    ) -> Result<Vec<u8>, InspectionError> {
+        match (self.request.if_match, base_tag) {
+            (true, None) => {
+                return Err(invalid_target("--if-match requires a base context tag"));
+            }
+            (false, Some(_)) => {
+                return Err(invalid_target("a base context tag requires --if-match"));
+            }
+            (true, Some(_)) | (false, None) => {}
+        }
+        let mut packet = Packet::new();
+        packet.header.message_id = message_id;
+        packet.header.code = MessageClass::Request(RequestType::IPatch);
+        packet.header.set_type(MessageType::Confirmable);
+        packet.set_token(token.to_vec());
+        packet.add_option(CoapOption::UriPath, b"schc".to_vec());
+        packet.add_option(CoapOption::ContentFormat, vec![142]);
+        packet.payload = self.ipatch_payload()?;
+        if let Some(tag) = base_tag {
+            packet.add_option(CoapOption::IfMatch, tag.bytes().to_vec());
+        }
+        packet
+            .to_bytes()
+            .map_err(|error| InspectionError::Coap(error.to_string()))
+    }
+}
+
 /// A complete readable rule selected by both `RuleID` keys.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct RuleDetail {
@@ -185,6 +775,55 @@ pub struct RuleDetail {
     pub nature: String,
     /// Entries sorted by entry index.
     pub entries: Vec<RuleEntry>,
+}
+
+impl RuleDetail {
+    /// Resolves an exact or human selector to one canonical entry index.
+    ///
+    /// FID comparisons use the same readable identity across the fixture
+    /// spelling (`ipv6.app-iid`) and the r-schc spelling
+    /// (`fid-ipv6-appiid`): case and punctuation are ignored, as is the
+    /// optional `fid-` prefix. Missing field-position or direction
+    /// discriminators are accepted only when the remaining selector is
+    /// unique.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no entry matches or when more than one entry
+    /// matches. Ambiguous errors contain complete readable matching entries
+    /// in canonical entry order.
+    pub fn resolve_entry_index(
+        &self,
+        selector: &RuleEntrySelector,
+    ) -> Result<usize, InspectionError> {
+        let mut matches = self
+            .entries
+            .iter()
+            .filter(|entry| entry_matches_selector(entry, selector))
+            .cloned()
+            .collect::<Vec<_>>();
+        matches.sort_by_key(|entry| entry.entry_index);
+        match matches.as_slice() {
+            [] => Err(InspectionError::MissingEntry {
+                rule: self.id,
+                selector: selector.description(),
+            }),
+            [entry] => Ok(entry.entry_index),
+            _ => {
+                let readable_matches = matches
+                    .iter()
+                    .map(format_rule_entry)
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                Err(InspectionError::AmbiguousEntry {
+                    rule: self.id,
+                    selector: selector.description(),
+                    matches,
+                    readable_matches,
+                })
+            }
+        }
+    }
 }
 
 /// One consistent active-context status view.
@@ -235,7 +874,11 @@ pub struct ManagementExchange {
     pub response_report: LinkReport,
 }
 
-/// Inspection-only CORECONF service rooted at `/schc`.
+/// CORECONF management service rooted at `/schc`.
+///
+/// GET and FETCH provide inspection. The only accepted mutation is one root
+/// iPATCH containing exactly one complete target-value replacement, which is
+/// validated and published atomically after detached candidate construction.
 pub struct InspectionService {
     active: Arc<ActiveContext>,
     model: CoreconfModel,
@@ -312,6 +955,23 @@ impl InspectionService {
     /// ambiguous.
     pub fn detail(&self, selector: RuleSelector) -> Result<RuleDetail, InspectionError> {
         let snapshot = self.active.snapshot();
+        self.detail_from_snapshot(&snapshot, selector)
+    }
+
+    /// Returns one complete rule from the supplied immutable active snapshot.
+    ///
+    /// This avoids resolving a selector against one snapshot and constructing
+    /// its update against another when a caller is preparing a mutation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no rule matches or when the selector is
+    /// ambiguous.
+    pub fn detail_from_snapshot(
+        &self,
+        snapshot: &ContextSnapshot,
+        selector: RuleSelector,
+    ) -> Result<RuleDetail, InspectionError> {
         let mut matches = snapshot
             .rules()
             .iter()
@@ -332,10 +992,29 @@ impl InspectionService {
         Ok(detail_from_rule(rule))
     }
 
-    /// Handles one complete logical CoAP datagram without mutating context.
+    /// Resolves a parsed update request against the current local rule.
     ///
-    /// GET and FETCH are delegated to rustconf.  Every mutation method is
-    /// rejected before the mutable request handler is called.
+    /// This is an inspection-only operation. It does not convert a target
+    /// value, construct an iPATCH, contact a device, or mutate the context.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same `RuleID` or entry-selection errors as [`Self::detail`]
+    /// and [`RuleUpdateRequest::resolve_entry_index`].
+    pub fn resolve_update_entry(
+        &self,
+        request: &RuleUpdateRequest,
+    ) -> Result<usize, InspectionError> {
+        let detail = self.detail(request.rule)?;
+        request.resolve_entry_index(&detail)
+    }
+
+    /// Handles one complete logical CoAP datagram.
+    ///
+    /// GET and FETCH are delegated to rustconf. The supported root iPATCH is
+    /// validated against one immutable snapshot and published only after the
+    /// detached candidate passes complete context and runtime validation.
+    /// Every other mutation method or shape is rejected before publication.
     ///
     /// # Errors
     ///
@@ -344,6 +1023,21 @@ impl InspectionService {
     pub fn handle_datagram(&mut self, datagram: &[u8]) -> Result<Vec<u8>, InspectionError> {
         let request = Packet::from_bytes(datagram)
             .map_err(|error| InspectionError::Coap(error.to_string()))?;
+        if matches!(
+            request.header.code,
+            MessageClass::Request(RequestType::IPatch)
+        ) {
+            if request.payload.is_empty()
+                && request.get_option(CoapOption::ContentFormat).is_none()
+                && request.get_option(CoapOption::IfMatch).is_none()
+            {
+                let response = coreconf_runtime::coap_types::Response::method_not_allowed(
+                    coreconf_runtime::coap_types::Method::Fetch,
+                );
+                return packet_without_content_format(&request, response);
+            }
+            return self.handle_target_ipatch(&request);
+        }
         if is_mutation(&request) {
             let response = coreconf_runtime::coap_types::Response::method_not_allowed(
                 coreconf_runtime::coap_types::Method::Fetch,
@@ -384,6 +1078,185 @@ impl InspectionService {
         packet_without_content_format(&datagram_packet(&request, datagram)?, response)
     }
 
+    fn handle_target_ipatch(&self, packet: &Packet) -> Result<Vec<u8>, InspectionError> {
+        let request = match packet_to_request(packet, "schc") {
+            Ok(request) => request,
+            Err(response) => return packet_without_content_format(packet, response),
+        };
+        let if_match = match parse_if_match_option(packet) {
+            Ok(if_match) => if_match,
+            Err(error) if error.precondition_failed => {
+                return packet_precondition_without_content_format(packet, &error.message)
+            }
+            Err(error) => {
+                let response =
+                    coreconf_runtime::coap_types::Response::error(error.code, &error.message);
+                return packet_without_content_format(packet, response);
+            }
+        };
+        let response = match self.apply_target_ipatch(&request, if_match) {
+            Ok(response) => response,
+            Err(error) if error.precondition_failed => {
+                return packet_precondition_without_content_format(packet, &error.message)
+            }
+            Err(error) => coreconf_runtime::coap_types::Response::error(error.code, &error.message),
+        };
+        packet_without_content_format(packet, response)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn apply_target_ipatch(
+        &self,
+        request: &Request,
+        if_match: Option<ContextTag>,
+    ) -> Result<coreconf_runtime::coap_types::Response, PatchFailure> {
+        if request.interface != Some(Interface::Management) || !request.path.is_empty() {
+            return Err(PatchFailure::bad(
+                "targeted iPATCH must address the management root",
+            ));
+        }
+        if request.content_format != Some(ContentFormat::YangDataCbor) {
+            return Err(PatchFailure::bad("targeted iPATCH requires yang-data+cbor"));
+        }
+        if !matches!(request.raw_content_format, Some(140 | 142)) {
+            return Err(PatchFailure::bad(
+                "targeted iPATCH requires content format 140 or 142 (yang-data+cbor)",
+            ));
+        }
+        if request.payload.is_empty() {
+            return Err(PatchFailure::bad(
+                "targeted iPATCH payload must contain one replacement",
+            ));
+        }
+        validate_update_model_shape(self.model.composite_model())
+            .map_err(|error| PatchFailure::internal(error.to_string()))?;
+        let instances = decode_instances_with_model(self.model.composite_model(), &request.payload)
+            .map_err(|error| PatchFailure::bad(format!("invalid iPATCH payload: {error}")))?;
+        if instances.len() != 1 {
+            return Err(PatchFailure::bad(format!(
+                "targeted iPATCH must contain exactly one operation, got {}",
+                instances.len()
+            )));
+        }
+        let target = target_patch_from_instance(&instances[0])?;
+
+        let _writer = self
+            .active
+            .writer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let snapshot = self.active.snapshot();
+        if if_match.is_some_and(|tag| tag != snapshot.tag()) {
+            return Err(PatchFailure::precondition(
+                "If-Match context tag does not match the current context",
+            ));
+        }
+        let rule_id = target.selector.rule_id();
+        if snapshot.protected_rules().contains(rule_id) {
+            return Err(PatchFailure::conflict(format!(
+                "RuleID {} is protected and immutable",
+                target.selector
+            )));
+        }
+        if !snapshot.rules().iter().any(|rule| rule.id() == rule_id) {
+            return Err(PatchFailure::conflict(format!(
+                "RuleID {} does not exist",
+                target.selector
+            )));
+        }
+
+        let mut candidate = Datastore::with_data(self.model.clone(), snapshot.tree().clone());
+        let keys = target
+            .path
+            .components
+            .iter()
+            .filter_map(|component| match component {
+                PathComponent::KeyValue(value) => Some(value.clone()),
+                PathComponent::SidDelta(_) => None,
+            })
+            .collect::<Vec<_>>();
+        let sid = target.path.absolute_sid().ok_or_else(|| {
+            PatchFailure::bad("targeted iPATCH path has no target-value leaf SID")
+        })?;
+        let xpath = candidate
+            .create_xpath(sid, &keys)
+            .map_err(|error| PatchFailure::conflict(error.to_string()))?;
+        let parsed_xpath = PredicatePath::parse(&xpath)
+            .map_err(|error| PatchFailure::conflict(error.to_string()))?;
+        let current_value = candidate
+            .get_path(&xpath)
+            .map_err(|error| PatchFailure::conflict(error.to_string()))?
+            .ok_or_else(|| PatchFailure::conflict("target-value leaf does not exist"))?;
+        let composite = self.model.composite_model();
+        let current_wire = composite
+            .identifier_value_to_sid_value_at_path(current_value, &parsed_xpath.canonical_path)
+            .map_err(|error| PatchFailure::conflict(error.to_string()))?;
+        let current_bytes = binary_bytes(&current_wire)
+            .map_err(|error| PatchFailure::conflict(error.to_string()))?;
+        let entry_xpath = candidate
+            .create_xpath(RULE_ENTRY_LIST_SID, &keys[..3])
+            .map_err(|error| PatchFailure::conflict(error.to_string()))?;
+        let entry_value = candidate
+            .get_path(&entry_xpath)
+            .map_err(|error| PatchFailure::conflict(error.to_string()))?
+            .ok_or_else(|| PatchFailure::conflict("target entry does not exist"))?;
+        let field_length_key = tree_key_for_sid(composite, FIELD_LENGTH_SID)
+            .map_err(|error| PatchFailure::conflict(error.to_string()))?;
+        let field_length = entry_value
+            .get(&field_length_key)
+            .and_then(Value::as_u64)
+            .ok_or_else(|| PatchFailure::conflict("target entry has no numeric field-length"))?;
+        if !binary_fits_field_length(&current_bytes, field_length) || field_length == 0 {
+            return Err(PatchFailure::conflict(format!(
+                "existing target value does not fit field length {field_length}"
+            )));
+        }
+        let replacement_identifier = composite
+            .sid_value_to_identifier_value_at_path(
+                target.value.clone(),
+                &parsed_xpath.canonical_path,
+            )
+            .map_err(|error| PatchFailure::conflict(error.to_string()))?;
+        let replacement_wire = composite
+            .identifier_value_to_sid_value_at_path(
+                replacement_identifier.clone(),
+                &parsed_xpath.canonical_path,
+            )
+            .map_err(|error| PatchFailure::conflict(error.to_string()))?;
+        let replacement_bytes = binary_bytes(&replacement_wire)
+            .map_err(|error| PatchFailure::conflict(error.to_string()))?;
+        if replacement_bytes.len() != current_bytes.len() {
+            return Err(PatchFailure::conflict(format!(
+                "target-value replacement has {} bytes, expected {}",
+                replacement_bytes.len(),
+                current_bytes.len()
+            )));
+        }
+        if !binary_fits_field_length(&replacement_bytes, field_length) {
+            return Err(PatchFailure::conflict(format!(
+                "target-value replacement does not fit field length {field_length}"
+            )));
+        }
+        candidate
+            .set_path(&xpath, replacement_identifier)
+            .map_err(|error| PatchFailure::conflict(error.to_string()))?;
+
+        let recipe = self.active.recipe();
+        let prepared = PreparedContext::from_tree(
+            recipe.sid_json.as_ref(),
+            candidate.get_all(),
+            recipe.device_id.clone(),
+            recipe.profile.clone(),
+            recipe.policy.clone(),
+        )
+        .map_err(|error| PatchFailure::conflict(error.to_string()))?;
+        self.active
+            .validate_candidate(&snapshot, &prepared)
+            .map_err(|error| PatchFailure::conflict(error.to_string()))?;
+        self.active.publish_locked(&prepared);
+        Ok(coreconf_runtime::coap_types::Response::changed())
+    }
+
     fn handle_context_check(&self, request: &Packet) -> Result<Vec<u8>, InspectionError> {
         if request.payload.len() != 1 + crate::CONTEXT_TAG_LEN {
             let response = coreconf_runtime::coap_types::Response::error(
@@ -411,6 +1284,174 @@ impl InspectionService {
     }
 }
 
+#[derive(Debug)]
+struct PatchFailure {
+    code: ResponseCode,
+    message: String,
+    precondition_failed: bool,
+}
+
+impl PatchFailure {
+    fn bad(message: impl Into<String>) -> Self {
+        Self {
+            code: ResponseCode::BadRequest,
+            message: message.into(),
+            precondition_failed: false,
+        }
+    }
+
+    fn conflict(message: impl Into<String>) -> Self {
+        Self {
+            code: ResponseCode::Conflict,
+            message: message.into(),
+            precondition_failed: false,
+        }
+    }
+
+    fn precondition(message: impl Into<String>) -> Self {
+        Self {
+            code: ResponseCode::Conflict,
+            message: message.into(),
+            precondition_failed: true,
+        }
+    }
+
+    fn internal(message: impl Into<String>) -> Self {
+        Self {
+            code: ResponseCode::InternalServerError,
+            message: message.into(),
+            precondition_failed: false,
+        }
+    }
+}
+
+fn parse_if_match_option(packet: &Packet) -> Result<Option<ContextTag>, PatchFailure> {
+    let Some(values) = packet.get_option(CoapOption::IfMatch) else {
+        return Ok(None);
+    };
+    if values.len() != 1 {
+        return Err(PatchFailure::bad(
+            "targeted iPATCH must contain zero or one If-Match option",
+        ));
+    }
+    let bytes = values
+        .front()
+        .ok_or_else(|| PatchFailure::bad("If-Match option is empty"))?;
+    if bytes.len() != crate::CONTEXT_TAG_LEN {
+        return Err(PatchFailure::bad(format!(
+            "If-Match option must contain exactly {} bytes",
+            crate::CONTEXT_TAG_LEN
+        )));
+    }
+    let mut tag_bytes = [0_u8; crate::CONTEXT_TAG_LEN];
+    tag_bytes.copy_from_slice(bytes);
+    Ok(Some(ContextTag::new(tag_bytes)))
+}
+
+#[derive(Debug)]
+struct TargetPatch {
+    selector: RuleSelector,
+    path: InstancePath,
+    value: Value,
+}
+
+fn target_patch_from_instance(instance: &Instance) -> Result<TargetPatch, PatchFailure> {
+    let components = &instance.path.components;
+    if components.len() != 9 {
+        return Err(PatchFailure::bad(
+            "targeted iPATCH path must contain the complete rule, entry, and target-value keys",
+        ));
+    }
+    let Some(PathComponent::SidDelta(root_delta)) = components.first() else {
+        return Err(PatchFailure::bad(
+            "targeted iPATCH path is missing the SCHC root",
+        ));
+    };
+    let Some(PathComponent::SidDelta(rule_delta)) = components.get(1) else {
+        return Err(PatchFailure::bad(
+            "targeted iPATCH path is missing the rule list",
+        ));
+    };
+    if *root_delta != SCHC_ROOT_SID || *rule_delta != RULE_LIST_SID - SCHC_ROOT_SID {
+        return Err(PatchFailure::bad(
+            "targeted iPATCH path is not rooted at the complete rule list",
+        ));
+    }
+    let rule_value = patch_key_u64(components.get(2), "RuleID value")?;
+    let rule_bits = patch_key_u64(components.get(3), "RuleID bit length")?;
+    let selector = RuleSelector::new(
+        rule_value,
+        usize::try_from(rule_bits)
+            .map_err(|_| PatchFailure::bad("RuleID bit length is out of range"))?,
+    )
+    .map_err(|error| PatchFailure::bad(error.to_string()))?;
+    let Some(PathComponent::SidDelta(entry_list_delta)) = components.get(4) else {
+        return Err(PatchFailure::bad(
+            "targeted iPATCH path is missing the entry list",
+        ));
+    };
+    if *entry_list_delta != RULE_ENTRY_LIST_SID - RULE_LIST_SID {
+        return Err(PatchFailure::bad(
+            "targeted iPATCH path is missing the canonical entry list",
+        ));
+    }
+    let entry_index = patch_key_usize(components.get(5), "entry index")?;
+    let Some(PathComponent::SidDelta(target_list_delta)) = components.get(6) else {
+        return Err(PatchFailure::bad(
+            "targeted iPATCH path is missing the target-value list",
+        ));
+    };
+    if *target_list_delta != TARGET_VALUE_LIST_SID - RULE_ENTRY_LIST_SID {
+        return Err(PatchFailure::bad(
+            "targeted iPATCH path is missing the canonical target-value list",
+        ));
+    }
+    let target_value_index = patch_key_usize(components.get(7), "target-value index")?;
+    let Some(PathComponent::SidDelta(target_leaf_delta)) = components.get(8) else {
+        return Err(PatchFailure::bad(
+            "targeted iPATCH path is missing the target-value leaf",
+        ));
+    };
+    if *target_leaf_delta != TARGET_VALUE_VALUE_SID - TARGET_VALUE_LIST_SID {
+        return Err(PatchFailure::bad(
+            "targeted iPATCH path names an unsupported leaf",
+        ));
+    }
+    let expected_path = target_value_path(selector, entry_index, target_value_index);
+    if instance.path != expected_path {
+        return Err(PatchFailure::bad(
+            "targeted iPATCH path is not the canonical target-value instance path",
+        ));
+    }
+    let value = instance
+        .value
+        .clone()
+        .ok_or_else(|| PatchFailure::bad("targeted iPATCH cannot delete the target-value leaf"))?;
+    Ok(TargetPatch {
+        selector,
+        path: instance.path.clone(),
+        value,
+    })
+}
+
+fn patch_key_u64(component: Option<&PathComponent>, name: &str) -> Result<u64, PatchFailure> {
+    let Some(PathComponent::KeyValue(value)) = component else {
+        return Err(PatchFailure::bad(format!(
+            "targeted iPATCH is missing the {name} key"
+        )));
+    };
+    value.as_u64().ok_or_else(|| {
+        PatchFailure::bad(format!(
+            "targeted iPATCH {name} key must be an unsigned integer"
+        ))
+    })
+}
+
+fn patch_key_usize(component: Option<&PathComponent>, name: &str) -> Result<usize, PatchFailure> {
+    usize::try_from(patch_key_u64(component, name)?)
+        .map_err(|_| PatchFailure::bad(format!("targeted iPATCH {name} key is out of range")))
+}
+
 fn datagram_packet(
     request: &coreconf_runtime::coap_types::Request,
     original: &[u8],
@@ -424,6 +1465,19 @@ fn packet_without_content_format(
     response: coreconf_runtime::coap_types::Response,
 ) -> Result<Vec<u8>, InspectionError> {
     let mut packet = response_to_packet(request, response);
+    packet.clear_option(CoapOption::ContentFormat);
+    packet
+        .to_bytes()
+        .map_err(|error| InspectionError::Coap(error.to_string()))
+}
+
+fn packet_precondition_without_content_format(
+    request: &Packet,
+    message: &str,
+) -> Result<Vec<u8>, InspectionError> {
+    let response = coreconf_runtime::coap_types::Response::error(ResponseCode::Conflict, message);
+    let mut packet = response_to_packet(request, response);
+    packet.header.code = MessageClass::Response(ResponseType::PreconditionFailed);
     packet.clear_option(CoapOption::ContentFormat);
     packet
         .to_bytes()
@@ -869,17 +1923,17 @@ fn base_request(method: RequestType, message_id: u16, token: &[u8]) -> Packet {
     packet
 }
 
-/// Performs one protected management exchange and verifies route and identity.
+/// Performs the protected management transport and returns the response code.
 ///
 /// # Errors
 ///
 /// Returns an error when SCHC rejects the packet, logical routing is invalid,
-/// or the response does not correlate and carry 2.05 Content.
-pub fn exchange_management(
+/// or the response does not correlate.
+fn exchange_management_response(
     link: &SchcLink,
     raw_link: &RawUdpLink,
     coap_datagram: &[u8],
-) -> Result<ManagementExchange, InspectionError> {
+) -> Result<(u8, ManagementExchange), InspectionError> {
     let request = Ipv6UdpCoapPacket::new(
         CORE_LOGICAL_ADDRESS,
         DEVICE_LOGICAL_ADDRESS,
@@ -926,17 +1980,54 @@ pub fn exchange_management(
             "CoAP message ID or token mismatch".into(),
         ));
     }
-    if response_message.code() != 69 {
+    let code = response_message.code();
+    Ok((
+        code,
+        ManagementExchange {
+            payload: response.coap_payload().to_vec(),
+            request_report: encoded.report().clone(),
+            response_report: decoded.report().clone(),
+        },
+    ))
+}
+
+/// Performs one protected management exchange and requires 2.05 Content.
+///
+/// # Errors
+///
+/// Returns an error when SCHC rejects the packet, logical routing is invalid,
+/// the response does not correlate, or the response is not 2.05 Content.
+pub fn exchange_management(
+    link: &SchcLink,
+    raw_link: &RawUdpLink,
+    coap_datagram: &[u8],
+) -> Result<ManagementExchange, InspectionError> {
+    let (code, exchange) = exchange_management_response(link, raw_link, coap_datagram)?;
+    if code != 69 {
         return Err(InspectionError::UnexpectedResponse(format!(
-            "expected CoAP 2.05 Content, got {}",
-            response_message.code()
+            "expected CoAP 2.05 Content, got {code}"
         )));
     }
-    Ok(ManagementExchange {
-        payload: response.coap_payload().to_vec(),
-        request_report: encoded.report().clone(),
-        response_report: decoded.report().clone(),
-    })
+    Ok(exchange)
+}
+
+/// Performs one protected management exchange and returns the validated CoAP
+/// response code for mutation callers.
+///
+/// Unlike [`exchange_management`], this accepts both successful and rejected
+/// device responses so the caller can distinguish a real 2.04 Changed
+/// acknowledgement from a device-side rejection.
+///
+/// # Errors
+///
+/// Returns an error when SCHC rejects the packet, logical routing is invalid,
+/// or the response does not correlate.
+pub fn exchange_management_update(
+    link: &SchcLink,
+    raw_link: &RawUdpLink,
+    coap_datagram: &[u8],
+) -> Result<(u8, ManagementExchange), InspectionError> {
+    exchange_management_response(link, raw_link, coap_datagram)
 }
 
 /// Formats summaries as stable scriptable lines.
@@ -964,20 +2055,254 @@ pub fn format_rule_detail(detail: &RuleDetail) -> Vec<String> {
     )];
     let mut entries = detail.entries.clone();
     entries.sort_by_key(|entry| entry.entry_index);
-    lines.extend(entries.into_iter().map(|entry| {
-        format!(
-            "ENTRY {} fid={} fp={} di={} length={} tv={} mo={} cda={}",
-            entry.entry_index,
-            entry.fid,
-            entry.field_position,
-            entry.direction,
-            entry.length,
-            entry.target,
-            entry.matching,
-            entry.cda
-        )
-    }));
+    lines.extend(entries.into_iter().map(|entry| format_rule_entry(&entry)));
     lines
+}
+
+fn format_rule_entry(entry: &RuleEntry) -> String {
+    format!(
+        "ENTRY {} fid={} fp={} di={} length={} tv={} mo={} cda={}",
+        entry.entry_index,
+        entry.fid,
+        entry.field_position,
+        entry.direction,
+        entry.length,
+        entry.target,
+        entry.matching,
+        entry.cda
+    )
+}
+
+fn entry_matches_selector(entry: &RuleEntry, selector: &RuleEntrySelector) -> bool {
+    match selector {
+        RuleEntrySelector::Entry { entry_index } => entry.entry_index == *entry_index,
+        RuleEntrySelector::Field {
+            fid,
+            field_position,
+            direction,
+        } => {
+            normalize_fid(&entry.fid) == normalize_fid(fid)
+                && field_position.map_or(true, |position| position == entry.field_position)
+                && direction
+                    .as_deref()
+                    .map_or(true, |selected| selected == entry.direction)
+        }
+    }
+}
+
+fn normalize_fid(fid: &str) -> String {
+    let fid = fid.trim().to_ascii_lowercase();
+    let fid = fid.strip_prefix("fid-").unwrap_or(&fid);
+    fid.chars().filter(char::is_ascii_alphanumeric).collect()
+}
+
+fn invalid_target(message: impl Into<String>) -> InspectionError {
+    InspectionError::InvalidTarget(message.into())
+}
+
+fn validate_update_model_shape(model: &CompositeModel) -> Result<(), InspectionError> {
+    for sid in [
+        SCHC_ROOT_SID,
+        RULE_LIST_SID,
+        RULE_ID_LENGTH_SID,
+        RULE_ID_VALUE_SID,
+        RULE_ENTRY_LIST_SID,
+        RULE_ENTRY_INDEX_SID,
+        FIELD_LENGTH_SID,
+        TARGET_VALUE_LIST_SID,
+        TARGET_VALUE_INDEX_SID,
+        TARGET_VALUE_VALUE_SID,
+    ] {
+        if model.get_identifier(sid).is_none() {
+            return Err(invalid_target(format!(
+                "SID model is missing identifier {sid}"
+            )));
+        }
+    }
+    require_list_keys(
+        model,
+        RULE_LIST_SID,
+        &[RULE_ID_VALUE_SID, RULE_ID_LENGTH_SID],
+    )?;
+    require_list_keys(model, RULE_ENTRY_LIST_SID, &[RULE_ENTRY_INDEX_SID])?;
+    require_list_keys(model, TARGET_VALUE_LIST_SID, &[TARGET_VALUE_INDEX_SID])?;
+    Ok(())
+}
+
+fn require_list_keys(
+    model: &CompositeModel,
+    list_sid: i64,
+    expected: &[i64],
+) -> Result<(), InspectionError> {
+    let Some(keys) = model.get_keys(list_sid) else {
+        return Err(invalid_target(format!(
+            "SID {list_sid} has no list key mapping"
+        )));
+    };
+    if keys.as_slice() != expected {
+        return Err(invalid_target(format!(
+            "SID {list_sid} list keys are {keys:?}, expected {expected:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn tree_key_for_sid(model: &CompositeModel, sid: i64) -> Result<String, InspectionError> {
+    let identifier = model
+        .get_identifier(sid)
+        .ok_or_else(|| invalid_target(format!("SID model is missing identifier {sid}")))?;
+    let key = identifier.rsplit('/').next().unwrap_or(identifier);
+    if key.is_empty() {
+        return Err(invalid_target(format!("SID {sid} has an empty tree key")));
+    }
+    Ok(key.to_owned())
+}
+
+fn serde_value_to_cbor(value: &Value) -> Result<CborValue, InspectionError> {
+    match value {
+        Value::Null => Ok(CborValue::Null),
+        Value::Bool(value) => Ok(CborValue::Bool(*value)),
+        Value::Number(value) => {
+            if let Some(value) = value.as_i64() {
+                Ok(CborValue::Integer(value.into()))
+            } else if let Some(value) = value.as_u64() {
+                Ok(CborValue::Integer(value.into()))
+            } else if let Some(value) = value.as_f64() {
+                Ok(CborValue::Float(value))
+            } else {
+                Err(invalid_target("path contains an invalid number"))
+            }
+        }
+        Value::String(value) => Ok(CborValue::Text(value.clone())),
+        Value::Array(values) => values
+            .iter()
+            .map(serde_value_to_cbor)
+            .collect::<Result<Vec<_>, _>>()
+            .map(CborValue::Array),
+        Value::Object(values) => values
+            .iter()
+            .map(|(key, value)| Ok((CborValue::Text(key.clone()), serde_value_to_cbor(value)?)))
+            .collect::<Result<Vec<_>, InspectionError>>()
+            .map(CborValue::Map),
+    }
+}
+
+fn binary_bytes(value: &Value) -> Result<Vec<u8>, InspectionError> {
+    let values = value
+        .as_array()
+        .ok_or_else(|| invalid_target("target-value/value is not a binary byte array"))?;
+    values
+        .iter()
+        .map(|value| {
+            let byte = value
+                .as_u64()
+                .ok_or_else(|| invalid_target("target-value/value contains a non-byte"))?;
+            u8::try_from(byte)
+                .map_err(|_| invalid_target("target-value/value contains an out-of-range byte"))
+        })
+        .collect()
+}
+
+fn binary_fits_field_length(bytes: &[u8], field_length: u64) -> bool {
+    let Some(storage_bits) = u64::try_from(bytes.len())
+        .ok()
+        .and_then(|length| length.checked_mul(8))
+    else {
+        return false;
+    };
+    if field_length == 0 || field_length > storage_bits {
+        return false;
+    }
+    let excess_bits = storage_bits - field_length;
+    let whole_bytes = usize::try_from(excess_bits / 8).unwrap_or(usize::MAX);
+    if bytes.iter().take(whole_bytes).any(|byte| *byte != 0) {
+        return false;
+    }
+    let remaining_bits = excess_bits % 8;
+    if remaining_bits == 0 || whole_bytes >= bytes.len() {
+        return true;
+    }
+    bytes[whole_bytes] & (0xff_u8 << (8 - remaining_bits)) == 0
+}
+
+fn numeric_target_value(
+    input: &str,
+    current_bytes: &[u8],
+    field_length: &Value,
+) -> Result<Value, InspectionError> {
+    if input.is_empty() || !input.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(invalid_target(
+            "tv must be an unsigned decimal value for a binary target",
+        ));
+    }
+    let number = input
+        .parse::<u64>()
+        .map_err(|_| invalid_target("tv is out of range for an unsigned target value"))?;
+    if current_bytes.is_empty() {
+        return Err(invalid_target(
+            "existing target value has no byte width to preserve",
+        ));
+    }
+    let storage_bits = current_bytes
+        .len()
+        .checked_mul(8)
+        .ok_or_else(|| invalid_target("existing target value byte width is too large"))?;
+    if storage_bits < 64 && number >= (1_u64 << storage_bits) {
+        return Err(invalid_target(format!(
+            "tv={input} does not fit existing target width of {storage_bits} bits"
+        )));
+    }
+    if let Some(bits) = field_length.as_u64() {
+        if bits == 0 {
+            return Err(invalid_target("selected field has a zero-bit length"));
+        }
+        if bits < 64 && number >= (1_u64 << bits) {
+            return Err(invalid_target(format!(
+                "tv={input} does not fit selected field length of {bits} bits"
+            )));
+        }
+    }
+    let mut bytes = vec![0_u8; current_bytes.len()];
+    let mut remaining = number;
+    for byte in bytes.iter_mut().rev() {
+        *byte = (remaining & 0xff) as u8;
+        remaining >>= 8;
+    }
+    if remaining != 0 {
+        return Err(invalid_target(format!(
+            "tv={input} does not fit existing target width of {storage_bits} bits"
+        )));
+    }
+    Ok(Value::Array(
+        bytes
+            .into_iter()
+            .map(|byte| Value::Number(byte.into()))
+            .collect(),
+    ))
+}
+
+fn target_value_path(
+    rule: RuleSelector,
+    entry_index: usize,
+    target_value_index: usize,
+) -> InstancePath {
+    let mut path = InstancePath::new();
+    let mut previous_sid = 0;
+    push_sid(&mut path, &mut previous_sid, SCHC_ROOT_SID);
+    push_sid(&mut path, &mut previous_sid, RULE_LIST_SID);
+    path.push_key(json!(rule.value));
+    path.push_key(json!(rule.bits));
+    push_sid(&mut path, &mut previous_sid, RULE_ENTRY_LIST_SID);
+    path.push_key(json!(entry_index));
+    push_sid(&mut path, &mut previous_sid, TARGET_VALUE_LIST_SID);
+    path.push_key(json!(target_value_index));
+    push_sid(&mut path, &mut previous_sid, TARGET_VALUE_VALUE_SID);
+    path
+}
+
+fn push_sid(path: &mut InstancePath, previous_sid: &mut i64, sid: i64) {
+    path.push_delta(sid - *previous_sid);
+    *previous_sid = sid;
 }
 
 fn summaries_from_rules(rules: &[Rule]) -> Vec<RuleSummary> {

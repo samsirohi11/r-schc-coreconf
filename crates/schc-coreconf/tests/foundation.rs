@@ -61,7 +61,7 @@ fn binary_values_round_trip_losslessly_through_both_models() {
     let (tree, canonical_sor) = canonicalize_sor(SID, SOR).expect("canonical");
     let rebuilt = canonical_sor_from_tree(SID, &tree).expect("re-encode");
     assert_eq!(canonical_sor, rebuilt);
-    assert!(tree["ietf-schc:schc"]["rule"][0]["entry"][19]["target-value"][0]["value"].is_string());
+    assert!(tree["ietf-schc:schc"]["rule"][1]["entry"][19]["target-value"][0]["value"].is_string());
 }
 
 #[test]
@@ -92,7 +92,7 @@ fn management_nature_derives_immutable_protected_rule_ids() {
 #[test]
 fn canonical_mutable_order_is_required() {
     let (mut tree, _) = canonicalize_sor(SID, SOR).expect("canonical");
-    tree["ietf-schc:schc"]["rule"][0]["entry"]
+    tree["ietf-schc:schc"]["rule"][1]["entry"]
         .as_array_mut()
         .expect("entries")
         .swap(0, 1);
@@ -125,7 +125,7 @@ fn rejected_protected_commit_leaves_everything_unchanged() {
     let before = active.snapshot();
     let mut handler = handler_for_active(&active);
     let mut candidate = initial.tree().clone();
-    candidate["ietf-schc:schc"]["rule"][0]["entry"][0]["field-position"] = Value::from(2);
+    candidate["ietf-schc:schc"]["rule"][1]["entry"][0]["field-position"] = Value::from(2);
     let request = Request::new(Method::IPatch)
         .with_interface(Interface::Management)
         .with_payload(
@@ -176,13 +176,13 @@ fn every_protected_lifecycle_mutation_is_rejected() {
         (
             "content",
             Box::new(|tree| {
-                tree["ietf-schc:schc"]["rule"][0]["entry"][0]["field-position"] = Value::from(2);
+                tree["ietf-schc:schc"]["rule"][1]["entry"][0]["field-position"] = Value::from(2);
             }),
         ),
         (
             "nature",
             Box::new(|tree| {
-                tree["ietf-schc:schc"]["rule"][0]["rule-nature"] =
+                tree["ietf-schc:schc"]["rule"][1]["rule-nature"] =
                     Value::String("ietf-schc:nature-no-compression".to_owned());
             }),
         ),
@@ -337,7 +337,7 @@ fn invalid_backend_candidate_has_no_hidden_pending_state() {
     let model = CoreconfModel::from_sid_str(SID).expect("model");
     let mut datastore = Datastore::with_backend(model.composite_model().clone(), active.backend());
     let mut invalid = initial.tree().clone();
-    invalid["ietf-schc:schc"]["rule"][0]["entry"][0]["field-position"] = Value::from(2);
+    invalid["ietf-schc:schc"]["rule"][1]["entry"][0]["field-position"] = Value::from(2);
     assert!(datastore.replace_tree(invalid).is_err());
     assert_eq!(active.generation(), 1);
     assert_eq!(active.tree(), initial.tree().clone());

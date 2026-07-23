@@ -8,13 +8,15 @@ use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::Duration;
 
+use coap_lite::{MessageClass, Packet, ResponseType};
 use common::{bind_raw_link, print_report, Args};
 use schc_coreconf::{
     context_check_request, decode_context_check_payload, decode_rule_detail_payload,
-    decode_rule_list_payload, exchange_management, format_rule_detail, format_rule_list,
-    parse_rule_selector, rule_get_request, rule_list_request, ContextStatus, InspectionService,
-    Ipv6UdpCoapPacket, LinkRole, SchcLink, TrafficOrigin, TrafficRoute, APPLICATION_PORT,
-    CORE_LOGICAL_ADDRESS, DEVICE_LOGICAL_ADDRESS,
+    decode_rule_list_payload, exchange_management, exchange_management_update, format_rule_detail,
+    format_rule_list, parse_rule_selector, parse_rule_update_command, rule_get_request,
+    rule_list_request, ActiveContext, ContextStatus, InspectionService, Ipv6UdpCoapPacket,
+    LinkRole, SchcLink, TrafficOrigin, TrafficRoute, APPLICATION_PORT, CORE_LOGICAL_ADDRESS,
+    DEVICE_LOGICAL_ADDRESS,
 };
 
 const CONSOLE_POLL: Duration = Duration::from_millis(50);
@@ -33,7 +35,7 @@ fn run() -> Result<(), String> {
     };
     let active = args.active_context()?;
     let link = SchcLink::new(active.clone(), LinkRole::Core);
-    let inspection = InspectionService::new(active.clone())
+    let mut inspection = InspectionService::new(active.clone())
         .map_err(|error| format!("load management inspection service: {error}"))?;
     let (app_sid, app_data) = args.application_inputs();
     if !app_sid.is_empty() || app_data.is_some() {
@@ -61,7 +63,7 @@ fn run() -> Result<(), String> {
         while let Ok(command) = commands.try_recv() {
             match handle_command(
                 command.trim(),
-                &inspection,
+                &mut inspection,
                 &active,
                 &link,
                 &raw_link,
@@ -186,7 +188,7 @@ fn stdin_commands() -> Receiver<String> {
 #[allow(clippy::too_many_lines)]
 fn handle_command(
     command: &str,
-    inspection: &InspectionService,
+    inspection: &mut InspectionService,
     active: &std::sync::Arc<schc_coreconf::ActiveContext>,
     link: &SchcLink,
     raw_link: &schc_coreconf::RawUdpLink,
@@ -200,13 +202,35 @@ fn handle_command(
     }
     if command == "help" {
         println!(
-            "commands: context status | context check | rule list core|device | rule get core|device <value>/<bits> | help | quit"
+            "commands: context status | context check | rule list core|device | rule get core|device <value>/<bits> | rule update <value>/<bits> ... | help | quit"
         );
         io::stdout().flush().map_err(|error| error.to_string())?;
         return Ok(CommandResult::Continue);
     }
-    if command.starts_with("rule update") || command.starts_with("context set") {
-        println!("ERROR management mutation unavailable until Task 7");
+    if command.starts_with("rule update") {
+        return execute_rule_update(
+            command,
+            inspection,
+            active,
+            next_message_id,
+            |datagram| {
+                let (code, exchange) = exchange_management_update(link, raw_link, datagram)
+                    .map_err(|error| error.to_string())?;
+                print_report("CORE MGMT TX", &exchange.request_report);
+                print_report("CORE MGMT RX", &exchange.response_report);
+                Ok(code)
+            },
+            |service, datagram| {
+                service
+                    .handle_datagram(datagram)
+                    .map_err(|error| error.to_string())
+            },
+        );
+    }
+    if command.starts_with("context set") {
+        println!(
+            "ERROR context-wide mutation is unsupported; use rule update for targeted changes"
+        );
         return Ok(CommandResult::Unavailable);
     }
     if command == "context status" {
@@ -311,6 +335,138 @@ fn handle_command(
     Ok(CommandResult::Continue)
 }
 
+#[allow(clippy::too_many_lines)]
+fn execute_rule_update<SendDevice, ApplyLocal>(
+    command: &str,
+    inspection: &mut InspectionService,
+    active: &std::sync::Arc<ActiveContext>,
+    next_message_id: &mut u16,
+    send_device: SendDevice,
+    apply_local: ApplyLocal,
+) -> Result<CommandResult, String>
+where
+    SendDevice: FnOnce(&[u8]) -> Result<u8, String>,
+    ApplyLocal: FnOnce(&mut InspectionService, &[u8]) -> Result<Vec<u8>, String>,
+{
+    let request = parse_rule_update_command(command).map_err(|error| {
+        format!("rule update rejected: {error}; device=not-sent; local=unchanged")
+    })?;
+    let snapshot = active.snapshot();
+    if snapshot.protected_rules().contains(request.rule.rule_id()) {
+        return Err(format!(
+            "rule update {}/{} rejected: protected RuleID; device=not-sent; local=unchanged",
+            request.rule.value, request.rule.bits
+        ));
+    }
+    let detail = inspection
+        .detail_from_snapshot(&snapshot, request.rule)
+        .map_err(|error| {
+            format!(
+                "rule update {}/{} rejected: {error}; device=not-sent; local=unchanged",
+                request.rule.value, request.rule.bits
+            )
+        })?;
+    let update = request
+        .resolve_target_value(&detail, snapshot.tree(), inspection.model())
+        .map_err(|error| {
+            format!(
+                "rule update {}/{} rejected: {error}; device=not-sent; local=unchanged",
+                request.rule.value, request.rule.bits
+            )
+        })?;
+    let base_tag = request.if_match.then_some(snapshot.tag());
+    let message_id = *next_message_id;
+    let datagram = update
+        .ipatch_datagram(message_id, &[0xC3], base_tag)
+        .map_err(|error| {
+            format!(
+                "rule update {}/{} entry={} rejected: {error}; device=not-sent; local=unchanged",
+                request.rule.value, request.rule.bits, update.entry_index
+            )
+        })?;
+    *next_message_id = next_message_id.wrapping_add(1);
+
+    let device_code = send_device(&datagram).map_err(|error| {
+        format!(
+            "rule update {}/{} entry={} device exchange failed: {error}; local=unchanged",
+            request.rule.value, request.rule.bits, update.entry_index
+        )
+    })?;
+    if device_code != 68 {
+        return Err(format!(
+            "rule update {}/{} entry={} device={} rejected; local=not-attempted; local=unchanged",
+            request.rule.value,
+            request.rule.bits,
+            update.entry_index,
+            format_coap_code(device_code)
+        ));
+    }
+
+    let local_datagram = apply_local(inspection, &datagram).map_err(|error| {
+        format!(
+            "rule update {}/{} entry={} device=2.04; local application failed: {error}; possible divergence - run context check",
+            request.rule.value, request.rule.bits, update.entry_index
+        )
+    })?;
+    validate_changed_response(&datagram, &local_datagram).map_err(|error| {
+        format!(
+            "rule update {}/{} entry={} device=2.04; local response failed: {error}; possible divergence - run context check",
+            request.rule.value, request.rule.bits, update.entry_index
+        )
+    })?;
+    let after = active.snapshot();
+    let expected_generation = snapshot.generation().checked_add(1).ok_or_else(|| {
+        format!(
+            "rule update {}/{} entry={} device=2.04; local generation overflow; possible divergence - run context check",
+            request.rule.value, request.rule.bits, update.entry_index
+        )
+    })?;
+    if after.generation() != expected_generation {
+        return Err(format!(
+            "rule update {}/{} entry={} device=2.04; local acknowledgement did not publish exactly once (generation={}); possible divergence - run context check",
+            request.rule.value,
+            request.rule.bits,
+            update.entry_index,
+            after.generation()
+        ));
+    }
+    println!(
+        "RULE UPDATE {}/{} entry={} device=2.04 local=2.04 generation={} tag={}",
+        request.rule.value,
+        request.rule.bits,
+        update.entry_index,
+        after.generation(),
+        after.tag()
+    );
+    Ok(CommandResult::Successful)
+}
+
+fn validate_changed_response(
+    request_datagram: &[u8],
+    response_datagram: &[u8],
+) -> Result<(), String> {
+    let request = Packet::from_bytes(request_datagram)
+        .map_err(|error| format!("malformed local request correlation: {error}"))?;
+    let response = Packet::from_bytes(response_datagram)
+        .map_err(|error| format!("malformed local CoAP response: {error}"))?;
+    if response.header.code != MessageClass::Response(ResponseType::Changed) {
+        return Err(format!(
+            "expected local CoAP 2.04 Changed, got {:?}",
+            response.header.code
+        ));
+    }
+    if response.header.message_id != request.header.message_id
+        || response.get_token() != request.get_token()
+    {
+        return Err("local CoAP response did not correlate".to_owned());
+    }
+    Ok(())
+}
+
+fn format_coap_code(code: u8) -> String {
+    format!("{}.{:02}", code >> 5, code & 0x1f)
+}
+
 fn hex_digest(digest: [u8; 32]) -> String {
     use std::fmt::Write as _;
     let mut output = String::with_capacity(64);
@@ -318,4 +474,164 @@ fn hex_digest(digest: [u8; 32]) -> String {
         write!(&mut output, "{byte:02x}").expect("writing to String cannot fail");
     }
     output
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::RefCell;
+    use std::sync::Arc;
+
+    use coap_lite::{MessageClass, Packet, ResponseType};
+    use schc_core::RuleId;
+    use schc_coreconf::{ActiveContext, InspectionService, PreparedContext, ProtectionPolicy};
+    use schc_runtime::{DeviceId, DeviceProfile};
+
+    use super::{execute_rule_update, CommandResult};
+
+    const SID: &str = include_str!("../../../../fixtures/demo/ietf-schc@2026-05-07.sid");
+    const SOR: &[u8] = include_bytes!("../../../../fixtures/demo/initial.sor");
+
+    fn active(device: &str) -> Arc<ActiveContext> {
+        let prepared = PreparedContext::from_sor_with_policy(
+            SID,
+            SOR,
+            DeviceId::new(device).expect("device"),
+            DeviceProfile::default(),
+            ProtectionPolicy::from_rule_ids([RuleId::new(16, 8), RuleId::new(17, 8)]),
+        )
+        .expect("prepared");
+        Arc::new(ActiveContext::new(prepared))
+    }
+
+    #[test]
+    fn device_rejection_does_not_attempt_local_application() {
+        let core = active("core-rejection");
+        let mut inspection = InspectionService::new(Arc::clone(&core)).expect("inspection");
+        let before = core.snapshot();
+        let mut device_sent = false;
+        let mut local_called = false;
+        let result = execute_rule_update(
+            "rule update 20/8 entry=9 tv=6",
+            &mut inspection,
+            &core,
+            &mut 1,
+            |_datagram| {
+                device_sent = true;
+                Ok(128)
+            },
+            |_service, _datagram| {
+                local_called = true;
+                Err("local must not run".to_owned())
+            },
+        );
+        let error = result.expect_err("device rejection");
+        assert!(error.contains("device=4.00"));
+        assert!(error.contains("local=not-attempted"));
+        assert!(device_sent);
+        assert!(!local_called);
+        let after = core.snapshot();
+        assert_eq!(after.tree(), before.tree());
+        assert_eq!(after.generation(), before.generation());
+        assert_eq!(after.tag(), before.tag());
+    }
+
+    #[test]
+    fn device_success_precedes_local_publication_and_contexts_match() {
+        let core = active("core-success");
+        let device = active("device-success");
+        let mut core_inspection =
+            InspectionService::new(Arc::clone(&core)).expect("core inspection");
+        let mut device_inspection =
+            InspectionService::new(Arc::clone(&device)).expect("device inspection");
+        let sequence = RefCell::new(Vec::new());
+        let mut next_message_id = 10;
+        let result = execute_rule_update(
+            "rule update 20/8 entry=9 tv=6 --if-match",
+            &mut core_inspection,
+            &core,
+            &mut next_message_id,
+            |datagram| {
+                sequence.borrow_mut().push("device".to_owned());
+                let response = device_inspection
+                    .handle_datagram(datagram)
+                    .expect("device response");
+                let packet = Packet::from_bytes(&response).expect("device packet");
+                assert_eq!(
+                    packet.header.code,
+                    MessageClass::Response(ResponseType::Changed)
+                );
+                Ok(68)
+            },
+            |service, datagram| {
+                sequence.borrow_mut().push("local".to_owned());
+                service
+                    .handle_datagram(datagram)
+                    .map_err(|error| error.to_string())
+            },
+        );
+        assert_eq!(result.expect("update success"), CommandResult::Successful);
+        assert_eq!(sequence.into_inner(), ["device", "local"]);
+        let core_after = core.snapshot();
+        let device_after = device.snapshot();
+        assert_eq!(core_after.tree(), device_after.tree());
+        assert_eq!(core_after.tag(), device_after.tag());
+        assert_eq!(core_after.generation(), 2);
+        assert_eq!(device_after.generation(), 2);
+        assert_eq!(
+            core_after.tree()["ietf-schc:schc"]["rule"][2]["entry"][9]["target-value"][0]["value"],
+            "AAAAAAAAAAY="
+        );
+    }
+
+    #[test]
+    fn protected_update_is_rejected_before_device_send() {
+        let core = active("core-protected");
+        let mut inspection = InspectionService::new(Arc::clone(&core)).expect("inspection");
+        let before = core.snapshot();
+        let mut device_sent = false;
+        let result = execute_rule_update(
+            "rule update 16/8 entry=0 tv=6",
+            &mut inspection,
+            &core,
+            &mut 1,
+            |_datagram| {
+                device_sent = true;
+                Ok(68)
+            },
+            |_service, _datagram| panic!("local must not run"),
+        );
+        let error = result.expect_err("protected update");
+        assert!(error.contains("protected RuleID"));
+        assert!(!device_sent);
+        let after = core.snapshot();
+        assert_eq!(after.tree(), before.tree());
+        assert_eq!(after.generation(), before.generation());
+    }
+
+    #[test]
+    fn local_failure_after_device_success_reports_possible_divergence() {
+        let core = active("core-divergence");
+        let mut inspection = InspectionService::new(Arc::clone(&core)).expect("inspection");
+        let before = core.snapshot();
+        let mut device_sent = false;
+        let result = execute_rule_update(
+            "rule update 20/8 entry=9 tv=6",
+            &mut inspection,
+            &core,
+            &mut 1,
+            |_datagram| {
+                device_sent = true;
+                Ok(68)
+            },
+            |_service, _datagram| Err("forced local failure".to_owned()),
+        );
+        let error = result.expect_err("local failure");
+        assert!(device_sent);
+        assert!(error.contains("possible divergence"));
+        assert!(error.contains("run context check"));
+        let after = core.snapshot();
+        assert_eq!(after.tree(), before.tree());
+        assert_eq!(after.generation(), before.generation());
+        assert_eq!(after.tag(), before.tag());
+    }
 }

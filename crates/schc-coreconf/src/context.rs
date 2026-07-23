@@ -1,7 +1,9 @@
 use std::fmt;
+use std::io::Cursor;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use arc_swap::ArcSwap;
+use ciborium::value::Value as CborValue;
 use coreconf_model::{CoreconfError, CoreconfModel};
 use coreconf_runtime::Backend;
 use schc_core::{Rule, RuleContext, RuleId, SidRegistry};
@@ -194,6 +196,8 @@ pub struct PreparedContext {
     pub(crate) tree: Arc<Value>,
     pub(crate) sor: Arc<[u8]>,
     runtime: Arc<Runtime>,
+    application_runtime: Arc<Runtime>,
+    pub(crate) application_rule_ids: Arc<[RuleId]>,
     pub(crate) protected: ProtectedRules,
     pub(crate) rule_ids: Arc<[RuleId]>,
     pub(crate) rules: Arc<[Rule]>,
@@ -295,6 +299,14 @@ impl PreparedContext {
             recipe.profile.clone(),
         )
         .map_err(|error| ContextError::Runtime(error.to_string()))?;
+        let (application_runtime, application_rule_ids) = application_runtime(
+            &loaded.sor,
+            &loaded.sid_registry,
+            &loaded.protected,
+            loaded.rule_context.clone(),
+            recipe.device_id.clone(),
+            recipe.profile.clone(),
+        )?;
         let digest = digest_context(&loaded.tree, &loaded.sor)?;
         let tag = crate::codec::context_tag(digest);
         let rules: Arc<[Rule]> = Arc::from(loaded.rule_context.rules().rules().to_vec());
@@ -304,6 +316,8 @@ impl PreparedContext {
             tree: Arc::new(loaded.tree),
             sor: Arc::from(loaded.sor),
             runtime: Arc::new(runtime),
+            application_runtime: Arc::new(application_runtime),
+            application_rule_ids,
             protected: loaded.protected,
             rule_ids,
             rules,
@@ -373,12 +387,111 @@ impl PreparedContext {
     }
 }
 
+const SCHC_ROOT_SID: i64 = 2574;
+const RULE_LIST_SID: i64 = 23;
+const RULE_ID_LENGTH_SID: i64 = 1;
+const RULE_ID_VALUE_SID: i64 = 2;
+
+fn application_runtime(
+    sor: &[u8],
+    sid_registry: &SidRegistry,
+    protected: &ProtectedRules,
+    rule_context: RuleContext,
+    device_id: DeviceId,
+    profile: DeviceProfile,
+) -> Result<(Runtime, Arc<[RuleId]>)> {
+    if protected.ids().is_empty() {
+        let ids = Arc::from(
+            rule_context
+                .rules()
+                .rules()
+                .iter()
+                .map(Rule::id)
+                .collect::<Vec<_>>(),
+        );
+        let runtime = Runtime::new(device_id, rule_context, profile)
+            .map_err(|error| ContextError::Runtime(error.to_string()))?;
+        return Ok((runtime, ids));
+    }
+    let mut filtered: CborValue = ciborium::de::from_reader(Cursor::new(sor))
+        .map_err(|error| ContextError::Cbor(error.to_string()))?;
+    let Some(root) = cbor_map_value_mut(&mut filtered, SCHC_ROOT_SID) else {
+        return Err(ContextError::Cbor(
+            "missing SCHC root in canonical SoR".to_owned(),
+        ));
+    };
+    let Some(rules) = cbor_map_value_mut(root, RULE_LIST_SID).and_then(CborValue::as_array_mut)
+    else {
+        return Err(ContextError::Cbor(
+            "missing rule list in canonical SoR".to_owned(),
+        ));
+    };
+    rules.retain(|rule| {
+        let value = cbor_map_value(rule, RULE_ID_VALUE_SID).and_then(cbor_u64);
+        let length = cbor_map_value(rule, RULE_ID_LENGTH_SID).and_then(cbor_u64);
+        match (value, length.and_then(|bits| usize::try_from(bits).ok())) {
+            (Some(value), Some(bits)) => !protected.contains(RuleId::new(value, bits)),
+            _ => true,
+        }
+    });
+    let mut filtered_sor = Vec::new();
+    ciborium::ser::into_writer(&filtered, &mut filtered_sor)
+        .map_err(|error| ContextError::Cbor(error.to_string()))?;
+    let filtered_context = RuleContext::from_cbor_slice(&filtered_sor, sid_registry.clone())
+        .map_err(|error| ContextError::Schc(error.to_string()))?;
+    let ids = Arc::from(
+        filtered_context
+            .rules()
+            .rules()
+            .iter()
+            .map(Rule::id)
+            .collect::<Vec<_>>(),
+    );
+    let runtime = Runtime::new(device_id, filtered_context, profile)
+        .map_err(|error| ContextError::Runtime(error.to_string()))?;
+    Ok((runtime, ids))
+}
+
+fn cbor_map_value(value: &CborValue, sid: i64) -> Option<&CborValue> {
+    let CborValue::Map(entries) = value else {
+        return None;
+    };
+    entries
+        .iter()
+        .find_map(|(key, value)| (cbor_i64(key) == Some(sid)).then_some(value))
+}
+
+fn cbor_map_value_mut(value: &mut CborValue, sid: i64) -> Option<&mut CborValue> {
+    let CborValue::Map(entries) = value else {
+        return None;
+    };
+    entries
+        .iter_mut()
+        .find_map(|(key, value)| (cbor_i64(key) == Some(sid)).then_some(value))
+}
+
+fn cbor_i64(value: &CborValue) -> Option<i64> {
+    let CborValue::Integer(integer) = value else {
+        return None;
+    };
+    i64::try_from(*integer).ok()
+}
+
+fn cbor_u64(value: &CborValue) -> Option<u64> {
+    let CborValue::Integer(integer) = value else {
+        return None;
+    };
+    u64::try_from(*integer).ok()
+}
+
 /// The immutable tuple published by [`ActiveContext`].
 #[derive(Debug)]
 pub struct ContextSnapshot {
     tree: Arc<Value>,
     sor: Arc<[u8]>,
     runtime: Arc<Runtime>,
+    application_runtime: Arc<Runtime>,
+    application_rule_ids: Arc<[RuleId]>,
     generation: u64,
     digest: [u8; 32],
     protected: ProtectedRules,
@@ -393,6 +506,8 @@ impl ContextSnapshot {
             tree: Arc::clone(&prepared.tree),
             sor: Arc::clone(&prepared.sor),
             runtime: Arc::clone(&prepared.runtime),
+            application_runtime: Arc::clone(&prepared.application_runtime),
+            application_rule_ids: Arc::clone(&prepared.application_rule_ids),
             generation,
             digest: prepared.digest,
             protected: prepared.protected.clone(),
@@ -424,6 +539,14 @@ impl ContextSnapshot {
     #[must_use]
     pub fn runtime_arc(&self) -> Arc<Runtime> {
         Arc::clone(&self.runtime)
+    }
+
+    pub(crate) fn application_runtime(&self) -> &Runtime {
+        self.application_runtime.as_ref()
+    }
+
+    pub(crate) fn contains_application_rule_id(&self, id: RuleId) -> bool {
+        self.application_rule_ids.contains(&id)
     }
 
     /// Returns the monotonic publication generation.

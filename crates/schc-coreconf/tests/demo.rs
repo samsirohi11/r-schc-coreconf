@@ -15,8 +15,8 @@ const INITIAL_RULES: &str = include_str!("../../../fixtures/demo/initial-rules.j
 const UPDATED_RULES: &str = include_str!("../../../fixtures/demo/updated-rules.json");
 const INITIAL_SOR: &[u8] = include_bytes!("../../../fixtures/demo/initial.sor");
 const UPDATED_SOR: &[u8] = include_bytes!("../../../fixtures/demo/updated.sor");
-const INITIAL_SOR_SHA256: &str = "3b5cff837a09e39c9cd063b373ebda27716d00436190e755453f0b7051fb7185";
-const UPDATED_SOR_SHA256: &str = "692c9956783dea29c3286df9cb646630b2a02c5ac2038d10ddbf9749efd80abd";
+const INITIAL_SOR_SHA256: &str = "fbd43f06ba956df8f90c50e1341d949f738824eaab5b1783a2059ce847fb581d";
+const UPDATED_SOR_SHA256: &str = "1e60aa35ad9fd425ee02a3e85b01d42e8c163af99bf1f25c61063d4c447933d0";
 
 fn source(document: &str) -> Value {
     serde_json::from_str(document).expect("OpenSCHC rule source")
@@ -120,12 +120,19 @@ fn rule_sources_have_only_the_minimal_inventory_and_expected_natures() {
         for rule in document.as_array().expect("rules") {
             assert_eq!(rule["RuleIDLength"], 8);
         }
-        for rule_id in [16, 17] {
-            let code = source_field(source_rule(document, rule_id), "COAP.CODE");
-            assert_eq!(code["MO"], "ignore");
-            assert_eq!(code["CDA"], "value-sent");
-            assert!(code.get("TV").is_none());
-        }
+        let protected = source_rule(document, 16);
+        assert_eq!(
+            protected["Compression"]
+                .as_array()
+                .expect("protected compression entries")
+                .len(),
+            0
+        );
+        assert!(protected["NoCompression"].is_null());
+        let code = source_field(source_rule(document, 17), "COAP.CODE");
+        assert_eq!(code["MO"], "ignore");
+        assert_eq!(code["CDA"], "value-sent");
+        assert!(code.get("TV").is_none());
     }
 
     let initial_context = rule_context(INITIAL_SOR);
@@ -146,21 +153,21 @@ fn rule_sources_have_only_the_minimal_inventory_and_expected_natures() {
                 .find_rule(RuleId::new(17, 8))
                 .expect("17/8")
                 .nature(),
-            expected
+            RuleNature::Compression
         );
         assert_eq!(
             context
                 .find_rule(RuleId::new(20, 8))
                 .expect("20/8")
                 .nature(),
-            expected
+            RuleNature::Compression
         );
         assert_eq!(
             context
                 .find_rule(RuleId::new(21, 8))
                 .expect("21/8")
                 .nature(),
-            expected
+            RuleNature::Compression
         );
         assert_eq!(
             context

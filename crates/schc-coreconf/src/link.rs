@@ -335,10 +335,11 @@ impl SchcLink {
     ) -> Result<LinkEncoding, LinkError> {
         let snapshot = self.active.snapshot();
         let (endpoint, flow) = self.role.outbound();
-        let encoded =
-            snapshot
-                .runtime()
-                .encode_detailed(&self.device, endpoint, flow, packet.as_bytes())?;
+        let runtime = match origin {
+            TrafficOrigin::Application => snapshot.application_runtime(),
+            TrafficOrigin::Management => snapshot.runtime(),
+        };
+        let encoded = runtime.encode_detailed(&self.device, endpoint, flow, packet.as_bytes())?;
         let class = classify(&snapshot, encoded.rule_id())?;
         enforce_origin(origin, encoded.rule_id(), class)?;
         let report = LinkReport::encoded(
@@ -368,9 +369,21 @@ impl SchcLink {
         let snapshot = self.active.snapshot();
         let (endpoint, flow) = self.role.inbound();
         let decoded =
-            snapshot
+            match snapshot
                 .runtime()
-                .decode_padded_detailed(&self.device, endpoint, flow, frame)?;
+                .decode_padded_detailed(&self.device, endpoint, flow, frame)
+            {
+                Ok(decoded) => decoded,
+                Err(full_error) => match snapshot.application_runtime().decode_padded_detailed(
+                    &self.device,
+                    endpoint,
+                    flow,
+                    frame,
+                ) {
+                    Ok(decoded) => decoded,
+                    Err(_) => return Err(full_error.into()),
+                },
+            };
         let class = classify(&snapshot, decoded.rule_id())?;
         let packet = Ipv6UdpCoapPacket::parse(decoded.packet())?;
         let peer_role = match self.role {
@@ -378,7 +391,12 @@ impl SchcLink {
             LinkRole::Device => NodeRole::Core,
         };
         let (canonical_endpoint, canonical_flow) = peer_role.outbound();
-        let canonical = snapshot.runtime().encode_detailed(
+        let canonical_runtime = if snapshot.protected_rules().contains(decoded.rule_id()) {
+            snapshot.runtime()
+        } else {
+            snapshot.application_runtime()
+        };
+        let canonical = canonical_runtime.encode_detailed(
             &self.device,
             canonical_endpoint,
             canonical_flow,
@@ -415,7 +433,7 @@ impl SchcLink {
 }
 
 fn classify(snapshot: &crate::ContextSnapshot, rule_id: RuleId) -> Result<TrafficClass, LinkError> {
-    if !snapshot.contains_rule_id(rule_id) {
+    if !snapshot.contains_rule_id(rule_id) && !snapshot.contains_application_rule_id(rule_id) {
         return Err(LinkError::UnknownRuleId {
             value: rule_id.value(),
             bit_len: rule_id.bit_len(),

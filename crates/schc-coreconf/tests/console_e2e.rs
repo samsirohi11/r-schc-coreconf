@@ -3,7 +3,7 @@
 mod support;
 
 use std::net::{SocketAddr, UdpSocket};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -32,6 +32,77 @@ fn prepared(sor: &[u8], device_id: &str) -> PreparedContext {
         ProtectionPolicy::from_rule_ids([RuleId::new(16, 8), RuleId::new(17, 8)]),
     )
     .expect("prepared context")
+}
+
+fn start_processes(
+    core_sor: Option<&Path>,
+    device_sor: Option<&Path>,
+) -> (TestProcess, TestProcess) {
+    let app_sid =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/demo/demo-data.sid");
+    let app_data =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/demo/app-data.json");
+    let (device_reservation, device_link) = reserve_address();
+    let (core_reservation, core_link) = reserve_address();
+    let (app_reservation, core_app) = reserve_address();
+    let mut device_args = vec![
+        "--link-bind".to_owned(),
+        device_link.to_string(),
+        "--link-peer".to_owned(),
+        core_link.to_string(),
+        "--app-sid".to_owned(),
+        app_sid.to_string_lossy().into_owned(),
+        "--app-data".to_owned(),
+        app_data.to_string_lossy().into_owned(),
+    ];
+    if let Some(path) = device_sor {
+        device_args.extend(["--sor".to_owned(), path.to_string_lossy().into_owned()]);
+    }
+    drop(device_reservation);
+    let device = TestProcess::spawn(env!("CARGO_BIN_EXE_schc-coreconf-device"), &device_args);
+    device
+        .ready
+        .recv_timeout(Duration::from_secs(5))
+        .expect("device readiness");
+
+    let mut core_args = vec![
+        "--link-bind".to_owned(),
+        core_link.to_string(),
+        "--link-peer".to_owned(),
+        device_link.to_string(),
+        "--app-bind".to_owned(),
+        core_app.to_string(),
+    ];
+    if let Some(path) = core_sor {
+        core_args.extend(["--sor".to_owned(), path.to_string_lossy().into_owned()]);
+    }
+    drop(core_reservation);
+    drop(app_reservation);
+    let core = TestProcess::spawn(env!("CARGO_BIN_EXE_schc-coreconf-core"), &core_args);
+    core.ready
+        .recv_timeout(Duration::from_secs(5))
+        .expect("core readiness");
+    (device, core)
+}
+
+fn assert_no_stderr(process_name: &str, stderr: &str) {
+    assert!(stderr.is_empty(), "{process_name} stderr: {stderr}");
+}
+
+fn context_checks(stdout: &str, result: &str) -> Vec<(String, String)> {
+    stdout
+        .lines()
+        .filter_map(|line| {
+            let words = line.split_whitespace().collect::<Vec<_>>();
+            (words.len() >= 5 && words[0] == "CONTEXT" && words[1] == "CHECK" && words[2] == result)
+                .then(|| {
+                    (
+                        words[3].trim_start_matches("core_tag=").to_owned(),
+                        words[4].trim_start_matches("device_tag=").to_owned(),
+                    )
+                })
+        })
+        .collect()
 }
 
 #[test]
@@ -149,4 +220,113 @@ fn real_console_inspection_reports_remote_mismatch_and_detail() {
     let (_, device_stderr) = device.output();
     assert!(device_stderr.is_empty(), "device stderr: {device_stderr}");
     std::fs::remove_file(updated_path).expect("remove temporary SoR");
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn real_console_rule_update_synchronizes_contexts_over_protected_link() {
+    let (mut device, mut core) = start_processes(None, None);
+    core.write_stdin(
+        b"context check\nrule update 20/8 fid=ipv6.app-iid tv=6 --if-match\ncontext check\nrule get core 20/8\nrule get device 20/8\nquit\n",
+    );
+    let core_status = core.wait_timeout(Duration::from_secs(20));
+    assert!(core_status.success(), "core status: {core_status}");
+    let (core_stdout, core_stderr) = core.output();
+    assert_no_stderr("core", &core_stderr);
+    let equal_checks = context_checks(&core_stdout, "equal");
+    assert_eq!(equal_checks.len(), 2, "core stdout: {core_stdout}");
+    assert_eq!(equal_checks[0].0, equal_checks[0].1);
+    assert_eq!(equal_checks[1].0, equal_checks[1].1);
+    assert_ne!(equal_checks[0], equal_checks[1]);
+    assert!(
+        core_stdout.contains("CORE MGMT TX class=ProtectedManagement rule=16/8"),
+        "core stdout: {core_stdout}"
+    );
+    assert!(
+        core_stdout.contains("CORE MGMT RX class=ProtectedManagement rule=17/8"),
+        "core stdout: {core_stdout}"
+    );
+    assert!(
+        core_stdout.contains("RULE UPDATE 20/8 entry=9 device=2.04 local=2.04"),
+        "core stdout: {core_stdout}"
+    );
+    assert!(core_stdout.contains("ENTRY 9 fid=fid-ipv6-appiid"));
+    assert!(core_stdout.contains("tv=0x0000000000000006"));
+    assert!(core_stdout.contains("RULE 20/8 nature=compression"));
+
+    device.kill();
+    let (device_stdout, device_stderr) = device.output();
+    assert_no_stderr("device", &device_stderr);
+    assert!(
+        device_stdout.contains("DEVICE RX class=ProtectedManagement rule=16/8"),
+        "device stdout: {device_stdout}"
+    );
+    assert!(
+        device_stdout.contains("DEVICE MGMT TX class=ProtectedManagement rule=17/8"),
+        "device stdout: {device_stdout}"
+    );
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn real_console_rule_update_rejects_stale_if_match_without_local_publication() {
+    let updated = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/demo/updated.sor");
+    let (mut device, mut core) = start_processes(Some(&updated), None);
+    core.write_stdin(
+        b"context status\ncontext check\nrule update 20/8 fid=ipv6.app-iid tv=6 --if-match\ncontext status\ncontext check\nquit\n",
+    );
+    let core_status = core.wait_timeout(Duration::from_secs(20));
+    assert!(core_status.success(), "core status: {core_status}");
+    let (core_stdout, core_stderr) = core.output();
+    assert_no_stderr("core", &core_stderr);
+    let mismatch_checks = context_checks(&core_stdout, "mismatch");
+    assert_eq!(mismatch_checks.len(), 2, "core stdout: {core_stdout}");
+    assert_ne!(mismatch_checks[0].0, mismatch_checks[0].1);
+    assert_eq!(mismatch_checks[0], mismatch_checks[1]);
+    assert!(
+        core_stdout.contains("CORE MGMT TX class=ProtectedManagement rule=16/8"),
+        "core stdout: {core_stdout}"
+    );
+    assert!(
+        core_stdout.contains("CORE MGMT RX class=ProtectedManagement rule=17/8"),
+        "core stdout: {core_stdout}"
+    );
+    assert!(
+        core_stdout.contains("device=4.12 rejected; local=not-attempted; local=unchanged"),
+        "core stdout: {core_stdout}"
+    );
+    assert!(!core_stdout.contains("RULE UPDATE 20/8 entry=9 device=2.04"));
+    let statuses = core_stdout
+        .lines()
+        .filter(|line| line.starts_with("CONTEXT generation="))
+        .collect::<Vec<_>>();
+    assert_eq!(statuses.len(), 2, "core stdout: {core_stdout}");
+    assert!(statuses.iter().all(|line| line.contains("generation=1")));
+    assert!(statuses[0].contains("tag=") && statuses[1].contains("tag="));
+    assert_eq!(
+        statuses[0]
+            .split("tag=")
+            .nth(1)
+            .unwrap()
+            .split_whitespace()
+            .next(),
+        statuses[1]
+            .split("tag=")
+            .nth(1)
+            .unwrap()
+            .split_whitespace()
+            .next()
+    );
+
+    device.kill();
+    let (device_stdout, device_stderr) = device.output();
+    assert_no_stderr("device", &device_stderr);
+    assert!(
+        device_stdout.contains("DEVICE RX class=ProtectedManagement rule=16/8"),
+        "device stdout: {device_stdout}"
+    );
+    assert!(
+        device_stdout.contains("DEVICE MGMT TX class=ProtectedManagement rule=17/8"),
+        "device stdout: {device_stdout}"
+    );
 }

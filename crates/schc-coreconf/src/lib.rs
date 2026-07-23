@@ -28,10 +28,12 @@ pub use link::{
 };
 pub use management::{
     context_check_request, context_check_response, decode_context_check_payload,
-    decode_rule_detail_payload, decode_rule_list_payload, exchange_management, format_rule_detail,
-    format_rule_list, parse_rule_selector, rule_get_request, rule_list_request, ContextCheckResult,
-    ContextStatus, InspectionError, InspectionService, ManagementExchange, RuleDetail, RuleEntry,
-    RuleSelector, RuleSummary, CONTEXT_CHECK_MARKER,
+    decode_rule_detail_payload, decode_rule_list_payload, exchange_management,
+    exchange_management_update, format_rule_detail, format_rule_list, parse_rule_selector,
+    parse_rule_update_command, rule_get_request, rule_list_request, ContextCheckResult,
+    ContextStatus, InspectionError, InspectionService, ManagementExchange, ResolvedRuleUpdate,
+    RuleDetail, RuleEntry, RuleEntrySelector, RuleSelector, RuleSummary, RuleUpdateRequest,
+    CONTEXT_CHECK_MARKER,
 };
 pub use packet::{
     CoapMessage, CoapOption, Ipv6UdpCoapPacket, PacketError, PacketMetadata, PacketResult,

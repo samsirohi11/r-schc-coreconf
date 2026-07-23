@@ -11,8 +11,8 @@ use support::TestProcess;
 
 use schc_core::{RuleId, SidRegistry};
 use schc_coreconf::{
-    temporary_ordinary_response, ActiveContext, GenericDataService, Ipv6UdpCoapPacket, LinkError,
-    LinkRole, PreparedContext, ProtectionPolicy, RawUdpLink, SchcLink, TrafficClass, TrafficOrigin,
+    temporary_ordinary_response, ActiveContext, GenericDataService, Ipv6UdpCoapPacket, LinkRole,
+    PreparedContext, ProtectionPolicy, RawUdpLink, SchcLink, TrafficClass, TrafficOrigin,
     TrafficRoute, APPLICATION_PORT, CORE_LOGICAL_ADDRESS, DEVICE_LOGICAL_ADDRESS, MANAGEMENT_PORT,
 };
 use schc_runtime::{DeviceId, DeviceProfile};
@@ -180,18 +180,11 @@ fn protected_rules_authorize_management_and_application_origin_cannot_impersonat
         .expect("management response decodes");
     assert_eq!(core_response.route(), TrafficRoute::ProtectedManagement);
 
-    let error = core
+    let application = core
         .encode(TrafficOrigin::Application, &request)
-        .expect_err("application origin must not select protected rule");
-    assert!(matches!(
-        error,
-        LinkError::OriginRuleMismatch {
-            origin: TrafficOrigin::Application,
-            value: 16,
-            bit_len: 8,
-            selected: TrafficClass::ProtectedManagement,
-        }
-    ));
+        .expect("application origin must use the filtered ordinary runtime");
+    assert_eq!(application.report().traffic_class, TrafficClass::Ordinary);
+    assert!(![RuleId::new(16, 8), RuleId::new(17, 8)].contains(&application.report().rule_id));
 }
 
 #[test]
