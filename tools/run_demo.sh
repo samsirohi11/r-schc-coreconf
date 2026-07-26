@@ -129,6 +129,7 @@ mkfifo "$CORE_FIFO"
 exec 3<>"$CORE_FIFO"
 
 "$DEVICE" \
+	--debug \
 	--link-bind "127.0.0.1:$DEVICE_LINK_PORT" \
 	--link-peer "127.0.0.1:$CORE_LINK_PORT" \
 	--app-sid "$APP_SID" \
@@ -138,6 +139,7 @@ DEVICE_PID=$!
 wait_for_line "$DEVICE_LOG" "READY role=device" "$DEVICE_PID"
 
 "$CORE" \
+	--debug \
 	--link-bind "127.0.0.1:$CORE_LINK_PORT" \
 	--link-peer "127.0.0.1:$DEVICE_LINK_PORT" \
 	--app-bind "127.0.0.1:$CORE_APP_PORT" \

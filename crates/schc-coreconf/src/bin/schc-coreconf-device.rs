@@ -4,10 +4,11 @@ mod common;
 
 use std::io::{self, Write};
 
-use common::{bind_raw_link, print_report, Args};
+use common::{bind_raw_link, print_report, Args, DEVICE_POLL};
 use schc_coreconf::{
-    GenericDataService, InspectionService, Ipv6UdpCoapPacket, LinkRole, SchcLink, TrafficOrigin,
-    TrafficRoute, APPLICATION_PORT, CORE_LOGICAL_ADDRESS, DEVICE_LOGICAL_ADDRESS, MANAGEMENT_PORT,
+    GenericDataService, InspectionService, Ipv6UdpCoapPacket, LinkError, LinkRole, SchcLink,
+    TrafficOrigin, TrafficRoute, APPLICATION_PORT, CORE_LOGICAL_ADDRESS, DEVICE_LOGICAL_ADDRESS,
+    MANAGEMENT_PORT,
 };
 
 fn main() {
@@ -36,20 +37,30 @@ fn run() -> Result<(), String> {
     let app_data = app_data.ok_or("missing required --app-data")?;
     let mut application = GenericDataService::from_files(app_sid, app_data, "c")
         .map_err(|error| format!("load application datastore: {error}"))?;
-    let (raw_link, link_local) = bind_raw_link(&args)?;
+    let (raw_link, link_local) = bind_raw_link(&args, Some(DEVICE_POLL))?;
     println!("READY role=device link={link_local}");
+    println!("WAITING role=device peer={}", args.link_peer);
     io::stdout()
         .flush()
         .map_err(|error| format!("flush readiness: {error}"))?;
 
     loop {
-        let received = raw_link
-            .recv()
-            .map_err(|error| format!("receive request SCHC frame: {error}"))?;
+        let received = match raw_link.recv() {
+            Ok(received) => received,
+            Err(LinkError::Io(error))
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+            {
+                continue
+            }
+            Err(error) => return Err(format!("receive request SCHC frame: {error}")),
+        };
         let decoded = link
             .decode(received.bytes())
             .map_err(|error| format!("decode request SCHC frame: {error}"))?;
-        print_report("DEVICE RX", decoded.report());
+        print_report("DEVICE RX", decoded.report(), args.debug);
         match decoded.route() {
             TrafficRoute::ProtectedManagement => {
                 let request = decoded.packet();
@@ -80,7 +91,7 @@ fn run() -> Result<(), String> {
                 if encoded.report().rule_id != schc_core::RuleId::new(17, 8) {
                     return Err("management response did not select RuleID 17/8".to_owned());
                 }
-                print_report("DEVICE MGMT TX", encoded.report());
+                print_report("DEVICE MGMT TX", encoded.report(), args.debug);
                 raw_link
                     .send_frame(encoded.frame())
                     .map_err(|error| format!("send management response SCHC frame: {error}"))?;
@@ -122,7 +133,7 @@ fn run() -> Result<(), String> {
                 let encoded = link
                     .encode(TrafficOrigin::Application, &response)
                     .map_err(|error| format!("encode ordinary response: {error}"))?;
-                print_report("DEVICE TX", encoded.report());
+                print_report("DEVICE TX", encoded.report(), args.debug);
                 raw_link
                     .send_frame(encoded.frame())
                     .map_err(|error| format!("send response SCHC frame: {error}"))?;

@@ -96,6 +96,44 @@ By default, the script builds from the checked-out source on every run.
 Set `DEMO_BUILD=0` to explicitly skip the build and use existing binaries.
 When `DEMO_BUILD=0`, `DEMO_BIN_DIR` may point to a directory containing the three binaries.
 
+## Interactive CLI use
+
+Run the core and data client from a terminal, not through a pipe, to get startup help and a visible prompt.
+The core prompt is `core>` and the data client prompt is `data>`.
+Both processes also accept `help` at any time.
+The device is a background service and prints `WAITING role=device` while it waits for frames.
+
+Traffic reports are concise by default and include the selected RuleID, packet size, SCHC bit count, padded frame size, and compression ratio.
+Pass `--debug` to `schc-coreconf-core` or `schc-coreconf-device` when full `packet_hex` and `frame_hex` fields are needed for wire-level diagnosis.
+The final demonstration script enables this mode automatically for its proof checks.
+
+The core command list is:
+
+```text
+context status
+context check
+rule list core|device
+rule get core|device <value>/<bits>
+rule update <value>/<bits> entry=<index> tv=<value> [--if-match]
+rule update <value>/<bits> fid=<field> [fp=<position>] [di=<direction>] tv=<value> [--if-match]
+help
+quit
+```
+
+The data client command list is:
+
+```text
+discover [query]
+schema [filter]
+get <path>
+fetch <path>
+set <path> <json-value>
+delete <path>
+reload
+help
+quit
+```
+
 ## Manual process commands
 
 The automated script is the recommended user-facing command because it reserves no fixed external files and performs all assertions.
@@ -172,6 +210,8 @@ If a previous manual run is still alive, stop the three processes before retryin
 
 If a process fails before printing `READY`, run `cargo build -p schc-coreconf --bins` and verify that the fixture paths exist.
 The script prints captured temporary logs when it fails.
+The device is expected to remain running while idle; its short receive polling interval treats normal `TimedOut` or `WouldBlock` results as no frame rather than a fatal error.
+Unexpected socket errors remain fatal.
 
 If the data client prints an application error, confirm that the core and device use the same initial SoR and the sample application SID and datastore.
 The expected FETCH result is the exact output line `7`.

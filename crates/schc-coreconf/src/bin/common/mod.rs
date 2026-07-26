@@ -13,11 +13,15 @@ use schc_runtime::{DeviceId, DeviceProfile};
 const DEFAULT_SID: &str = include_str!("../../../../../fixtures/demo/ietf-schc@2026-05-07.sid");
 const DEFAULT_SOR: &[u8] = include_bytes!("../../../../../fixtures/demo/initial.sor");
 
+#[allow(dead_code)]
 pub(crate) const OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
+#[allow(dead_code)]
+pub(crate) const DEVICE_POLL: Duration = Duration::from_millis(250);
 
 pub(crate) struct Args {
     pub(crate) link_bind: SocketAddr,
     pub(crate) link_peer: SocketAddr,
+    pub(crate) debug: bool,
     pub(crate) once: bool,
     app_sid: Vec<PathBuf>,
     app_data: Option<PathBuf>,
@@ -39,6 +43,7 @@ impl Args {
         let mut link_bind = None;
         let mut link_peer = None;
         let mut app_bind = None;
+        let mut debug = false;
         let mut once = false;
         let mut help = false;
         let mut arguments = env::args().skip(1);
@@ -67,6 +72,7 @@ impl Args {
                         "--app-bind",
                     )?);
                 }
+                "--debug" => debug = true,
                 "--once" => once = true,
                 "-h" | "--help" => help = true,
                 other => return Err(format!("unknown argument {other}; use --help")),
@@ -102,6 +108,7 @@ impl Args {
                 device_id,
                 link_bind: link_bind.ok_or("missing required --link-bind")?,
                 link_peer: link_peer.ok_or("missing required --link-peer")?,
+                debug,
                 once,
             },
             app_bind,
@@ -128,11 +135,14 @@ impl Args {
     }
 }
 
-pub(crate) fn bind_raw_link(args: &Args) -> Result<(RawUdpLink, SocketAddr), String> {
+pub(crate) fn bind_raw_link(
+    args: &Args,
+    read_timeout: Option<Duration>,
+) -> Result<(RawUdpLink, SocketAddr), String> {
     let raw_link = RawUdpLink::bind(args.link_bind, args.link_peer)
         .map_err(|error| format!("bind SCHC link: {error}"))?;
     raw_link
-        .set_read_timeout(Some(OPERATION_TIMEOUT))
+        .set_read_timeout(read_timeout)
         .map_err(|error| format!("set SCHC link timeout: {error}"))?;
     let local = raw_link
         .local_addr()
@@ -140,24 +150,30 @@ pub(crate) fn bind_raw_link(args: &Args) -> Result<(RawUdpLink, SocketAddr), Str
     Ok((raw_link, local))
 }
 
-pub(crate) fn print_report(prefix: &str, report: &LinkReport) {
+pub(crate) fn print_report(prefix: &str, report: &LinkReport, debug: bool) {
     let bit_len = report
         .schc_bit_len
         .map_or_else(|| "unknown".to_owned(), |bits| bits.to_string());
     let ratio = report
         .compression_ratio()
         .map_or_else(|| "unknown".to_owned(), |value| format!("{value:.3}"));
-    println!(
-        "{prefix} class={:?} rule={}/{} packet_bytes={} frame_bits={} frame_bytes={} ratio={ratio} packet_hex={} frame_hex={}",
+    print!(
+        "{prefix} class={:?} rule={}/{} packet_bytes={} frame_bits={} frame_bytes={} ratio={ratio}",
         report.traffic_class,
         report.rule_id.value(),
         report.rule_id.bit_len(),
         report.packet_size,
         bit_len,
         report.padded_byte_len,
-        hex_bytes(&report.packet_bytes),
-        hex_bytes(&report.frame_bytes)
     );
+    if debug {
+        print!(
+            " packet_hex={} frame_hex={}",
+            hex_bytes(&report.packet_bytes),
+            hex_bytes(&report.frame_bytes)
+        );
+    }
+    println!();
 }
 
 fn hex_bytes(bytes: &[u8]) -> String {
@@ -194,8 +210,16 @@ fn print_usage(process_name: &str, requires_app_bind: bool) {
         " --app-sid PATH --app-data PATH"
     };
     println!(
-        "Usage: {process_name} --link-bind ADDR --link-peer ADDR{app} [--once] [--sid PATH] [--sor PATH] [--device-id ID]"
+        "Usage: {process_name} --link-bind ADDR --link-peer ADDR{app} [--debug] [--once] [--sid PATH] [--sor PATH] [--device-id ID]"
     );
+    println!("  --debug  Include complete logical-packet and raw-frame hex in traffic reports");
+    if requires_app_bind {
+        println!("Interactive commands: context status, context check, rule list, rule get, rule update, help, quit");
+    } else {
+        println!(
+            "The device is a service process and waits for SCHC frames from its configured peer."
+        );
+    }
 }
 
 fn next(arguments: &mut impl Iterator<Item = String>, flag: &str) -> Result<String, String> {

@@ -163,6 +163,7 @@ fn final_real_process_demo_reuses_logical_request_and_shrinks_raw_frame() {
     let app_data = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../fixtures/demo/app-data.json");
     let device_args = vec![
+        "--debug".to_owned(),
         "--link-bind".to_owned(),
         device_link.to_string(),
         "--link-peer".to_owned(),
@@ -173,6 +174,7 @@ fn final_real_process_demo_reuses_logical_request_and_shrinks_raw_frame() {
         app_data.to_string_lossy().into_owned(),
     ];
     let core_args = vec![
+        "--debug".to_owned(),
         "--link-bind".to_owned(),
         core_link.to_string(),
         "--link-peer".to_owned(),
@@ -231,6 +233,10 @@ fn final_real_process_demo_reuses_logical_request_and_shrinks_raw_frame() {
     let (device_stdout, device_stderr) = device.output();
     assert!(core_stderr.is_empty(), "core stderr: {core_stderr}");
     assert!(device_stderr.is_empty(), "device stderr: {device_stderr}");
+    assert!(core_stdout.contains("packet_hex="));
+    assert!(core_stdout.contains("frame_hex="));
+    assert!(device_stdout.contains("packet_hex="));
+    assert!(device_stdout.contains("frame_hex="));
 
     let core_request_reports = process_reports(&core_stdout, "CORE TX class=Ordinary ");
     let core_response_reports = process_reports(&core_stdout, "CORE RX class=Ordinary ");
@@ -738,4 +744,75 @@ fn real_three_process_data_client_discovers_and_fetches() {
     assert!(device_stderr.is_empty(), "device stderr: {device_stderr}");
     assert!(core_stdout.contains("CORE TX class=Ordinary"));
     assert!(device_stdout.contains("DEVICE RX class=Ordinary"));
+    assert!(!core_stdout.contains("packet_hex="));
+    assert!(!core_stdout.contains("frame_hex="));
+    assert!(!device_stdout.contains("packet_hex="));
+    assert!(!device_stdout.contains("frame_hex="));
+}
+
+#[test]
+fn process_help_explains_interactive_commands_and_debug_reports() {
+    for (program, expected) in [
+        (
+            env!("CARGO_BIN_EXE_schc-coreconf-core"),
+            ["--debug", "Interactive commands", "context check"].as_slice(),
+        ),
+        (
+            env!("CARGO_BIN_EXE_schc-coreconf-device"),
+            ["--debug", "waits for SCHC frames"].as_slice(),
+        ),
+        (
+            env!("CARGO_BIN_EXE_schc-data-client"),
+            ["Data client commands:", "fetch <path>", "quit"].as_slice(),
+        ),
+    ] {
+        let output = Command::new(program)
+            .arg("--help")
+            .output()
+            .expect("run help");
+        assert!(output.status.success(), "help status: {}", output.status);
+        assert!(output.stderr.is_empty(), "help stderr: {:?}", output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for line in expected {
+            assert!(stdout.contains(line), "missing {line:?} in {stdout}");
+        }
+    }
+}
+
+#[test]
+fn idle_device_stays_alive_between_frames() {
+    let (device_reservation, device_link) = reserve_address();
+    let (core_reservation, core_link) = reserve_address();
+    let app_sid = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/demo/demo-data.sid");
+    let app_data = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/demo/app-data.json");
+    let args = vec![
+        "--link-bind".to_owned(),
+        device_link.to_string(),
+        "--link-peer".to_owned(),
+        core_link.to_string(),
+        "--app-sid".to_owned(),
+        app_sid.to_string_lossy().into_owned(),
+        "--app-data".to_owned(),
+        app_data.to_string_lossy().into_owned(),
+    ];
+    drop(device_reservation);
+    drop(core_reservation);
+    let mut device = TestProcess::spawn(env!("CARGO_BIN_EXE_schc-coreconf-device"), &args);
+    device
+        .ready
+        .recv_timeout(Duration::from_secs(5))
+        .expect("device readiness");
+    // The old 30-second socket timeout caused an idle device to exit here.
+    // Keep this over that threshold so the regression test exercises real idle survival.
+    std::thread::sleep(Duration::from_secs(31));
+    assert!(device.is_running(), "idle device exited unexpectedly");
+    let (stdout, stderr) = device.output();
+    assert!(
+        stdout.contains("WAITING role=device"),
+        "device stdout: {stdout}"
+    );
+    assert!(stderr.is_empty(), "device stderr: {stderr}");
+    device.kill();
 }

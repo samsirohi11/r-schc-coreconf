@@ -1,7 +1,7 @@
 //! Scriptable CORECONF application data client.
 
 use std::env;
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, IsTerminal, Write};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
@@ -36,22 +36,36 @@ fn run() -> Result<(), String> {
     let mut client = DataClient::connect(model, options.server, options.resource_path)
         .map_err(|error| format!("connect application endpoint: {error}"))?;
     println!("READY role=data-client server={}", client.endpoint());
-    io::stdout()
-        .flush()
-        .map_err(|error| format!("flush readiness: {error}"))?;
+    let interactive = io::stdin().is_terminal() && io::stdout().is_terminal();
+    if interactive {
+        println!();
+        print_command_help();
+        print_prompt()?;
+    } else {
+        io::stdout()
+            .flush()
+            .map_err(|error| format!("flush readiness: {error}"))?;
+    }
 
     let stdin = io::stdin();
     for line in stdin.lock().lines() {
         let line = line.map_err(|error| format!("read command: {error}"))?;
         if line.trim().is_empty() {
+            if interactive {
+                print_prompt()?;
+            }
             continue;
         }
         if execute_command(&mut client, &line)? {
             break;
         }
-        io::stdout()
-            .flush()
-            .map_err(|error| format!("flush command output: {error}"))?;
+        if interactive {
+            print_prompt()?;
+        } else {
+            io::stdout()
+                .flush()
+                .map_err(|error| format!("flush command output: {error}"))?;
+        }
     }
     Ok(())
 }
@@ -98,7 +112,7 @@ fn execute_command(client: &mut DataClient, line: &str) -> Result<bool, String> 
             print_mutation(client.delete(path));
         }
         "reload" => print_json_value(client.reload()),
-        "help" => print_usage(),
+        "help" => print_command_help(),
         "quit" => return Ok(true),
         other => println!("error: unknown command '{other}' (use help)"),
     }
@@ -206,5 +220,25 @@ fn next(arguments: &mut impl Iterator<Item = String>, flag: &str) -> Result<Stri
 
 fn print_usage() {
     println!("Usage: schc-data-client --sid PATH [--sid PATH ...] --server ADDR [--path PATH]");
-    println!("Commands: discover [query], schema [filter], get <path>, fetch <path>, set <path> <json-value>, delete <path>, reload, help, quit");
+    print_command_help();
+}
+
+fn print_command_help() {
+    println!("Data client commands:");
+    println!("  discover [query]");
+    println!("  schema [filter]");
+    println!("  get <path>");
+    println!("  fetch <path>");
+    println!("  set <path> <json-value>");
+    println!("  delete <path>");
+    println!("  reload");
+    println!("  help");
+    println!("  quit");
+}
+
+fn print_prompt() -> Result<(), String> {
+    print!("data> ");
+    io::stdout()
+        .flush()
+        .map_err(|error| format!("flush data prompt: {error}"))
 }

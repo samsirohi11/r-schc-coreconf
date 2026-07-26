@@ -2,14 +2,14 @@
 
 mod common;
 
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, IsTerminal, Write};
 use std::net::UdpSocket;
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::Duration;
 
 use coap_lite::{MessageClass, Packet, ResponseType};
-use common::{bind_raw_link, print_report, Args};
+use common::{bind_raw_link, print_report, Args, OPERATION_TIMEOUT};
 use schc_coreconf::{
     context_check_request, decode_context_check_payload, decode_rule_detail_payload,
     decode_rule_list_payload, exchange_management, exchange_management_update, format_rule_detail,
@@ -47,14 +47,21 @@ fn run() -> Result<(), String> {
     app_socket
         .set_read_timeout(Some(CONSOLE_POLL))
         .map_err(|error| format!("set application timeout: {error}"))?;
-    let (raw_link, link_local) = bind_raw_link(&args)?;
+    let (raw_link, link_local) = bind_raw_link(&args, Some(OPERATION_TIMEOUT))?;
     let app_local = app_socket
         .local_addr()
         .map_err(|error| format!("query application socket: {error}"))?;
     println!("READY role=core app={app_local} link={link_local}");
-    io::stdout()
-        .flush()
-        .map_err(|error| format!("flush readiness: {error}"))?;
+    let interactive = io::stdin().is_terminal() && io::stdout().is_terminal();
+    if interactive {
+        println!();
+        print_console_help();
+        print_prompt()?;
+    } else {
+        io::stdout()
+            .flush()
+            .map_err(|error| format!("flush readiness: {error}"))?;
+    }
 
     let commands = stdin_commands();
     let mut request_bytes = vec![0_u8; 65_535];
@@ -68,6 +75,7 @@ fn run() -> Result<(), String> {
                 &link,
                 &raw_link,
                 &mut next_message_id,
+                args.debug,
             ) {
                 Ok(CommandResult::Quit) => return Ok(()),
                 Ok(CommandResult::Successful) if args.once => return Ok(()),
@@ -83,6 +91,9 @@ fn run() -> Result<(), String> {
                         .map_err(|flush_error| format!("flush command error: {flush_error}"))?;
                 }
             }
+            if interactive {
+                print_prompt()?;
+            }
         }
 
         let (length, application_peer) = match app_socket.recv_from(&mut request_bytes) {
@@ -97,6 +108,9 @@ fn run() -> Result<(), String> {
             }
             Err(error) => return Err(format!("receive application CoAP datagram: {error}")),
         };
+        if interactive {
+            println!();
+        }
         let coap = &request_bytes[..length];
         let request = Ipv6UdpCoapPacket::new(
             CORE_LOGICAL_ADDRESS,
@@ -109,7 +123,7 @@ fn run() -> Result<(), String> {
         let encoded = link
             .encode(TrafficOrigin::Application, &request)
             .map_err(|error| format!("encode ordinary request: {error}"))?;
-        print_report("CORE TX", encoded.report());
+        print_report("CORE TX", encoded.report(), args.debug);
         raw_link
             .send_frame(encoded.frame())
             .map_err(|error| format!("send request SCHC frame: {error}"))?;
@@ -120,7 +134,7 @@ fn run() -> Result<(), String> {
         let decoded = link
             .decode(received.bytes())
             .map_err(|error| format!("decode response SCHC frame: {error}"))?;
-        print_report("CORE RX", decoded.report());
+        print_report("CORE RX", decoded.report(), args.debug);
         if decoded.route() != TrafficRoute::Application {
             return Err("protected response reached the ordinary core path".to_owned());
         }
@@ -155,6 +169,9 @@ fn run() -> Result<(), String> {
         io::stdout()
             .flush()
             .map_err(|error| format!("flush operation output: {error}"))?;
+        if interactive {
+            print_prompt()?;
+        }
         if args.once {
             return Ok(());
         }
@@ -167,6 +184,25 @@ enum CommandResult {
     Successful,
     Unavailable,
     Quit,
+}
+
+fn print_console_help() {
+    println!("Core console commands:");
+    println!("  context status");
+    println!("  context check");
+    println!("  rule list <core|device>");
+    println!("  rule get <core|device> <value>/<bits>");
+    println!("  rule update <value>/<bits> entry=<index> tv=<value> [--if-match]");
+    println!("  rule update <value>/<bits> fid=<field> [fp=<position>] [di=<direction>] tv=<value> [--if-match]");
+    println!("  help");
+    println!("  quit");
+}
+
+fn print_prompt() -> Result<(), String> {
+    print!("core> ");
+    io::stdout()
+        .flush()
+        .map_err(|error| format!("flush core prompt: {error}"))
 }
 
 fn stdin_commands() -> Receiver<String> {
@@ -193,6 +229,7 @@ fn handle_command(
     link: &SchcLink,
     raw_link: &schc_coreconf::RawUdpLink,
     next_message_id: &mut u16,
+    debug: bool,
 ) -> Result<CommandResult, String> {
     if command.is_empty() {
         return Ok(CommandResult::Continue);
@@ -201,9 +238,7 @@ fn handle_command(
         return Ok(CommandResult::Quit);
     }
     if command == "help" {
-        println!(
-            "commands: context status | context check | rule list core|device | rule get core|device <value>/<bits> | rule update <value>/<bits> ... | help | quit"
-        );
+        print_console_help();
         io::stdout().flush().map_err(|error| error.to_string())?;
         return Ok(CommandResult::Continue);
     }
@@ -216,8 +251,8 @@ fn handle_command(
             |datagram| {
                 let (code, exchange) = exchange_management_update(link, raw_link, datagram)
                     .map_err(|error| error.to_string())?;
-                print_report("CORE MGMT TX", &exchange.request_report);
-                print_report("CORE MGMT RX", &exchange.response_report);
+                print_report("CORE MGMT TX", &exchange.request_report, debug);
+                print_report("CORE MGMT RX", &exchange.response_report, debug);
                 Ok(code)
             },
             |service, datagram| {
@@ -252,8 +287,8 @@ fn handle_command(
         *next_message_id = next_message_id.wrapping_add(1);
         let exchange = exchange_management(link, raw_link, &coap)
             .map_err(|error| format!("context check failed: {error}"))?;
-        print_report("CORE MGMT TX", &exchange.request_report);
-        print_report("CORE MGMT RX", &exchange.response_report);
+        print_report("CORE MGMT TX", &exchange.request_report, debug);
+        print_report("CORE MGMT RX", &exchange.response_report, debug);
         let result = decode_context_check_payload(&exchange.payload, tag)
             .map_err(|error| format!("context check response failed: {error}"))?;
         println!(
@@ -286,8 +321,8 @@ fn handle_command(
             .map_err(|error| format!("device rule list failed: {error}"))?;
         let summaries = decode_rule_list_payload(&exchange.payload, inspection.model())
             .map_err(|error| format!("device rule list response failed: {error}"))?;
-        print_report("CORE MGMT TX", &exchange.request_report);
-        print_report("CORE MGMT RX", &exchange.response_report);
+        print_report("CORE MGMT TX", &exchange.request_report, debug);
+        print_report("CORE MGMT RX", &exchange.response_report, debug);
         for line in format_rule_list(&summaries) {
             println!("{line}");
         }
@@ -314,8 +349,8 @@ fn handle_command(
                 selector,
             )
             .map_err(|error| format!("device rule get response failed: {error}"))?;
-            print_report("CORE MGMT TX", &exchange.request_report);
-            print_report("CORE MGMT RX", &exchange.response_report);
+            print_report("CORE MGMT TX", &exchange.request_report, debug);
+            print_report("CORE MGMT RX", &exchange.response_report, debug);
             for line in format_rule_detail(&detail) {
                 println!("{line}");
             }

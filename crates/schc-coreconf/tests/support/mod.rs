@@ -95,6 +95,12 @@ impl TestProcess {
         }
     }
 
+    /// Returns whether the child process is still running.
+    #[allow(dead_code)]
+    pub(crate) fn is_running(&mut self) -> bool {
+        self.child.try_wait().expect("poll child").is_none()
+    }
+
     /// Waits until captured standard output contains `needle`.
     #[allow(dead_code)]
     pub(crate) fn wait_for_stdout(&self, needle: &str, timeout: Duration) -> String {
