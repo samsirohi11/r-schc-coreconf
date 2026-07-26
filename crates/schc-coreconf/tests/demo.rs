@@ -15,8 +15,8 @@ const INITIAL_RULES: &str = include_str!("../../../fixtures/demo/initial-rules.j
 const UPDATED_RULES: &str = include_str!("../../../fixtures/demo/updated-rules.json");
 const INITIAL_SOR: &[u8] = include_bytes!("../../../fixtures/demo/initial.sor");
 const UPDATED_SOR: &[u8] = include_bytes!("../../../fixtures/demo/updated.sor");
-const INITIAL_SOR_SHA256: &str = "fbd43f06ba956df8f90c50e1341d949f738824eaab5b1783a2059ce847fb581d";
-const UPDATED_SOR_SHA256: &str = "1e60aa35ad9fd425ee02a3e85b01d42e8c163af99bf1f25c61063d4c447933d0";
+const INITIAL_SOR_SHA256: &str = "bfde2596ccefcbc8b36bef870468663b381fba1e5deaa62c6cb3d023e1de92d0";
+const UPDATED_SOR_SHA256: &str = "4d262c52cd274f4fd3743d003f960afc4d56e3c3ce2b4843385d248b3cff457b";
 
 fn source(document: &str) -> Value {
     serde_json::from_str(document).expect("OpenSCHC rule source")
@@ -133,6 +133,24 @@ fn rule_sources_have_only_the_minimal_inventory_and_expected_natures() {
         assert_eq!(code["MO"], "ignore");
         assert_eq!(code["CDA"], "value-sent");
         assert!(code.get("TV").is_none());
+
+        let fetch_rule = source_rule(document, 20);
+        assert_eq!(source_field(fetch_rule, "COAP.CODE")["TV"], 5);
+        let uri_paths = fetch_rule["Compression"]
+            .as_array()
+            .expect("fetch compression entries")
+            .iter()
+            .filter(|field| field["FID"] == "COAP.option(11)")
+            .map(|field| (field["FP"].clone(), field["TV"].clone()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            uri_paths,
+            vec![
+                (serde_json::json!(1), serde_json::json!("c")),
+                (serde_json::json!(2), serde_json::json!("demo-data:config")),
+                (serde_json::json!(3), serde_json::json!("count")),
+            ]
+        );
     }
 
     let initial_context = rule_context(INITIAL_SOR);

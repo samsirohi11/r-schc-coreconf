@@ -73,6 +73,250 @@ fn packet(
         .expect("logical packet")
 }
 
+#[derive(Debug)]
+struct ProcessReport {
+    rule: String,
+    frame_bits: usize,
+    frame_bytes: usize,
+    packet_hex: String,
+    frame_hex: String,
+}
+
+fn process_reports(stdout: &str, prefix: &str) -> Vec<ProcessReport> {
+    stdout
+        .lines()
+        .filter(|line| line.starts_with(prefix))
+        .map(|line| ProcessReport {
+            rule: report_field(line, "rule"),
+            frame_bits: report_field(line, "frame_bits")
+                .parse()
+                .expect("frame bits in process report"),
+            frame_bytes: report_field(line, "frame_bytes")
+                .parse()
+                .expect("frame bytes in process report"),
+            packet_hex: report_field(line, "packet_hex"),
+            frame_hex: report_field(line, "frame_hex"),
+        })
+        .collect()
+}
+
+fn report_field(line: &str, field: &str) -> String {
+    line.split_whitespace()
+        .find_map(|word| word.strip_prefix(&format!("{field}=")))
+        .unwrap_or_else(|| panic!("missing {field} in process report: {line}"))
+        .to_owned()
+}
+
+fn equal_context_tags(stdout: &str) -> Vec<(String, String)> {
+    stdout
+        .lines()
+        .filter(|line| line.starts_with("CONTEXT CHECK equal "))
+        .map(|line| {
+            (
+                report_field(line, "core_tag"),
+                report_field(line, "device_tag"),
+            )
+        })
+        .collect()
+}
+
+fn run_data_fetch(app_sid: &std::path::Path, core_app: SocketAddr, commands: &[u8]) -> String {
+    let mut client = Command::new(env!("CARGO_BIN_EXE_schc-data-client"))
+        .args([
+            "--sid",
+            app_sid.to_str().expect("SID path"),
+            "--server",
+            &core_app.to_string(),
+            "--path",
+            "c",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn data client");
+    client
+        .stdin
+        .take()
+        .expect("client stdin")
+        .write_all(commands)
+        .expect("write client commands");
+    let output = client.wait_with_output().expect("wait data client");
+    assert!(
+        output.status.success(),
+        "data client status: {}",
+        output.status
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.is_empty(), "data client stderr: {stderr}");
+    String::from_utf8(output.stdout).expect("data client UTF-8 output")
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn final_real_process_demo_reuses_logical_request_and_shrinks_raw_frame() {
+    let (device_reservation, device_link) = reserve_address();
+    let (core_reservation, core_link) = reserve_address();
+    let (app_reservation, core_app) = reserve_address();
+    let app_sid = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/demo/demo-data.sid");
+    let app_data = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/demo/app-data.json");
+    let device_args = vec![
+        "--link-bind".to_owned(),
+        device_link.to_string(),
+        "--link-peer".to_owned(),
+        core_link.to_string(),
+        "--app-sid".to_owned(),
+        app_sid.to_string_lossy().into_owned(),
+        "--app-data".to_owned(),
+        app_data.to_string_lossy().into_owned(),
+    ];
+    let core_args = vec![
+        "--link-bind".to_owned(),
+        core_link.to_string(),
+        "--link-peer".to_owned(),
+        device_link.to_string(),
+        "--app-bind".to_owned(),
+        core_app.to_string(),
+    ];
+    drop(device_reservation);
+    let mut device = TestProcess::spawn(env!("CARGO_BIN_EXE_schc-coreconf-device"), &device_args);
+    device
+        .ready
+        .recv_timeout(Duration::from_secs(5))
+        .expect("device readiness");
+    drop(core_reservation);
+    drop(app_reservation);
+    let mut core = TestProcess::spawn(env!("CARGO_BIN_EXE_schc-coreconf-core"), &core_args);
+    core.ready
+        .recv_timeout(Duration::from_secs(5))
+        .expect("core readiness");
+
+    core.write_stdin(b"context check\nrule list device\nrule get device 20/8\n");
+    core.wait_for_stdout("RULE 20/8 nature=compression", Duration::from_secs(10));
+    core.wait_for_stdout("tv=0x0000000000000005", Duration::from_secs(10));
+    let before_client = run_data_fetch(
+        &app_sid,
+        core_app,
+        b"discover d=0\nschema demo-data\nfetch /demo-data:config/count\nquit\n",
+    );
+    assert!(before_client.contains("READY role=data-client"));
+    assert!(before_client.contains("core.c.ds"));
+    assert!(before_client.contains("/demo-data:config/count (sid 60002)"));
+    assert!(
+        before_client.lines().any(|line| line == "7"),
+        "before client output: {before_client}"
+    );
+
+    core.write_stdin(b"rule update 20/8 fid=ipv6.app-iid tv=2 --if-match\n");
+    core.wait_for_stdout(
+        "RULE UPDATE 20/8 entry=9 device=2.04 local=2.04",
+        Duration::from_secs(15),
+    );
+    core.write_stdin(b"context check\nrule get core 20/8\nrule get device 20/8\n");
+    core.wait_for_stdout("tv=0x0000000000000002", Duration::from_secs(15));
+    let after_client = run_data_fetch(&app_sid, core_app, b"fetch /demo-data:config/count\nquit\n");
+    assert!(after_client.contains("READY role=data-client"));
+    assert!(
+        after_client.lines().any(|line| line == "7"),
+        "after client output: {after_client}"
+    );
+    core.write_stdin(b"quit\n");
+
+    let core_status = core.wait_timeout(Duration::from_secs(20));
+    assert!(core_status.success(), "core status: {core_status}");
+    let (core_stdout, core_stderr) = core.output();
+    device.kill();
+    let (device_stdout, device_stderr) = device.output();
+    assert!(core_stderr.is_empty(), "core stderr: {core_stderr}");
+    assert!(device_stderr.is_empty(), "device stderr: {device_stderr}");
+
+    let core_request_reports = process_reports(&core_stdout, "CORE TX class=Ordinary ");
+    let core_response_reports = process_reports(&core_stdout, "CORE RX class=Ordinary ");
+    let device_request_reports = process_reports(&device_stdout, "DEVICE RX class=Ordinary ");
+    let device_response_reports = process_reports(&device_stdout, "DEVICE TX class=Ordinary ");
+    assert_eq!(
+        core_request_reports.len(),
+        3,
+        "core TX reports: {core_stdout}"
+    );
+    assert_eq!(
+        core_response_reports.len(),
+        3,
+        "core RX reports: {core_stdout}"
+    );
+    assert_eq!(
+        device_request_reports.len(),
+        3,
+        "device RX reports: {device_stdout}"
+    );
+    assert_eq!(
+        device_response_reports.len(),
+        3,
+        "device TX reports: {device_stdout}"
+    );
+    // The first operation is discovery; compare the two identical FETCHes.
+    let core_tx = &core_request_reports[1..];
+    let core_rx = &core_response_reports[1..];
+    let device_rx = &device_request_reports[1..];
+    let device_tx = &device_response_reports[1..];
+
+    assert_eq!(core_tx[0].rule, "25/8");
+    assert_eq!(
+        core_tx[1].rule, "20/8",
+        "core ordinary reports: {core_stdout}"
+    );
+    assert_eq!(core_rx[0].rule, "21/8");
+    assert_eq!(core_rx[1].rule, "21/8");
+    assert_eq!(device_tx[0].rule, "21/8");
+    assert_eq!(device_tx[1].rule, "21/8");
+    assert!(core_tx[1].frame_bits < core_tx[0].frame_bits);
+    assert_eq!(
+        device_rx[0].rule, core_tx[0].rule,
+        "device before reports: {device_stdout}"
+    );
+    assert_eq!(
+        device_rx[1].rule, core_tx[1].rule,
+        "device after reports: {device_stdout}"
+    );
+    assert_eq!(device_rx[0].frame_bits, core_tx[0].frame_bits);
+    assert_eq!(device_rx[1].frame_bits, core_tx[1].frame_bits);
+
+    for index in 0..2 {
+        assert_eq!(core_tx[index].packet_hex, device_rx[index].packet_hex);
+        assert_eq!(core_tx[index].frame_hex, device_rx[index].frame_hex);
+        assert_eq!(
+            core_tx[index].frame_hex.len() / 2,
+            core_tx[index].frame_bytes
+        );
+        assert!(core_tx[index].frame_bits <= core_tx[index].frame_bytes * 8);
+    }
+    assert_eq!(core_tx[0].packet_hex, core_tx[1].packet_hex);
+    assert_ne!(core_tx[0].frame_hex, core_tx[0].packet_hex);
+
+    for index in 0..2 {
+        assert_eq!(device_tx[index].packet_hex, core_rx[index].packet_hex);
+        assert_eq!(device_tx[index].frame_hex, core_rx[index].frame_hex);
+        assert_eq!(
+            device_tx[index].frame_hex.len() / 2,
+            device_tx[index].frame_bytes
+        );
+        assert!(device_tx[index].frame_bits <= device_tx[index].frame_bytes * 8);
+    }
+    assert_eq!(device_tx[0].packet_hex, device_tx[1].packet_hex);
+    assert_eq!(device_tx[0].packet_hex, core_rx[0].packet_hex);
+
+    let tags = equal_context_tags(&core_stdout);
+    assert_eq!(tags.len(), 2, "context checks: {core_stdout}");
+    assert_eq!(tags[0].0, tags[0].1);
+    assert_eq!(tags[1].0, tags[1].1);
+    assert_ne!(tags[0].0, tags[1].0, "the update should publish a new tag");
+    assert!(core_stdout.contains("RULE 20/8 nature=compression"));
+    assert!(core_stdout.contains("ENTRY 9 fid=fid-ipv6-appiid"));
+    assert!(core_stdout.contains("tv=0x0000000000000002"));
+}
+
 #[test]
 fn ordinary_request_and_response_reconstruct_exactly_with_reports() {
     let core = SchcLink::new(active("core-ordinary"), LinkRole::Core);
@@ -412,9 +656,9 @@ fn real_core_and_device_processes_complete_one_ordinary_operation() {
     assert!(core_stderr.is_empty(), "core stderr: {core_stderr}");
     assert!(device_stderr.is_empty(), "device stderr: {device_stderr}");
     assert!(core_stdout.contains("CORE TX class=Ordinary rule=25/8 packet_bytes="));
-    assert!(core_stdout.contains("CORE RX class=Ordinary rule=25/8 packet_bytes="));
+    assert!(core_stdout.contains("CORE RX class=Ordinary rule=21/8 packet_bytes="));
     assert!(device_stdout.contains("DEVICE RX class=Ordinary rule=25/8 packet_bytes="));
-    assert!(device_stdout.contains("DEVICE TX class=Ordinary rule=25/8 packet_bytes="));
+    assert!(device_stdout.contains("DEVICE TX class=Ordinary rule=21/8 packet_bytes="));
 }
 
 #[test]

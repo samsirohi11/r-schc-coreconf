@@ -95,6 +95,23 @@ impl TestProcess {
         }
     }
 
+    /// Waits until captured standard output contains `needle`.
+    #[allow(dead_code)]
+    pub(crate) fn wait_for_stdout(&self, needle: &str, timeout: Duration) -> String {
+        let start = Instant::now();
+        loop {
+            let output = self.output().0;
+            if output.contains(needle) {
+                return output;
+            }
+            assert!(
+                start.elapsed() < timeout,
+                "process did not print {needle:?} before timeout; stdout: {output}"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     /// Terminates a process that is still running.
     pub(crate) fn kill(&mut self) {
         if self.child.try_wait().expect("poll child").is_none() {

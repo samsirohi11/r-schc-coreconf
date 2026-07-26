@@ -148,14 +148,26 @@ pub(crate) fn print_report(prefix: &str, report: &LinkReport) {
         .compression_ratio()
         .map_or_else(|| "unknown".to_owned(), |value| format!("{value:.3}"));
     println!(
-        "{prefix} class={:?} rule={}/{} packet_bytes={} frame_bits={} frame_bytes={} ratio={ratio}",
+        "{prefix} class={:?} rule={}/{} packet_bytes={} frame_bits={} frame_bytes={} ratio={ratio} packet_hex={} frame_hex={}",
         report.traffic_class,
         report.rule_id.value(),
         report.rule_id.bit_len(),
         report.packet_size,
         bit_len,
-        report.padded_byte_len
+        report.padded_byte_len,
+        hex_bytes(&report.packet_bytes),
+        hex_bytes(&report.frame_bytes)
     );
+}
+
+fn hex_bytes(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push(HEX[usize::from(byte >> 4)] as char);
+        output.push(HEX[usize::from(byte & 0x0f)] as char);
+    }
+    output
 }
 
 fn load_text(path: Option<&Path>, default: &str) -> Result<String, String> {
