@@ -191,7 +191,7 @@ fn real_console_inspection_reports_remote_mismatch_and_detail() {
         "core stdout: {core_stdout}"
     );
     assert!(core_stdout.contains("CORE MGMT RX class=ProtectedManagement rule=17/8"));
-    assert!(core_stdout.contains("RULE 16/8 nature=compression"));
+    assert!(core_stdout.contains("RULE 16/8 nature=no-compression"));
     assert!(core_stdout.contains("RULE 20/8 nature=compression"));
     for line in initial_lines {
         assert!(

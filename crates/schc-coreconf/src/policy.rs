@@ -8,8 +8,7 @@ use crate::{ContextError, Result};
 ///
 /// The default policy derives protected IDs from `nature-management` rules.
 /// Explicit IDs are useful for the deterministic demonstration fixture because
-/// rule2sor 0.1.0 emits compression nature for its `OpenSCHC` `Compression`
-/// entries and has no management-nature JSON key.
+/// its protected management rules are policy-selected rather than management-nature rules.
 #[derive(Debug, Clone, Default, Eq, PartialEq)]
 pub struct ProtectionPolicy {
     pub(crate) ids: Vec<RuleId>,

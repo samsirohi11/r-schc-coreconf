@@ -1055,9 +1055,7 @@ impl InspectionService {
         }
         if request
             .get_option(CoapOption::UriPath)
-            .map_or(true, |segments| {
-                segments.iter().any(|segment| segment.as_slice() != b"schc")
-            })
+            .is_none_or(|segments| segments.iter().any(|segment| segment.as_slice() != b"schc"))
         {
             let response = coreconf_runtime::coap_types::Response::not_found("/schc");
             return packet_without_content_format(&request, response);
@@ -2082,10 +2080,10 @@ fn entry_matches_selector(entry: &RuleEntry, selector: &RuleEntrySelector) -> bo
             direction,
         } => {
             normalize_fid(&entry.fid) == normalize_fid(fid)
-                && field_position.map_or(true, |position| position == entry.field_position)
+                && field_position.is_none_or(|position| position == entry.field_position)
                 && direction
                     .as_deref()
-                    .map_or(true, |selected| selected == entry.direction)
+                    .is_none_or(|selected| selected == entry.direction)
         }
     }
 }

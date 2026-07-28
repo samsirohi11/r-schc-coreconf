@@ -19,10 +19,14 @@ It decodes raw SCHC frames, dispatches protected management traffic by exact Rul
 The internal link carries only padded SCHC frame bytes.
 IPv6, UDP, and CoAP headers are reconstructed at the receiving SCHC endpoint rather than being sent as an outer link envelope.
 
+The repository currently composes source-pinned development dependencies.
+The target release boundary uses versioned `r-schc` and `rustconf` crates, keeps those repositories independently usable, and separates the application server from the SCHC device as a fourth process.
+See [the composition contract](docs/COMPOSITION.md) for dependency ownership, the four-role target, replaceable inputs, synchronization invariants, and the rule lifecycle profile.
+
 The protected management RuleIDs are `16/8` and `17/8`.
 Rule `20/8` is the ordinary optimized FETCH request rule.
 Rule `21/8` is the ordinary response rule.
-Rule `25/8` is the no-compression fallback used before the Rule 20 update.
+Rule `25/8` is the ordinary header-compression fallback used before the Rule 20 update.
 
 The initial Rule 20 target for `IPV6.APP_IID` is `::5`.
 The updated target is `::2`, which matches the application/core source address in the sample request.
@@ -32,7 +36,7 @@ Only the selected SCHC representation changes.
 
 ## Prerequisites
 
-- Rust and Cargo with a current stable toolchain.
+- Rust and Cargo 1.85 or newer.
 - Python 3 for fixture checking.
 - A Linux or Unix environment with localhost UDP support.
 - No root privileges are required.
@@ -196,7 +200,8 @@ printf '%s\n' \
 
 ## Limitations
 
-This prototype uses one device and fixed localhost UDP endpoints.
+This prototype uses one device, fixed localhost UDP endpoints, and three processes.
+The application CORECONF server and datastore are still embedded in the SCHC device process.
 It does not implement Linux TUN integration, kernel-routed IPv6, SCHC fragmentation, OSCORE, QUIC, TCP, or remote administration.
 It does not provide automatic RuleID allocation, context epochs, retries, rollback, replay journals, or concurrent multi-device routing.
 The core applies an update locally only after the device acknowledges it.
@@ -226,3 +231,8 @@ Then run `python3 tools/generate_demo_fixtures.py --check --rule2sor /path/to/ru
 
 The repository validation contract is formatting, strict Clippy, full workspace tests, rustdoc with warnings denied, deterministic fixture regeneration, and diff checks.
 The final acceptance E2E is also available as `cargo test -p schc-coreconf --test link final_real_process_demo_reuses_logical_request_and_shrinks_raw_frame`.
+
+## License
+
+Licensed under either of the Apache License, Version 2.0 or the MIT license, at your option.
+See [LICENSE-APACHE](LICENSE-APACHE) and [LICENSE-MIT](LICENSE-MIT).

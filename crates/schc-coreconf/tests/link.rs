@@ -351,8 +351,8 @@ fn ordinary_request_and_response_reconstruct_exactly_with_reports() {
         Some(encoded.frame().bit_len())
     );
     assert!(
-        encoded.report().compression_ratio().expect("request ratio") > 1.0,
-        "the initial request uses no-compression fallback including its RuleID"
+        encoded.report().compression_ratio().expect("request ratio") < 1.0,
+        "the initial request uses the ordinary fallback RuleID"
     );
 
     let decoded = device
@@ -430,11 +430,11 @@ fn protected_rules_authorize_management_and_application_origin_cannot_impersonat
         .expect("management response decodes");
     assert_eq!(core_response.route(), TrafficRoute::ProtectedManagement);
 
-    let application = core
-        .encode(TrafficOrigin::Application, &request)
-        .expect("application origin must use the filtered ordinary runtime");
-    assert_eq!(application.report().traffic_class, TrafficClass::Ordinary);
-    assert!(![RuleId::new(16, 8), RuleId::new(17, 8)].contains(&application.report().rule_id));
+    let application = core.encode(TrafficOrigin::Application, &request);
+    assert!(
+        application.is_err(),
+        "application origin must not select a protected management RuleID"
+    );
 }
 
 #[test]
@@ -523,7 +523,17 @@ fn malformed_frames_are_rejected_and_rule_identity_includes_bit_length() {
         .encode(TrafficOrigin::Application, &request)
         .expect("request");
     assert_eq!(frame.frame().bit_len() % 8, 0);
-    let mut extra_padding = frame.frame().bytes().to_vec();
+    let management_request = packet(
+        CORE_LOGICAL_ADDRESS,
+        DEVICE_LOGICAL_ADDRESS,
+        APPLICATION_PORT,
+        MANAGEMENT_PORT,
+        &coap(0, 1, 4, &[], Some(b"schc")),
+    );
+    let management_frame = core
+        .encode(TrafficOrigin::Management, &management_request)
+        .expect("management request");
+    let mut extra_padding = management_frame.frame().bytes().to_vec();
     extra_padding.push(0);
     assert!(device.decode(&extra_padding).is_err());
     let response = temporary_ordinary_response(&request).expect("response");

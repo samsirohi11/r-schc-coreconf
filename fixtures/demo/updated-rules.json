@@ -2,7 +2,7 @@
   {
     "RuleID": 16,
     "RuleIDLength": 8,
-    "Compression": []
+    "NoCompression": []
   },
   {
     "RuleID": 17,
@@ -89,5 +89,22 @@
       {"FID":"PAYLOAD","FL":"var","FP":1,"DI":"BI","TV":"","MO":"ignore","CDA":"value-sent"}
     ]
   },
-  {"RuleID":25,"RuleIDLength":8,"NoCompression":[]}
+  {
+    "RuleID":25,
+    "RuleIDLength":8,
+    "Compression": [
+      {"FID":"IPV6.VER","FL":4,"FP":1,"DI":"BI","TV":6,"MO":"equal","CDA":"not-sent"},
+      {"FID":"IPV6.TC","FL":8,"FP":1,"DI":"BI","TV":0,"MO":"equal","CDA":"not-sent"},
+      {"FID":"IPV6.FL","FL":20,"FP":1,"DI":"BI","TV":0,"MO":"equal","CDA":"not-sent"},
+      {"FID":"IPV6.LEN","FL":16,"FP":1,"DI":"BI","TV":0,"MO":"ignore","CDA":"compute-length"},
+      {"FID":"IPV6.NXT","FL":8,"FP":1,"DI":"BI","TV":17,"MO":"equal","CDA":"not-sent"},
+      {"FID":"IPV6.HOP_LMT","FL":8,"FP":1,"DI":"BI","TV":64,"MO":"equal","CDA":"not-sent"},
+      {"FID":"IPV6.DEV_PREFIX","FL":64,"FP":1,"DI":"BI","TV":"2001:db8::/64","MO":"equal","CDA":"not-sent"},
+      {"FID":"IPV6.DEV_IID","FL":64,"FP":1,"DI":"BI","TV":"::1","MO":"equal","CDA":"not-sent"},
+      {"FID":"IPV6.APP_PREFIX","FL":64,"FP":1,"DI":"BI","TV":"2001:db8::/64","MO":"equal","CDA":"not-sent"},
+      {"FID":"IPV6.APP_IID","FL":64,"FP":1,"DI":"BI","TV":"::2","MO":"equal","CDA":"not-sent"},
+      {"FID":"UDP.DEV_PORT","FL":16,"FP":1,"DI":"BI","TV":5683,"MO":"equal","CDA":"not-sent"},
+      {"FID":"UDP.APP_PORT","FL":16,"FP":1,"DI":"BI","TV":5683,"MO":"equal","CDA":"not-sent"}
+    ]
+  }
 ]

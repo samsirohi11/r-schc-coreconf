@@ -286,9 +286,9 @@ impl Ipv6UdpCoapPacket {
             destination,
             source_port: udp.source_port(),
             destination_port: udp.destination_port(),
-            traffic_class: (input[0] & 0x0f) << 4 | (input[1] >> 4),
-            flow_label: u32::from(input[1] & 0x0f) << 16
-                | u32::from(input[2]) << 8
+            traffic_class: ((input[0] & 0x0f) << 4) | (input[1] >> 4),
+            flow_label: (u32::from(input[1] & 0x0f) << 16)
+                | (u32::from(input[2]) << 8)
                 | u32::from(input[3]),
             hop_limit: input[7],
         };

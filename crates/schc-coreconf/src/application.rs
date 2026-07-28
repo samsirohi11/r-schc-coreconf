@@ -390,7 +390,7 @@ pub fn schema_lines(model: &CompositeModel, filter: Option<&str>) -> Vec<String>
                 .starts_with('/')
                 .then_some((identifier.clone(), *sid))
         })
-        .filter(|(identifier, _)| filter.map_or(true, |filter| identifier.contains(filter)))
+        .filter(|(identifier, _)| filter.is_none_or(|filter| identifier.contains(filter)))
         .collect();
     entries.sort_by(|left, right| left.0.cmp(&right.0));
     entries

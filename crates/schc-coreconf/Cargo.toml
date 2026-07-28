@@ -10,8 +10,8 @@ description = "Atomic SCHC CORECONF active-context backend"
 arc-swap = "1.7"
 ciborium = "0.2"
 coap-lite = "0.13"
-# Gitlinks pin these path dependencies to the recorded submodule revisions.
-# rustconf: 1611ec1; r-schc: cf0b9bc.
+# Development uses the source revisions pinned by the parent repository Gitlinks.
+# Releases will replace these paths with tested, versioned crate dependencies.
 coreconf-model = { path = "../../deps/rustconf/crates/coreconf-model" }
 coreconf-runtime = { path = "../../deps/rustconf/crates/coreconf-runtime" }
 schc-core = { path = "../../deps/r-schc/crates/schc-core" }

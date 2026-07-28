@@ -428,7 +428,7 @@ fn parser_rejects_header_length_next_header_udp_and_coap_errors() {
 #[test]
 fn maximum_legal_udp_and_ipv6_lengths_are_supported_without_truncation() {
     let mut coap = vec![0x40, 0x01, 0x00, 0x01, 0xff];
-    coap.extend(std::iter::repeat(0xa5).take(MAX_COAP_DATAGRAM_LEN - 5));
+    coap.extend(std::iter::repeat_n(0xa5, MAX_COAP_DATAGRAM_LEN - 5));
     let packet = Ipv6UdpCoapPacket::new(CORE, DEVICE, 1, 2, &coap).expect("maximum packet");
     assert_eq!(coap.len(), MAX_COAP_DATAGRAM_LEN);
     assert_eq!(packet.udp_length(), u16::MAX);

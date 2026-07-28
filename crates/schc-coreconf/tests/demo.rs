@@ -15,8 +15,8 @@ const INITIAL_RULES: &str = include_str!("../../../fixtures/demo/initial-rules.j
 const UPDATED_RULES: &str = include_str!("../../../fixtures/demo/updated-rules.json");
 const INITIAL_SOR: &[u8] = include_bytes!("../../../fixtures/demo/initial.sor");
 const UPDATED_SOR: &[u8] = include_bytes!("../../../fixtures/demo/updated.sor");
-const INITIAL_SOR_SHA256: &str = "bfde2596ccefcbc8b36bef870468663b381fba1e5deaa62c6cb3d023e1de92d0";
-const UPDATED_SOR_SHA256: &str = "4d262c52cd274f4fd3743d003f960afc4d56e3c3ce2b4843385d248b3cff457b";
+const INITIAL_SOR_SHA256: &str = "39bebf9b48900b6335024ff0b23e199279a8ad1023986d9812ecab4929401eb7";
+const UPDATED_SOR_SHA256: &str = "baa3c8045322fd6cf3f15130f2f2eb3baa8bb21038eea6758a9a63b40b5578fb";
 
 fn source(document: &str) -> Value {
     serde_json::from_str(document).expect("OpenSCHC rule source")
@@ -121,14 +121,14 @@ fn rule_sources_have_only_the_minimal_inventory_and_expected_natures() {
             assert_eq!(rule["RuleIDLength"], 8);
         }
         let protected = source_rule(document, 16);
+        assert!(protected["Compression"].is_null());
         assert_eq!(
-            protected["Compression"]
+            protected["NoCompression"]
                 .as_array()
-                .expect("protected compression entries")
+                .expect("protected no-compression entries")
                 .len(),
             0
         );
-        assert!(protected["NoCompression"].is_null());
         let code = source_field(source_rule(document, 17), "COAP.CODE");
         assert_eq!(code["MO"], "ignore");
         assert_eq!(code["CDA"], "value-sent");
@@ -155,16 +155,13 @@ fn rule_sources_have_only_the_minimal_inventory_and_expected_natures() {
 
     let initial_context = rule_context(INITIAL_SOR);
     let updated_context = rule_context(UPDATED_SOR);
-    for (context, expected) in [
-        (&initial_context, RuleNature::Compression),
-        (&updated_context, RuleNature::Compression),
-    ] {
+    for context in [&initial_context, &updated_context] {
         assert_eq!(
             context
                 .find_rule(RuleId::new(16, 8))
                 .expect("16/8")
                 .nature(),
-            expected
+            RuleNature::NoCompression
         );
         assert_eq!(
             context
@@ -192,11 +189,11 @@ fn rule_sources_have_only_the_minimal_inventory_and_expected_natures() {
                 .find_rule(RuleId::new(25, 8))
                 .expect("25/8")
                 .nature(),
-            RuleNature::NoCompression
+            RuleNature::Compression
         );
     }
-    assert!(source_rule(&initial, 25).get("Compression").is_none());
-    assert!(source_rule(&initial, 25).get("NoCompression").is_some());
+    assert!(source_rule(&initial, 25).get("Compression").is_some());
+    assert!(source_rule(&initial, 25).get("NoCompression").is_none());
 }
 
 #[test]

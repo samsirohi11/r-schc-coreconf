@@ -5,20 +5,21 @@ They are not YANG datastore JSON.
 
 `initial-rules.json` contains these exact rules:
 
-- `16/8`: protected management request using a zero-entry compression rule.
+- `16/8`: protected management request using a no-compression full-packet passthrough rule.
 - `17/8`: protected management response using a compression rule whose response code is carried in the residue.
 - `20/8`: ordinary application FETCH request for the resource path `c/demo-data:config/count`, with an intentionally nonmatching application IID of `::5`.
 - `21/8`: ordinary application response on UDP port 5683 with CBOR Content-Format option value 140.
-- `25/8`: generic ordinary no-compression fallback.
+- `25/8`: ordinary header-compression fallback that carries the remaining packet bytes.
 
 `updated-rules.json` is identical except that rule `20/8` changes the `IPV6.APP_IID` target from `::5` to `::2`.
 The fixed data-client request uses `2001:db8::2` as its application/core source address and `2001:db8::1` as its device destination.
 It is handled by rule `25/8` before the update and rule `20/8` after it.
 The optimized rule carries only the request residue, so the demonstration can prove fewer SCHC bits without changing the logical request.
 
-Rule `16/8` is represented as a zero-entry compression rule because the pinned `rule2sor` JSON grammar has no management nature.
-The r-schc integration treats this exact protected RuleID as a complete-packet passthrough whose packet bytes are carried as residue.
-This keeps standard CoAP management options such as If-Match available while preserving exact RuleID authorization.
+Rule `16/8` uses the pinned `rule2sor` `NoCompression` form as a complete-packet passthrough.
+The packet bytes are carried after the exact protected RuleID, which keeps standard CoAP management options such as If-Match available while preserving exact RuleID authorization.
+The integration does not rely on an empty compression rule being interpreted as a passthrough.
+The ordinary Rule `25/8` fallback is a header-only compression rule with the remaining packet carried as suffix because rule2sor permits only one `NoCompression` entry.
 The integration policy protects exact rule identities `16/8` and `17/8`.
 
 The fixed logical addresses are `2001:db8::1` for the device and `2001:db8::2` for the application/core.

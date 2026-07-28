@@ -26,9 +26,8 @@ fn device() -> DeviceId {
 }
 
 fn policy() -> ProtectionPolicy {
-    // rule2sor 0.1.0 emits compression nature for every OpenSCHC
-    // Compression rule, including management traffic. Protection is therefore
-    // an integration policy over the exact 16/8 and 17/8 identities.
+    // Protection is an integration policy over the exact 16/8 and 17/8
+    // identities, independent of each rule's wire nature.
     ProtectionPolicy::from_rule_ids([RuleId::new(16, 8), RuleId::new(17, 8)])
 }
 
