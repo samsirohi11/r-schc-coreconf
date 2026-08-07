@@ -56,8 +56,7 @@
       {"FID":"COAP.MID","FL":16,"FP":1,"DI":"BI","TV":0,"MO":"ignore","CDA":"value-sent"},
       {"FID":"COAP.TOKEN","FL":"tkl","FP":1,"DI":"BI","TV":0,"MO":"ignore","CDA":"value-sent"},
       {"FID":"COAP.option(11)","FL":"var","FP":1,"DI":"BI","TV":"c","MO":"equal","CDA":"not-sent"},
-      {"FID":"COAP.option(11)","FL":"var","FP":2,"DI":"BI","TV":"demo-data:config","MO":"equal","CDA":"not-sent"},
-      {"FID":"COAP.option(11)","FL":"var","FP":3,"DI":"BI","TV":"count","MO":"equal","CDA":"not-sent"},
+      {"FID":"COAP.option(12)","FL":"var","FP":1,"DI":"BI","TV":141,"MO":"equal","CDA":"not-sent"},
       {"FID":"PAYLOAD","FL":"var","FP":1,"DI":"BI","TV":"","MO":"ignore","CDA":"value-sent"}
     ]
   },
@@ -85,7 +84,7 @@
       {"FID":"COAP.CODE","FL":8,"FP":1,"DI":"BI","TV":69,"MO":"equal","CDA":"not-sent"},
       {"FID":"COAP.MID","FL":16,"FP":1,"DI":"BI","TV":0,"MO":"ignore","CDA":"value-sent"},
       {"FID":"COAP.TOKEN","FL":"tkl","FP":1,"DI":"BI","TV":0,"MO":"ignore","CDA":"value-sent"},
-      {"FID":"COAP.option(12)","FL":"var","FP":1,"DI":"BI","TV":140,"MO":"equal","CDA":"not-sent"},
+      {"FID":"COAP.option(12)","FL":"var","FP":1,"DI":"BI","TV":142,"MO":"equal","CDA":"not-sent"},
       {"FID":"PAYLOAD","FL":"var","FP":1,"DI":"BI","TV":"","MO":"ignore","CDA":"value-sent"}
     ]
   },

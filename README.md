@@ -7,7 +7,8 @@ It does not require root privileges or a TUN interface.
 ## Architecture
 
 `schc-data-client` is the application-facing client.
-It discovers resources, displays schema paths, and issues CORECONF FETCH, GET, SET, and DELETE requests.
+It discovers resources and displays schema paths.
+Its `get` command uses a root CORECONF GET, its `fetch` command uses a root FETCH with identifier payloads, and its `set` and `delete` commands use root iPATCH mutations.
 
 `schc-coreconf-core` is the application and management core.
 It receives application CoAP datagrams, constructs logical IPv6 and UDP packets, compresses ordinary traffic, and sends raw SCHC frames to the device.
@@ -36,7 +37,7 @@ Only the selected SCHC representation changes.
 
 ## Prerequisites
 
-- Rust and Cargo 1.85 or newer.
+- Rust and Cargo 1.93.1 or newer.
 - Python 3 for fixture checking.
 - A Linux or Unix environment with localhost UDP support.
 - No root privileges are required.

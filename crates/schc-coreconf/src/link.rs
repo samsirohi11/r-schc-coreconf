@@ -614,10 +614,10 @@ impl RawUdpLink {
     }
 }
 
-/// Builds the task-4 temporary ordinary 2.05 response.
+/// Builds a synthetic format-142 `yang-instances+cbor-seq` FETCH response.
 ///
-/// The response carries the CBOR Content-Format option used by the sample
-/// application.
+/// The response carries the format-142 Content-Format option used by the
+/// sample application.
 /// The CoAP message ID and token are retained, and both logical IPv6 and UDP
 /// endpoints are swapped.  This helper is intentionally independent of any
 /// datastore or URI semantics.
@@ -627,7 +627,7 @@ impl RawUdpLink {
 /// Returns a packet error if the response cannot be serialized or validated.
 pub fn temporary_ordinary_response(request: &Ipv6UdpCoapPacket) -> PacketResult<Ipv6UdpCoapPacket> {
     let request_message = request.coap_message();
-    let content_format = crate::CoapOption::new(12, vec![140]).map_err(PacketError::Coap)?;
+    let content_format = crate::CoapOption::new(12, vec![142]).map_err(PacketError::Coap)?;
     let response = crate::CoapMessage::from_parts(
         1,
         2,

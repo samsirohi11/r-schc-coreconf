@@ -9,6 +9,7 @@ use std::time::Duration;
 mod support;
 use support::TestProcess;
 
+use coreconf_model::instance_id::{encode_identifiers, InstancePath};
 use schc_core::{RuleId, SidRegistry};
 use schc_coreconf::{
     temporary_ordinary_response, ActiveContext, GenericDataService, Ipv6UdpCoapPacket, LinkRole,
@@ -218,8 +219,14 @@ fn final_real_process_demo_reuses_logical_request_and_shrinks_raw_frame() {
     );
     core.write_stdin(b"context check\nrule get core 20/8\nrule get device 20/8\n");
     core.wait_for_stdout("tv=0x0000000000000002", Duration::from_secs(15));
-    let after_client = run_data_fetch(&app_sid, core_app, b"fetch /demo-data:config/count\nquit\n");
+    let after_client = run_data_fetch(
+        &app_sid,
+        core_app,
+        b"discover d=0\nschema demo-data\nfetch /demo-data:config/count\nquit\n",
+    );
     assert!(after_client.contains("READY role=data-client"));
+    assert!(after_client.contains("core.c.ds"));
+    assert!(after_client.contains("/demo-data:config/count (sid 60002)"));
     assert!(
         after_client.lines().any(|line| line == "7"),
         "after client output: {after_client}"
@@ -244,29 +251,29 @@ fn final_real_process_demo_reuses_logical_request_and_shrinks_raw_frame() {
     let device_response_reports = process_reports(&device_stdout, "DEVICE TX class=Ordinary ");
     assert_eq!(
         core_request_reports.len(),
-        3,
+        4,
         "core TX reports: {core_stdout}"
     );
     assert_eq!(
         core_response_reports.len(),
-        3,
+        4,
         "core RX reports: {core_stdout}"
     );
     assert_eq!(
         device_request_reports.len(),
-        3,
+        4,
         "device RX reports: {device_stdout}"
     );
     assert_eq!(
         device_response_reports.len(),
-        3,
+        4,
         "device TX reports: {device_stdout}"
     );
-    // The first operation is discovery; compare the two identical FETCHes.
-    let core_tx = &core_request_reports[1..];
-    let core_rx = &core_response_reports[1..];
-    let device_rx = &device_request_reports[1..];
-    let device_tx = &device_response_reports[1..];
+    // Each client performs discovery followed by FETCH; compare the FETCHes.
+    let core_tx = [&core_request_reports[1], &core_request_reports[3]];
+    let core_rx = [&core_response_reports[1], &core_response_reports[3]];
+    let device_rx = [&device_request_reports[1], &device_request_reports[3]];
+    let device_tx = [&device_response_reports[1], &device_response_reports[3]];
 
     assert_eq!(core_tx[0].rule, "25/8");
     assert_eq!(
@@ -367,6 +374,27 @@ fn ordinary_request_and_response_reconstruct_exactly_with_reports() {
     assert_eq!(decoded.report().schc_bit_len, encoded.report().schc_bit_len);
 
     let response = temporary_ordinary_response(decoded.packet()).expect("response");
+    assert_eq!(response.source(), request.destination());
+    assert_eq!(response.destination(), request.source());
+    assert_eq!(response.source_port(), request.destination_port());
+    assert_eq!(response.destination_port(), request.source_port());
+    assert_eq!(
+        response.coap_message().message_id(),
+        request.coap_message().message_id()
+    );
+    assert_eq!(
+        response.coap_message().token(),
+        request.coap_message().token()
+    );
+    assert!(response.coap_message().payload().is_empty());
+    let content_formats = response
+        .coap_message()
+        .options()
+        .iter()
+        .filter(|option| option.number() == 12)
+        .map(|option| option.value().to_vec())
+        .collect::<Vec<_>>();
+    assert_eq!(content_formats, vec![vec![142]]);
     let response_frame = device
         .encode(TrafficOrigin::Application, &response)
         .expect("ordinary response encodes");
@@ -450,14 +478,34 @@ fn dispatch_seam_uses_rule_route_not_management_looking_coap_details() {
     )
     .expect("application service");
 
-    // FETCH on /c resembles management traffic at the CoAP layer, but the
-    // ordinary logical ports select the ordinary RuleID and application route.
+    // A root FETCH with an identifier payload resembles management traffic at
+    // the CoAP layer, but ordinary logical ports select the ordinary RuleID
+    // and application route.
+    let mut fetch_identifier = InstancePath::new();
+    fetch_identifier
+        .push_delta(60002)
+        .expect("application identifier SID");
+    let fetch_payload = encode_identifiers(&[fetch_identifier]).expect("FETCH identifiers");
+    let fetch_options = vec![
+        schc_coreconf::CoapOption::new(11, b"c".to_vec()).expect("URI path option"),
+        schc_coreconf::CoapOption::new(12, vec![141]).expect("content format option"),
+    ];
     let ordinary_request = packet(
         CORE_LOGICAL_ADDRESS,
         DEVICE_LOGICAL_ADDRESS,
         APPLICATION_PORT,
         APPLICATION_PORT,
-        &coap(0, 5, 0x2401, &[], Some(b"c")),
+        &schc_coreconf::CoapMessage::from_parts(
+            1,
+            0,
+            5,
+            0x2401,
+            Vec::new(),
+            fetch_options,
+            fetch_payload,
+        )
+        .expect("FETCH CoAP")
+        .to_vec(),
     );
     let ordinary_frame = core
         .encode(TrafficOrigin::Application, &ordinary_request)
@@ -672,9 +720,12 @@ fn real_core_and_device_processes_complete_one_ordinary_operation() {
     assert!(core_stderr.is_empty(), "core stderr: {core_stderr}");
     assert!(device_stderr.is_empty(), "device stderr: {device_stderr}");
     assert!(core_stdout.contains("CORE TX class=Ordinary rule=25/8 packet_bytes="));
-    assert!(core_stdout.contains("CORE RX class=Ordinary rule=21/8 packet_bytes="));
+    assert!(
+        core_stdout.contains("CORE RX class=Ordinary rule=25/8 packet_bytes="),
+        "core stdout: {core_stdout}"
+    );
     assert!(device_stdout.contains("DEVICE RX class=Ordinary rule=25/8 packet_bytes="));
-    assert!(device_stdout.contains("DEVICE TX class=Ordinary rule=21/8 packet_bytes="));
+    assert!(device_stdout.contains("DEVICE TX class=Ordinary rule=25/8 packet_bytes="));
 }
 
 #[test]

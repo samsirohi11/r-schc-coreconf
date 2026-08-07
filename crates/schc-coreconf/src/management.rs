@@ -11,7 +11,7 @@ use std::sync::Arc;
 use ciborium::value::Value as CborValue;
 use coap_lite::{CoapOption, MessageClass, MessageType, Packet, RequestType, ResponseType};
 use coreconf_model::instance_id::{
-    decode_instances_with_model, Instance, InstancePath, PathComponent,
+    decode_instances_with_model, encode_identifiers, Instance, InstancePath, PathComponent,
 };
 use coreconf_model::{CompositeModel, CoreconfModel};
 use coreconf_runtime::coap_types::{ContentFormat, Interface, Method, Request};
@@ -40,7 +40,6 @@ const SCHC_ROOT_SID: i64 = 2574;
 const RULE_LIST_SID: i64 = 2597;
 const RULE_ID_LENGTH_SID: i64 = 2598;
 const RULE_ID_VALUE_SID: i64 = 2599;
-const RULE_NATURE_SID: i64 = 2600;
 const RULE_ENTRY_LIST_SID: i64 = 2620;
 const RULE_ENTRY_INDEX_SID: i64 = 2621;
 const FIELD_LENGTH_SID: i64 = 2625;
@@ -667,7 +666,7 @@ impl ResolvedRuleUpdate {
                 invalid_target(format!("replacement target value is invalid: {error}"))
             })?;
 
-        let path = target_value_path(request.rule, entry_index, target_value_index);
+        let path = target_value_path(request.rule, entry_index, target_value_index)?;
         Ok(Self {
             request: request.clone(),
             entry_index,
@@ -701,8 +700,8 @@ impl ResolvedRuleUpdate {
 
     /// Constructs the generic root iPATCH request for this update.
     ///
-    /// The request uses `YangDataCbor` and an empty root path, as required by
-    /// the runtime's instance-sequence iPATCH handler.
+    /// The request uses `YangInstancesCborSeq` (wire value 142) and an empty
+    /// root path, as required by the runtime's instance-sequence iPATCH handler.
     ///
     /// This request abstraction cannot carry CoAP options. Updates parsed
     /// with `--if-match` must use [`Self::ipatch_datagram`] instead.
@@ -718,7 +717,7 @@ impl ResolvedRuleUpdate {
             ));
         }
         Ok(Request::new(Method::IPatch)
-            .with_payload(self.ipatch_payload()?, ContentFormat::YangDataCbor)
+            .with_payload(self.ipatch_payload()?, ContentFormat::YangInstancesCborSeq)
             .with_interface(Interface::Management))
     }
 
@@ -906,7 +905,8 @@ impl InspectionService {
             .map_err(|error| InspectionError::Datastore(error.to_string()))?;
         let sid_registry = SidRegistry::from_json_str(&active.recipe().sid_json)
             .map_err(|error| InspectionError::Datastore(error.to_string()))?;
-        let datastore = Datastore::with_backend(model.composite_model().clone(), active.backend());
+        let datastore = Datastore::with_backend(model.composite_model().clone(), active.backend())
+            .map_err(|error| InspectionError::Datastore(error.to_string()))?;
         Ok(Self {
             active,
             model,
@@ -1113,12 +1113,11 @@ impl InspectionService {
                 "targeted iPATCH must address the management root",
             ));
         }
-        if request.content_format != Some(ContentFormat::YangDataCbor) {
-            return Err(PatchFailure::bad("targeted iPATCH requires yang-data+cbor"));
-        }
-        if !matches!(request.raw_content_format, Some(140 | 142)) {
+        if request.content_format != Some(ContentFormat::YangInstancesCborSeq)
+            || request.raw_content_format != Some(ContentFormat::YangInstancesCborSeq.as_u16())
+        {
             return Err(PatchFailure::bad(
-                "targeted iPATCH requires content format 140 or 142 (yang-data+cbor)",
+                "targeted iPATCH requires content format 142 (yang-instances+cbor-seq)",
             ));
         }
         if request.payload.is_empty() {
@@ -1163,7 +1162,12 @@ impl InspectionService {
             )));
         }
 
-        let mut candidate = Datastore::with_data(self.model.clone(), snapshot.tree().clone());
+        let mut candidate = Datastore::with_data(self.model.clone(), snapshot.tree().clone())
+            .map_err(|error| {
+                PatchFailure::conflict(format!(
+                    "candidate datastore rejected the active tree: {error}"
+                ))
+            })?;
         let keys = target
             .path
             .components
@@ -1276,7 +1280,7 @@ impl InspectionService {
         }
         let response = coreconf_runtime::coap_types::Response::content(
             payload,
-            coreconf_runtime::coap_types::ContentFormat::YangDataCbor,
+            coreconf_runtime::coap_types::ContentFormat::YangDataCborSid,
         );
         packet_without_content_format(request, response)
     }
@@ -1415,7 +1419,8 @@ fn target_patch_from_instance(instance: &Instance) -> Result<TargetPatch, PatchF
             "targeted iPATCH path names an unsupported leaf",
         ));
     }
-    let expected_path = target_value_path(selector, entry_index, target_value_index);
+    let expected_path = target_value_path(selector, entry_index, target_value_index)
+        .map_err(|error| PatchFailure::bad(error.to_string()))?;
     if instance.path != expected_path {
         return Err(PatchFailure::bad(
             "targeted iPATCH path is not the canonical target-value instance path",
@@ -1465,7 +1470,7 @@ fn packet_without_content_format(
     let mut packet = response_to_packet(request, response);
     packet.clear_option(CoapOption::ContentFormat);
     packet
-        .to_bytes()
+        .to_bytes_unlimited()
         .map_err(|error| InspectionError::Coap(error.to_string()))
 }
 
@@ -1478,7 +1483,7 @@ fn packet_precondition_without_content_format(
     packet.header.code = MessageClass::Response(ResponseType::PreconditionFailed);
     packet.clear_option(CoapOption::ContentFormat);
     packet
-        .to_bytes()
+        .to_bytes_unlimited()
         .map_err(|error| InspectionError::Coap(error.to_string()))
 }
 
@@ -1568,100 +1573,105 @@ pub fn decode_context_check_payload(
     }
 }
 
-/// Decodes the exact projected rule-summary FETCH response from a device.
+/// Decodes one complete SCHC-root FETCH response into deterministic rule
+/// summaries.
 ///
-/// The model is required because ordinary CORECONF instance paths do not mark
-/// integer list keys. The returned values are taken exclusively from the
-/// response payload.
+/// The request selects the unambiguous `/ietf-schc:schc` container, so the
+/// response must contain exactly one canonical root instance. The returned
+/// root value is converted and validated through the SID model before its
+/// complete rule array is summarized.
 ///
 /// # Errors
 ///
-/// Returns an error for unknown paths, duplicate or missing leaves, mismatched
-/// key pairs, unexpected full fields, or malformed leaf values.
+/// Returns an error for deleted or extra instances, a wrong path, malformed
+/// model data, missing rule fields, invalid `RuleIDs`, duplicate `RuleIDs`, or an
+/// invalid rule nature.
 pub fn decode_rule_list_payload(
     payload: &[u8],
     model: &CoreconfModel,
 ) -> Result<Vec<RuleSummary>, InspectionError> {
     let instances = decode_instances_with_model(model.composite_model(), payload)
         .map_err(|error| InspectionError::UnexpectedResponse(error.to_string()))?;
-    if instances.is_empty() {
+    if instances.len() != 1 {
+        return Err(InspectionError::UnexpectedResponse(format!(
+            "rule-list response contained {} instances, expected one root container",
+            instances.len()
+        )));
+    }
+    let instance = &instances[0];
+    validate_root_instance_path(&instance.path)?;
+    let raw_root = instance.value.clone().ok_or_else(|| {
+        InspectionError::UnexpectedResponse("rule-list response contained a deleted root".into())
+    })?;
+    if raw_root.is_null() {
         return Err(InspectionError::UnexpectedResponse(
-            "rule-list response contained no summary leaves".into(),
+            "rule-list response contained a null root".into(),
         ));
     }
-
-    let mut summaries =
-        std::collections::BTreeMap::<RuleSelector, std::collections::BTreeMap<i64, String>>::new();
-    for instance in instances {
-        let leaf_sid = instance.path.absolute_sid().ok_or_else(|| {
-            InspectionError::UnexpectedResponse("rule-list response contained an empty path".into())
-        })?;
-        if !matches!(
-            leaf_sid,
-            RULE_ID_VALUE_SID | RULE_ID_LENGTH_SID | RULE_NATURE_SID
-        ) {
-            return Err(InspectionError::UnexpectedResponse(format!(
-                "rule-list response contained unexpected SID {leaf_sid}"
-            )));
-        }
-        validate_rule_instance_path(&instance.path, leaf_sid, None)?;
-        let keys = rule_key_values(&instance.path)?;
-        let bits = usize::try_from(keys[1]).map_err(|_| {
-            InspectionError::UnexpectedResponse("RuleID bit length is out of range".into())
-        })?;
-        let selector = RuleSelector::new(keys[0], bits)?;
-        let value = instance.value.ok_or_else(|| {
+    let root = model
+        .composite_model()
+        .sid_value_to_identifier_value_at_path(raw_root, "/ietf-schc:schc")
+        .map_err(|error| InspectionError::UnexpectedResponse(error.to_string()))?;
+    let tree = json!({"ietf-schc:schc": root});
+    model
+        .composite_model()
+        .validate_identifier_value(&tree)
+        .map_err(|error| InspectionError::UnexpectedResponse(error.to_string()))?;
+    let rules = tree
+        .get("ietf-schc:schc")
+        .and_then(|root| root.get("rule"))
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
             InspectionError::UnexpectedResponse(
-                "rule-list response contained a deleted leaf".into(),
+                "rule-list response root did not contain a rule array".into(),
             )
         })?;
-        if value.is_object() || value.is_array() || value.is_null() {
-            return Err(InspectionError::UnexpectedResponse(
-                "rule-list response contained a projected full field".into(),
-            ));
-        }
-        if leaf_sid == RULE_ID_VALUE_SID && value.as_u64() != Some(selector.value)
-            || leaf_sid == RULE_ID_LENGTH_SID && value.as_u64() != Some(selector.bits as u64)
-        {
+
+    let mut summaries = std::collections::BTreeMap::new();
+    for rule in rules {
+        let rule = rule.as_object().ok_or_else(|| {
+            InspectionError::UnexpectedResponse(
+                "rule-list response contained a non-object rule".into(),
+            )
+        })?;
+        let value = rule
+            .get("rule-id-value")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| {
+                InspectionError::UnexpectedResponse(
+                    "rule-list response rule-id-value is not numeric".into(),
+                )
+            })?;
+        let bits = rule
+            .get("rule-id-length")
+            .and_then(Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+            .ok_or_else(|| {
+                InspectionError::UnexpectedResponse(
+                    "rule-list response rule-id-length is not numeric".into(),
+                )
+            })?;
+        let selector = RuleSelector::new(value, bits)?;
+        let nature = decode_nature_value(
+            model.composite_model(),
+            rule.get("rule-nature").cloned().ok_or_else(|| {
+                InspectionError::UnexpectedResponse(
+                    "rule-list response is missing rule-nature".into(),
+                )
+            })?,
+        )?;
+        if summaries.insert(selector, nature).is_some() {
             return Err(InspectionError::UnexpectedResponse(format!(
-                "rule-list response leaf SID {leaf_sid} disagreed with its RuleID keys"
-            )));
-        }
-        let display = if leaf_sid == RULE_NATURE_SID {
-            decode_nature_value(model.composite_model(), value)?
-        } else {
-            value.to_string()
-        };
-        let leaves = summaries.entry(selector).or_default();
-        if leaves.insert(leaf_sid, display).is_some() {
-            return Err(InspectionError::UnexpectedResponse(format!(
-                "rule-list response duplicated SID {leaf_sid} for RuleID {}/{}",
+                "rule-list response duplicated RuleID {}/{}",
                 selector.value, selector.bits
             )));
         }
     }
 
-    let mut result = Vec::with_capacity(summaries.len());
-    for (selector, leaves) in summaries {
-        if leaves.len() != 3
-            || !leaves.contains_key(&RULE_ID_VALUE_SID)
-            || !leaves.contains_key(&RULE_ID_LENGTH_SID)
-            || !leaves.contains_key(&RULE_NATURE_SID)
-        {
-            return Err(InspectionError::UnexpectedResponse(format!(
-                "rule-list response is missing a summary leaf for RuleID {}/{}",
-                selector.value, selector.bits
-            )));
-        }
-        result.push(RuleSummary {
-            id: selector,
-            nature: leaves
-                .get(&RULE_NATURE_SID)
-                .cloned()
-                .ok_or_else(|| InspectionError::UnexpectedResponse("missing rule nature".into()))?,
-        });
-    }
-    Ok(result)
+    Ok(summaries
+        .into_iter()
+        .map(|(id, nature)| RuleSummary { id, nature })
+        .collect())
 }
 
 /// Decodes the exact complete selected-rule FETCH response from a device.
@@ -1750,6 +1760,35 @@ pub fn decode_rule_detail_payload(
     Ok(detail_from_rule(&rules[0]))
 }
 
+fn validate_root_instance_path(path: &InstancePath) -> Result<(), InspectionError> {
+    if path.components.len() != 1
+        || !matches!(
+            path.components.first(),
+            Some(PathComponent::SidDelta(SCHC_ROOT_SID))
+        )
+    {
+        return Err(InspectionError::UnexpectedResponse(
+            "rule-list response did not contain the canonical SCHC root instance".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn management_instance_path(
+    selector: Option<RuleSelector>,
+) -> Result<InstancePath, InspectionError> {
+    let mut path = InstancePath::new();
+    path.push_delta(SCHC_ROOT_SID)
+        .map_err(|error| InspectionError::Datastore(error.to_string()))?;
+    if let Some(selector) = selector {
+        path.push_delta(RULE_LIST_SID - SCHC_ROOT_SID)
+            .map_err(|error| InspectionError::Datastore(error.to_string()))?;
+        path.push_key(json!(selector.value));
+        path.push_key(json!(selector.bits));
+    }
+    Ok(path)
+}
+
 fn rule_key_values(
     path: &coreconf_model::instance_id::InstancePath,
 ) -> Result<[u64; 2], InspectionError> {
@@ -1814,9 +1853,13 @@ fn validate_rule_instance_path(
 }
 
 fn decode_nature_value(model: &CompositeModel, value: Value) -> Result<String, InspectionError> {
-    let value = model
-        .sid_value_to_identifier_value_at_path(value, "/ietf-schc:schc/rule/rule-nature")
-        .map_err(|error| InspectionError::UnexpectedResponse(error.to_string()))?;
+    let value = if value.is_string() {
+        value
+    } else {
+        model
+            .sid_value_to_identifier_value_at_path(value, "/ietf-schc:schc/rule/rule-nature")
+            .map_err(|error| InspectionError::UnexpectedResponse(error.to_string()))?
+    };
     let identifier = match value {
         Value::String(value) => value,
         Value::Number(value) => model
@@ -1874,41 +1917,47 @@ fn encode_remote_rule(sid_json: &str, rule_value: &Value) -> Result<Vec<u8>, Ins
         .map_err(|error| InspectionError::UnexpectedResponse(error.to_string()))
 }
 
-/// Builds a normal CORECONF FETCH for the minimal rule-list projection.
+/// Builds a normal CORECONF FETCH for the unambiguous SCHC root container.
 ///
-/// # Panics
+/// The request carries exactly one root identifier and
+/// `application/yang-identifiers+cbor-seq` (141).
 ///
-/// Panics only if fixed numeric identifiers cannot be serialized.
-#[must_use]
-pub fn rule_list_request(message_id: u16, token: &[u8]) -> Vec<u8> {
+/// # Errors
+///
+/// Returns an error if the fixed root path or CoAP datagram cannot be
+/// represented.
+pub fn rule_list_request(message_id: u16, token: &[u8]) -> Result<Vec<u8>, InspectionError> {
+    let path = management_instance_path(None)?;
     let mut packet = base_request(RequestType::Fetch, message_id, token);
-    for sid in [RULE_ID_VALUE_SID, RULE_ID_LENGTH_SID, RULE_NATURE_SID] {
-        ciborium::ser::into_writer(&CborValue::Integer(sid.into()), &mut packet.payload)
-            .expect("rule-list identifier is representable");
-    }
+    packet.add_option(CoapOption::ContentFormat, vec![141]);
+    packet.payload = encode_identifiers(std::slice::from_ref(&path))
+        .map_err(|error| InspectionError::Datastore(error.to_string()))?;
     packet
         .to_bytes()
-        .expect("rule-list request is representable")
+        .map_err(|error| InspectionError::Coap(error.to_string()))
 }
 
 /// Builds a normal CORECONF FETCH for exactly one keyed rule instance.
 ///
-/// # Panics
+/// The request carries the canonical SCHC root, rule-list SID, and both
+/// `RuleID` value and width keys with format 141.
 ///
-/// Panics only if fixed numeric identifiers cannot be serialized.
-#[must_use]
-pub fn rule_get_request(selector: RuleSelector, message_id: u16, token: &[u8]) -> Vec<u8> {
+/// # Errors
+///
+/// Returns an error if the fixed path or CoAP datagram cannot be represented.
+pub fn rule_get_request(
+    selector: RuleSelector,
+    message_id: u16,
+    token: &[u8],
+) -> Result<Vec<u8>, InspectionError> {
+    let path = management_instance_path(Some(selector))?;
     let mut packet = base_request(RequestType::Fetch, message_id, token);
-    let path = CborValue::Array(vec![
-        CborValue::Integer(RULE_LIST_SID.into()),
-        CborValue::Integer(selector.value.into()),
-        CborValue::Integer(selector.bits.into()),
-    ]);
-    ciborium::ser::into_writer(&path, &mut packet.payload)
-        .expect("rule-get identifier is representable");
+    packet.add_option(CoapOption::ContentFormat, vec![141]);
+    packet.payload = encode_identifiers(std::slice::from_ref(&path))
+        .map_err(|error| InspectionError::Datastore(error.to_string()))?;
     packet
         .to_bytes()
-        .expect("rule-get request is representable")
+        .map_err(|error| InspectionError::Coap(error.to_string()))
 }
 
 fn base_request(method: RequestType, message_id: u16, token: &[u8]) -> Packet {
@@ -2283,24 +2332,31 @@ fn target_value_path(
     rule: RuleSelector,
     entry_index: usize,
     target_value_index: usize,
-) -> InstancePath {
+) -> Result<InstancePath, InspectionError> {
     let mut path = InstancePath::new();
     let mut previous_sid = 0;
-    push_sid(&mut path, &mut previous_sid, SCHC_ROOT_SID);
-    push_sid(&mut path, &mut previous_sid, RULE_LIST_SID);
+    push_sid(&mut path, &mut previous_sid, SCHC_ROOT_SID)?;
+    push_sid(&mut path, &mut previous_sid, RULE_LIST_SID)?;
     path.push_key(json!(rule.value));
     path.push_key(json!(rule.bits));
-    push_sid(&mut path, &mut previous_sid, RULE_ENTRY_LIST_SID);
+    push_sid(&mut path, &mut previous_sid, RULE_ENTRY_LIST_SID)?;
     path.push_key(json!(entry_index));
-    push_sid(&mut path, &mut previous_sid, TARGET_VALUE_LIST_SID);
+    push_sid(&mut path, &mut previous_sid, TARGET_VALUE_LIST_SID)?;
     path.push_key(json!(target_value_index));
-    push_sid(&mut path, &mut previous_sid, TARGET_VALUE_VALUE_SID);
-    path
+    push_sid(&mut path, &mut previous_sid, TARGET_VALUE_VALUE_SID)?;
+    Ok(path)
 }
 
-fn push_sid(path: &mut InstancePath, previous_sid: &mut i64, sid: i64) {
-    path.push_delta(sid - *previous_sid);
+fn push_sid(
+    path: &mut InstancePath,
+    previous_sid: &mut i64,
+    sid: i64,
+) -> Result<(), InspectionError> {
+    path.push_delta(sid - *previous_sid).map_err(|error| {
+        invalid_target(format!("target-value path construction failed: {error}"))
+    })?;
     *previous_sid = sid;
+    Ok(())
 }
 
 fn summaries_from_rules(rules: &[Rule]) -> Vec<RuleSummary> {

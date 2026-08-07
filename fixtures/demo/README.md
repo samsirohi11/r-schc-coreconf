@@ -7,8 +7,8 @@ They are not YANG datastore JSON.
 
 - `16/8`: protected management request using a no-compression full-packet passthrough rule.
 - `17/8`: protected management response using a compression rule whose response code is carried in the residue.
-- `20/8`: ordinary application FETCH request for the resource path `c/demo-data:config/count`, with an intentionally nonmatching application IID of `::5`.
-- `21/8`: ordinary application response on UDP port 5683 with CBOR Content-Format option value 140.
+- `20/8`: ordinary application FETCH request for the current public rustconf root FETCH shape, with an intentionally nonmatching application IID of `::5`.
+- `21/8`: ordinary application FETCH response on UDP port 5683 with CBOR Content-Format option value 142 and a format-142 instance-sequence payload carried as residue.
 - `25/8`: ordinary header-compression fallback that carries the remaining packet bytes.
 
 `updated-rules.json` is identical except that rule `20/8` changes the `IPV6.APP_IID` target from `::5` to `::2`.
@@ -26,8 +26,8 @@ The fixed logical addresses are `2001:db8::1` for the device and `2001:db8::2` f
 Application traffic uses UDP port 5683.
 Protected management requests use core/application-side UDP port 5683 and device-side UDP port 5684.
 Protected management responses reverse those endpoints.
-The data client uses resource path `c` and fetches `/demo-data:config/count`.
-The resulting CoAP FETCH request has code 5 and URI-Path options `c`, `demo-data:config`, and `count`.
+The data client uses the public rustconf root FETCH shape to fetch `/demo-data:config/count`.
+The resulting CoAP FETCH request has code 5, one Uri-Path option `c`, one Content-Format option with numeric value `141`, and an identifier-sequence payload selecting `/demo-data:config/count`.
 Management requests use path `schc`.
 The management request code and response code are carried so inspection and iPATCH share the protected rules.
 The fixture entries use `BI` direction indicators so each rule is a complete bidirectional field path.

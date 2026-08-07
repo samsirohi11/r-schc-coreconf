@@ -17,6 +17,7 @@ use schc_coreconf::{
     CONTEXT_TAG_LEN,
 };
 use schc_runtime::{DeviceId, DeviceProfile};
+use serde_json::Value;
 
 const SID: &str = include_str!("../../../fixtures/demo/ietf-schc@2026-05-07.sid");
 const SOR: &[u8] = include_bytes!("../../../fixtures/demo/initial.sor");
@@ -34,13 +35,21 @@ fn active() -> Arc<ActiveContext> {
 }
 
 fn target_ipatch_datagram(payload: Vec<u8>, message_id: u16) -> Vec<u8> {
+    target_ipatch_datagram_with_format(payload, message_id, 142)
+}
+
+fn target_ipatch_datagram_with_format(
+    payload: Vec<u8>,
+    message_id: u16,
+    content_format: u8,
+) -> Vec<u8> {
     let mut packet = Packet::new();
     packet.header.message_id = message_id;
     packet.header.code = MessageClass::Request(RequestType::IPatch);
     packet.header.set_type(MessageType::Confirmable);
     packet.set_token(vec![0xD1]);
     packet.add_option(CoapOption::UriPath, b"schc".to_vec());
-    packet.add_option(CoapOption::ContentFormat, vec![142]);
+    packet.add_option(CoapOption::ContentFormat, vec![content_format]);
     packet.payload = payload;
     packet.to_bytes().expect("iPATCH datagram")
 }
@@ -131,6 +140,10 @@ fn device_context_check_reports_updated_tag_without_context_payload() {
     let mut service = InspectionService::new(device.clone()).expect("service");
     let request = context_check_request(core.tag(), 10, &[0x44]);
     let response = service.handle_datagram(&request).expect("response");
+    let response_packet = Packet::from_bytes(&response).expect("response packet");
+    assert!(response_packet
+        .get_option(CoapOption::ContentFormat)
+        .is_none());
     let result = context_check_response(&response, core.tag()).expect("check");
     assert!(!result.equal);
     assert_eq!(result.device_tag, device.tag());
@@ -143,7 +156,7 @@ fn inspection_projects_summaries_and_rejects_mutations() {
     let mut service = InspectionService::new(active.clone()).expect("service");
     let before = active.snapshot();
     let before_runtime = before.runtime_arc();
-    let request = rule_list_request(11, &[0xC1]);
+    let request = rule_list_request(11, &[0xC1]).expect("rule-list request");
     let response = Packet::from_bytes(&service.handle_datagram(&request).expect("list response"))
         .expect("response");
     assert_eq!(
@@ -153,14 +166,13 @@ fn inspection_projects_summaries_and_rejects_mutations() {
     let instances =
         decode_instances_with_model(service.model().composite_model(), &response.payload)
             .expect("instances");
-    assert_eq!(instances.len(), 15);
-    assert!(instances.iter().all(|instance| !instance
-        .value
-        .as_ref()
-        .is_some_and(serde_json::Value::is_object)));
-    assert!(instances
-        .iter()
-        .all(|instance| matches!(instance.path.absolute_sid(), Some(2598..=2600))));
+    assert_eq!(instances.len(), 1);
+    assert_eq!(instances[0].path.absolute_sid(), Some(2574));
+    assert!(instances[0].path.components.len() == 1);
+    assert!(instances[0].value.as_ref().is_some_and(Value::is_object));
+    let summaries =
+        decode_rule_list_payload(&response.payload, service.model()).expect("root rule summaries");
+    assert_eq!(summaries, service.summaries());
     for (message_id, method) in [
         (12, RequestType::IPatch),
         (13, RequestType::Patch),
@@ -190,6 +202,53 @@ fn inspection_projects_summaries_and_rejects_mutations() {
         assert_eq!(before.tag(), after.tag());
         assert!(Arc::ptr_eq(&before_runtime, &after.runtime_arc()));
     }
+}
+
+#[test]
+fn rule_list_fetch_requests_one_root_identifier_with_format_141() {
+    let packet = Packet::from_bytes(&rule_list_request(21, &[0xC1]).expect("rule-list request"))
+        .expect("request packet");
+    assert_eq!(
+        packet
+            .get_option(CoapOption::ContentFormat)
+            .and_then(|options| options.front()),
+        Some(&vec![141])
+    );
+    let path = coreconf_model::instance_id::InstancePath::decode_cbor(&packet.payload)
+        .expect("root identifier");
+    assert_eq!(path.components, vec![PathComponent::SidDelta(2574)]);
+}
+
+#[test]
+fn bare_rule_list_fetch_is_rejected_without_mutation() {
+    let active = active();
+    let before = active.snapshot();
+    let mut service = InspectionService::new(active.clone()).expect("service");
+    let mut packet = Packet::new();
+    packet.header.message_id = 22;
+    packet.header.code = MessageClass::Request(RequestType::Fetch);
+    packet.header.set_type(MessageType::Confirmable);
+    packet.set_token(vec![0xC3]);
+    packet.add_option(CoapOption::UriPath, b"schc".to_vec());
+    packet.add_option(CoapOption::ContentFormat, vec![141]);
+    let mut path = coreconf_model::instance_id::InstancePath::new();
+    path.push_delta(2574).expect("root SID");
+    path.push_delta(23).expect("rule SID delta");
+    packet.payload = path.encode_cbor().expect("bare list identifier");
+    let response = Packet::from_bytes(
+        &service
+            .handle_datagram(&packet.to_bytes().expect("request bytes"))
+            .expect("response bytes"),
+    )
+    .expect("response packet");
+    assert_eq!(
+        response.header.code,
+        MessageClass::Response(ResponseType::BadRequest)
+    );
+    let after = active.snapshot();
+    assert_eq!(after.tree(), before.tree());
+    assert_eq!(after.generation(), before.generation());
+    assert_eq!(after.tag(), before.tag());
 }
 
 #[test]
@@ -276,7 +335,10 @@ fn resolved_update_has_exact_sid_path_and_fixed_width_wire_value() {
     let ipatch = update.ipatch_request().expect("iPATCH request");
     assert_eq!(ipatch.method, Method::IPatch);
     assert_eq!(ipatch.path, "");
-    assert_eq!(ipatch.content_format, Some(ContentFormat::YangDataCbor));
+    assert_eq!(
+        ipatch.content_format,
+        Some(ContentFormat::YangInstancesCborSeq)
+    );
     assert_eq!(ipatch.interface, Some(Interface::Management));
     let raw: CborValue =
         ciborium::de::from_reader(Cursor::new(&ipatch.payload)).expect("raw iPATCH map");
@@ -392,7 +454,8 @@ fn detached_update_changes_only_requested_target_value() {
         "AAAAAAAAAAY="
     );
 
-    let mut candidate = Datastore::with_data(service.model().clone(), before);
+    let mut candidate =
+        Datastore::with_data(service.model().clone(), before).expect("candidate datastore");
     let instance = &instances[0];
     let sid = instance.path.absolute_sid().expect("target SID");
     let keys = instance
@@ -417,6 +480,54 @@ fn detached_update_changes_only_requested_target_value() {
         .set_path(&xpath, value)
         .expect("set candidate value");
     assert_eq!(candidate.get_all(), expected);
+}
+
+#[test]
+fn device_ipatch_requires_instance_sequence_content_format_without_publication() {
+    let active = active();
+    let before = active.snapshot();
+    let before_runtime = before.runtime_arc();
+    let update = update_for(&active, "rule update 20/8 entry=9 tv=6");
+    let mut service = InspectionService::new(Arc::clone(&active)).expect("service");
+
+    let rejected = Packet::from_bytes(
+        &service
+            .handle_datagram(&target_ipatch_datagram_with_format(
+                update.ipatch_payload().expect("payload"),
+                59,
+                140,
+            ))
+            .expect("response"),
+    )
+    .expect("response packet");
+    assert_eq!(
+        rejected.header.code,
+        MessageClass::Response(ResponseType::BadRequest)
+    );
+    let unchanged = active.snapshot();
+    assert_eq!(unchanged.tree(), before.tree());
+    assert_eq!(unchanged.sor(), before.sor());
+    assert_eq!(unchanged.generation(), before.generation());
+    assert_eq!(unchanged.digest(), before.digest());
+    assert_eq!(unchanged.tag(), before.tag());
+    assert!(Arc::ptr_eq(&unchanged.runtime_arc(), &before_runtime));
+
+    let accepted = Packet::from_bytes(
+        &service
+            .handle_datagram(&target_ipatch_datagram_with_format(
+                update.ipatch_payload().expect("payload"),
+                60,
+                142,
+            ))
+            .expect("response"),
+    )
+    .expect("response packet");
+    assert_eq!(
+        accepted.header.code,
+        MessageClass::Response(ResponseType::Changed)
+    );
+    assert_eq!(active.generation(), before.generation() + 1);
+    assert_ne!(active.tag(), before.tag());
 }
 
 #[test]
@@ -456,11 +567,10 @@ fn device_ipatch_publishes_one_valid_target_update_and_keeps_inspection_live() {
         parse_rule_selector("20/8").expect("selector")
     );
     let inspect = service
-        .handle_datagram(&rule_get_request(
-            parse_rule_selector("20/8").expect("selector"),
-            61,
-            &[0xD2],
-        ))
+        .handle_datagram(
+            &rule_get_request(parse_rule_selector("20/8").expect("selector"), 61, &[0xD2])
+                .expect("rule-get request"),
+        )
         .expect("inspection response");
     assert_eq!(
         Packet::from_bytes(&inspect)
@@ -787,16 +897,33 @@ fn malformed_update_commands_fail_clearly() {
 #[test]
 fn rule_get_fetch_contains_only_selected_instance() {
     let mut service = InspectionService::new(active()).expect("service");
-    let response = Packet::from_bytes(
-        &service
-            .handle_datagram(&rule_get_request(
-                parse_rule_selector("20/8").expect("selector"),
-                22,
-                &[0xC2],
-            ))
-            .expect("response"),
+    let request = rule_get_request(parse_rule_selector("20/8").expect("selector"), 22, &[0xC2])
+        .expect("rule-get request");
+    let request_packet = Packet::from_bytes(&request).expect("request packet");
+    assert_eq!(
+        request_packet
+            .get_option(CoapOption::ContentFormat)
+            .and_then(|options| options.front()),
+        Some(&vec![141])
+    );
+    let request_value: Value = ciborium::de::from_reader(Cursor::new(&request_packet.payload))
+        .expect("request identifier");
+    let request_path = coreconf_model::instance_id::InstancePath::from_cbor_value_with_model(
+        &request_value,
+        service.model().composite_model(),
     )
-    .expect("packet");
+    .expect("request path");
+    assert_eq!(
+        request_path.components,
+        vec![
+            PathComponent::SidDelta(2574),
+            PathComponent::SidDelta(23),
+            PathComponent::KeyValue(serde_json::json!(20)),
+            PathComponent::KeyValue(serde_json::json!(8)),
+        ]
+    );
+    let response =
+        Packet::from_bytes(&service.handle_datagram(&request).expect("response")).expect("packet");
     assert_eq!(
         response.header.code,
         MessageClass::Response(ResponseType::Content)
@@ -827,7 +954,7 @@ fn remote_decoders_display_updated_device_rule_values() {
 
     let list_packet = Packet::from_bytes(
         &service
-            .handle_datagram(&rule_list_request(23, &[0xC1]))
+            .handle_datagram(&rule_list_request(23, &[0xC1]).expect("rule-list request"))
             .expect("list response"),
     )
     .expect("list packet");
@@ -836,7 +963,7 @@ fn remote_decoders_display_updated_device_rule_values() {
 
     let detail_packet = Packet::from_bytes(
         &service
-            .handle_datagram(&rule_get_request(selector, 24, &[0xC2]))
+            .handle_datagram(&rule_get_request(selector, 24, &[0xC2]).expect("rule-get request"))
             .expect("detail response"),
     )
     .expect("detail packet");

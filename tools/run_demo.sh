@@ -172,10 +172,12 @@ printf '%s\n' \
 	'rule get device 20/8' >&3
 wait_for_line "$CORE_LOG" "tv=0x0000000000000002" "$CORE_PID"
 
-run_client "$AFTER_LOG" "fetch /demo-data:config/count
+run_client "$AFTER_LOG" "discover d=0
+schema demo-data
+fetch /demo-data:config/count
 quit"
 grep -Fxq '7' "$AFTER_LOG" || fail "after-update FETCH did not return an exact output line 7"
-wait_for_count "$CORE_LOG" "CORE DONE" 3 "$CORE_PID"
+wait_for_count "$CORE_LOG" "CORE DONE" 4 "$CORE_PID"
 
 printf '%s\n' quit >&3
 exec 3>&-
@@ -214,15 +216,15 @@ core_tx = reports(core, "CORE TX class=Ordinary ")
 core_rx = reports(core, "CORE RX class=Ordinary ")
 device_rx = reports(device, "DEVICE RX class=Ordinary ")
 device_tx = reports(device, "DEVICE TX class=Ordinary ")
-require(len(core_tx) == 3, f"expected 3 core request reports, got {len(core_tx)}")
-require(len(core_rx) == 3, f"expected 3 core response reports, got {len(core_rx)}")
-require(len(device_rx) == 3, f"expected 3 device request reports, got {len(device_rx)}")
-require(len(device_tx) == 3, f"expected 3 device response reports, got {len(device_tx)}")
+require(len(core_tx) == 4, f"expected 4 core request reports, got {len(core_tx)}")
+require(len(core_rx) == 4, f"expected 4 core response reports, got {len(core_rx)}")
+require(len(device_rx) == 4, f"expected 4 device request reports, got {len(device_rx)}")
+require(len(device_tx) == 4, f"expected 4 device response reports, got {len(device_tx)}")
 
-before_request, after_request = core_tx[1:]
-before_response, after_response = core_rx[1:]
-device_before_request, device_after_request = device_rx[1:]
-device_before_response, device_after_response = device_tx[1:]
+before_request, after_request = core_tx[1], core_tx[3]
+before_response, after_response = core_rx[1], core_rx[3]
+device_before_request, device_after_request = device_rx[1], device_rx[3]
+device_before_response, device_after_response = device_tx[1], device_tx[3]
 require(before_request["rule"] == "25/8", "initial request did not use fallback Rule25")
 require(after_request["rule"] == "20/8", "updated request did not use Rule20")
 require(before_response["rule"] == after_response["rule"] == "21/8", "responses did not use Rule21")

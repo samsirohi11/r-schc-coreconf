@@ -146,7 +146,8 @@ pub(crate) fn encode_tree(model: &CoreconfModel, tree: &Value) -> Result<Vec<u8>
     let sid_value = composite
         .identifier_value_to_sid_value(tree.clone())
         .map_err(ContextError::Rustconf)?;
-    let cbor_value = coreconf_model::codec::json_to_cbor_value(composite, &sid_value, 0);
+    let cbor_value = coreconf_model::codec::json_to_cbor_value(composite, &sid_value, 0)
+        .map_err(ContextError::Rustconf)?;
     // rustconf models identityrefs as ordinary integers in JSON/CBOR. The
     // SCHC SoR uses the identityref tag, so restore that tag after rustconf's
     // lossless modeled conversion. This also keeps union field-length

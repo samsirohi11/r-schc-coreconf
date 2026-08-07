@@ -15,8 +15,8 @@ const INITIAL_RULES: &str = include_str!("../../../fixtures/demo/initial-rules.j
 const UPDATED_RULES: &str = include_str!("../../../fixtures/demo/updated-rules.json");
 const INITIAL_SOR: &[u8] = include_bytes!("../../../fixtures/demo/initial.sor");
 const UPDATED_SOR: &[u8] = include_bytes!("../../../fixtures/demo/updated.sor");
-const INITIAL_SOR_SHA256: &str = "39bebf9b48900b6335024ff0b23e199279a8ad1023986d9812ecab4929401eb7";
-const UPDATED_SOR_SHA256: &str = "baa3c8045322fd6cf3f15130f2f2eb3baa8bb21038eea6758a9a63b40b5578fb";
+const INITIAL_SOR_SHA256: &str = "f374d7269a98ed403eb793d348f54715f3d447e82f411e82c92326bea3899645";
+const UPDATED_SOR_SHA256: &str = "dcdc582a61ae0eb91c50ce7009a02a99ff475864a3cf6746adc78ac471370721";
 
 fn source(document: &str) -> Value {
     serde_json::from_str(document).expect("OpenSCHC rule source")
@@ -43,6 +43,22 @@ fn source_field<'a>(rule: &'a Value, fid: &str) -> &'a Value {
 fn rule_context(sor: &[u8]) -> RuleContext {
     RuleContext::from_cbor_slice(sor, SidRegistry::from_json_str(SID).expect("r-schc SID"))
         .expect("r-schc SoR")
+}
+
+fn source_fields<'a>(rule: &'a Value, fid: &str) -> Vec<&'a Value> {
+    rule["Compression"]
+        .as_array()
+        .expect("compression entries")
+        .iter()
+        .filter(|field| field["FID"] == fid)
+        .collect()
+}
+
+fn source_field_values(rule: &Value, fid: &str) -> Vec<(Value, Value)> {
+    source_fields(rule, fid)
+        .into_iter()
+        .map(|field| (field["FP"].clone(), field["TV"].clone()))
+        .collect()
 }
 
 fn protected_policy() -> ProtectionPolicy {
@@ -136,20 +152,20 @@ fn rule_sources_have_only_the_minimal_inventory_and_expected_natures() {
 
         let fetch_rule = source_rule(document, 20);
         assert_eq!(source_field(fetch_rule, "COAP.CODE")["TV"], 5);
-        let uri_paths = fetch_rule["Compression"]
-            .as_array()
-            .expect("fetch compression entries")
-            .iter()
-            .filter(|field| field["FID"] == "COAP.option(11)")
-            .map(|field| (field["FP"].clone(), field["TV"].clone()))
-            .collect::<Vec<_>>();
+        let uri_paths = source_field_values(fetch_rule, "COAP.option(11)");
         assert_eq!(
             uri_paths,
-            vec![
-                (serde_json::json!(1), serde_json::json!("c")),
-                (serde_json::json!(2), serde_json::json!("demo-data:config")),
-                (serde_json::json!(3), serde_json::json!("count")),
-            ]
+            vec![(serde_json::json!(1), serde_json::json!("c"))]
+        );
+        let content_formats = source_field_values(fetch_rule, "COAP.option(12)");
+        assert_eq!(
+            content_formats,
+            vec![(serde_json::json!(1), serde_json::json!(141))]
+        );
+        let response_formats = source_field_values(source_rule(document, 21), "COAP.option(12)");
+        assert_eq!(
+            response_formats,
+            vec![(serde_json::json!(1), serde_json::json!(142))]
         );
     }
 

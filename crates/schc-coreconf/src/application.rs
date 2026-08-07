@@ -6,9 +6,8 @@
 //! core application endpoint.
 
 use std::fs;
-use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use coap_lite::{
     CoapOption, ContentFormat, MessageClass, MessageType, Packet, RequestType, ResponseType,
@@ -21,8 +20,6 @@ use coreconf_runtime::transport::coap_lite::{
 use coreconf_runtime::Datastore;
 use serde_json::Value;
 use thiserror::Error;
-
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Errors returned by the application service and client.
 #[derive(Debug, Error)]
@@ -44,9 +41,6 @@ pub enum ApplicationError {
         /// The optional response payload rendered as text.
         message: String,
     },
-    /// The remote response did not correlate with the request.
-    #[error("CoAP response did not correlate with request: {0}")]
-    Correlation(String),
     /// A command value was not valid JSON.
     #[error("invalid JSON value: {0}")]
     Json(#[from] serde_json::Error),
@@ -186,29 +180,29 @@ impl GenericDataService {
         let mut response = Packet::new();
         response.header.message_id = request.header.message_id;
         response.header.set_type(response_type_for(request));
-        response.header.code = MessageClass::Response(ResponseType::Content);
         response.set_token(request.get_token().to_vec());
-        response.payload = format!(
-            "</{management}>;rt=\"core.c.ds\";ct=112,</{streaming}>;rt=\"core.c.ev\";ct=141;obs"
-        )
-        .into_bytes();
-        response.set_content_format(ContentFormat::TextPlain);
+        if matches!(request.header.code, MessageClass::Request(RequestType::Get)) {
+            response.header.code = MessageClass::Response(ResponseType::Content);
+            response.payload = format!(
+                "</{management}>;rt=\"core.c.ds\";ct=140;ds=1029,</{streaming}>;rt=\"core.c.ev\";ct=142;obs"
+            )
+            .into_bytes();
+            response.set_content_format(ContentFormat::ApplicationLinkFormat);
+        } else {
+            response.header.code = MessageClass::Response(ResponseType::MethodNotAllowed);
+        }
         response
     }
 }
 
 /// A normal CoAP UDP client for a device-owned CORECONF datastore.
 ///
-/// rustconf owns discovery, GET, and mutation packet construction. The
-/// separate socket and packet builder are intentionally limited to FETCH,
-/// which the pinned public [`CoreconfClient`] trait does not expose.
+/// rustconf owns discovery, root GET, root FETCH, and mutation packet
+/// construction through its public [`CoreconfClient`] implementation.
 pub struct DataClient {
     client: CoapLiteClient,
-    fetch_socket: UdpSocket,
     endpoint: SocketAddr,
-    resource_path: String,
     model: CompositeModel,
-    next_fetch_message_id: u16,
 }
 
 impl DataClient {
@@ -227,17 +221,11 @@ impl DataClient {
             ApplicationError::Coap("endpoint resolved to no addresses".to_owned())
         })?;
         let resource_path = normalize_resource_path(&resource_path.into());
-        let client = CoapLiteClient::connect(model.clone(), endpoint, resource_path.clone())?;
-        let fetch_socket = UdpSocket::bind("0.0.0.0:0")?;
-        fetch_socket.set_read_timeout(Some(DEFAULT_TIMEOUT))?;
-        fetch_socket.connect(endpoint)?;
+        let client = CoapLiteClient::connect(model.clone(), endpoint, resource_path)?;
         Ok(Self {
             client,
-            fetch_socket,
             endpoint,
-            resource_path,
             model,
-            next_fetch_message_id: 1,
         })
     }
 
@@ -264,21 +252,27 @@ impl DataClient {
             .map_err(ApplicationError::from)
     }
 
-    /// Performs a remote CoAP GET and decodes its CORECONF value.
+    /// Performs a root CoAP GET, validates the complete snapshot locally, and
+    /// selects one value from the requested path.
     ///
-    /// A 4.04 response is represented as `Ok(None)`.
+    /// A missing selected path is represented as `Ok(None)`.
     ///
     /// # Errors
     ///
-    /// Returns an error for transport, decoding, or another response status.
+    /// Returns an error for transport, decoding, model validation, or another
+    /// response status.
     pub fn get(&mut self, path: &str) -> Result<Option<Value>, ApplicationError> {
         let path = canonical_path(path);
-        self.client
-            .fetch_path(&path)
-            .map_err(ApplicationError::from)
+        let snapshot = self
+            .client
+            .fetch_snapshot()
+            .map_err(ApplicationError::from)?;
+        let datastore = Datastore::from_json_with_model(self.model.clone(), &snapshot.to_string())?;
+        datastore.get_path(&path).map_err(ApplicationError::from)
     }
 
-    /// Performs a remote CoAP FETCH and decodes its CORECONF value.
+    /// Performs a root CoAP FETCH using the public rustconf client and decodes
+    /// its selected CORECONF instance value.
     ///
     /// This method emits the FETCH CoAP method code and does not alias GET.
     ///
@@ -287,19 +281,8 @@ impl DataClient {
     /// Returns an error for transport, decoding, or another response status.
     pub fn fetch(&mut self, path: &str) -> Result<Option<Value>, ApplicationError> {
         let path = canonical_path(path);
-        let packet = self.new_fetch_packet(&path);
-        let response = self.send_fetch(&packet)?;
-        if matches!(
-            response.header.code,
-            MessageClass::Response(ResponseType::NotFound)
-        ) {
-            return Ok(None);
-        }
-        ensure_success(&response)?;
-        let sid_value = coreconf_model::codec::cbor_to_json_value(&response.payload)?;
-        self.model
-            .sid_value_to_identifier_value_at_path(sid_value, &path)
-            .map(Some)
+        self.client
+            .fetch_path(&path)
             .map_err(ApplicationError::from)
     }
 
@@ -319,7 +302,7 @@ impl DataClient {
             .map_err(ApplicationError::from)
     }
 
-    /// Sends an immediate CORECONF DELETE mutation for one path.
+    /// Sends an immediate root CORECONF iPATCH deletion for one path.
     ///
     /// # Errors
     ///
@@ -338,43 +321,6 @@ impl DataClient {
     /// Returns an error for transport, decoding, or a non-success response.
     pub fn reload(&mut self) -> Result<Value, ApplicationError> {
         self.client.fetch_snapshot().map_err(ApplicationError::from)
-    }
-
-    fn new_fetch_packet(&mut self, path: &str) -> Packet {
-        let mut packet = Packet::new();
-        packet.header.message_id = self.next_fetch_message_id;
-        self.next_fetch_message_id = self.next_fetch_message_id.wrapping_add(1);
-        packet.header.code = MessageClass::Request(RequestType::Fetch);
-        packet.header.set_type(MessageType::Confirmable);
-        packet.set_token(vec![0xC0]);
-        add_uri_path(&mut packet, &self.resource_path);
-        if path != "/" {
-            add_uri_path(&mut packet, path);
-        }
-        packet
-    }
-
-    fn send_fetch(&self, packet: &Packet) -> Result<Packet, ApplicationError> {
-        let message_id = packet.header.message_id;
-        let token = packet.get_token().to_vec();
-        let bytes = packet
-            .to_bytes()
-            .map_err(|error| ApplicationError::Coap(error.to_string()))?;
-        self.fetch_socket.send(&bytes)?;
-        let mut buffer = vec![0_u8; 65_535];
-        let length = self.fetch_socket.recv(&mut buffer)?;
-        let response = Packet::from_bytes(&buffer[..length])
-            .map_err(|error| ApplicationError::Coap(error.to_string()))?;
-        if response.header.message_id != message_id {
-            return Err(ApplicationError::Correlation(format!(
-                "message ID {}, received {}",
-                message_id, response.header.message_id
-            )));
-        }
-        if response.get_token() != token.as_slice() {
-            return Err(ApplicationError::Correlation("token mismatch".to_owned()));
-        }
-        Ok(response)
     }
 }
 
@@ -399,16 +345,6 @@ pub fn schema_lines(model: &CompositeModel, filter: Option<&str>) -> Vec<String>
         .collect()
 }
 
-fn ensure_success(packet: &Packet) -> Result<(), ApplicationError> {
-    match packet.header.code {
-        MessageClass::Response(code) if !code.is_error() => Ok(()),
-        code => Err(ApplicationError::Remote {
-            code: code.to_string(),
-            message: String::from_utf8_lossy(&packet.payload).into_owned(),
-        }),
-    }
-}
-
 fn normalize_resource_path(path: &str) -> String {
     let path = path.trim_matches('/');
     if path.is_empty() {
@@ -429,6 +365,7 @@ fn canonical_path(path: &str) -> String {
     }
 }
 
+#[cfg(test)]
 fn add_uri_path(packet: &mut Packet, path: &str) {
     for segment in path
         .trim_matches('/')
@@ -464,6 +401,7 @@ fn response_type_for(request: &Packet) -> MessageType {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use coap_lite::RequestType;
 
     const SID: &str = include_str!("../../../fixtures/demo/demo-data.sid");
     const DATA: &str = include_str!("../../../fixtures/demo/app-data.json");
@@ -538,8 +476,114 @@ mod tests {
         assert!(filtered[0].contains("/demo-data:config/enabled"));
     }
 
+    fn discovery_request(method: RequestType, message_id: u16, token: &[u8]) -> Packet {
+        let mut request = Packet::new();
+        request.header.message_id = message_id;
+        request.header.code = MessageClass::Request(method);
+        request.header.set_type(MessageType::Confirmable);
+        request.set_token(token.to_vec());
+        add_uri_path(&mut request, "/.well-known/core");
+        request.add_option(CoapOption::UriQuery, b"d=0".to_vec());
+        request
+    }
+
+    fn content_formats(packet: &Packet) -> Vec<u16> {
+        packet
+            .get_option(CoapOption::ContentFormat)
+            .into_iter()
+            .flatten()
+            .map(|value| {
+                value
+                    .iter()
+                    .fold(0_u16, |number, byte| number << 8 | u16::from(*byte))
+            })
+            .collect()
+    }
+
     #[test]
-    fn discovery_and_fetch_preserve_coap_correlation() {
+    fn discovery_response_matches_rustconf_contract() {
+        let mut service =
+            GenericDataService::from_sid_contents(&[SID], DATA, "c").expect("service");
+        let request = discovery_request(RequestType::Get, 0x3456, &[0xc1, 0xd2]);
+        let response = Packet::from_bytes(
+            &service
+                .handle_datagram(&request.to_bytes().expect("request bytes"))
+                .expect("response bytes"),
+        )
+        .expect("response");
+
+        assert_eq!(
+            response.header.code,
+            MessageClass::Response(ResponseType::Content)
+        );
+        assert_eq!(response.header.get_type(), MessageType::Acknowledgement);
+        assert_eq!(response.header.message_id, 0x3456);
+        assert_eq!(response.get_token(), &[0xc1, 0xd2]);
+        assert_eq!(content_formats(&response), vec![40]);
+        assert_eq!(
+            response.payload.as_slice(),
+            b"</c>;rt=\"core.c.ds\";ct=140;ds=1029,</s>;rt=\"core.c.ev\";ct=142;obs"
+        );
+    }
+
+    #[test]
+    fn discovery_rejects_non_get_methods() {
+        let methods = [
+            RequestType::Post,
+            RequestType::Put,
+            RequestType::Delete,
+            RequestType::Fetch,
+            RequestType::Patch,
+            RequestType::IPatch,
+        ];
+        let mut service =
+            GenericDataService::from_sid_contents(&[SID], DATA, "c").expect("service");
+
+        for (index, method) in (0_u8..).zip(methods) {
+            let message_id = 0x1000 + u16::from(index);
+            let token = [index, 0xa5];
+            let request = discovery_request(method, message_id, &token);
+            let response = Packet::from_bytes(
+                &service
+                    .handle_datagram(&request.to_bytes().expect("request bytes"))
+                    .expect("response bytes"),
+            )
+            .expect("response");
+
+            assert_eq!(
+                response.header.code,
+                MessageClass::Response(ResponseType::MethodNotAllowed),
+                "method {method:?}"
+            );
+            assert_eq!(response.header.get_type(), MessageType::Acknowledgement);
+            assert_eq!(response.header.message_id, message_id);
+            assert_eq!(response.get_token(), token);
+            assert!(response.payload.is_empty());
+            assert!(content_formats(&response).is_empty());
+        }
+    }
+
+    #[test]
+    fn discovery_response_preserves_custom_resource_paths() {
+        let mut service =
+            GenericDataService::from_sid_contents(&[SID], DATA, "mgmt").expect("service");
+        let request = discovery_request(RequestType::Get, 0x4567, &[0x01]);
+        let response = Packet::from_bytes(
+            &service
+                .handle_datagram(&request.to_bytes().expect("request bytes"))
+                .expect("response bytes"),
+        )
+        .expect("response");
+
+        assert_eq!(content_formats(&response), vec![40]);
+        assert_eq!(
+            response.payload.as_slice(),
+            b"</mgmt>;rt=\"core.c.ds\";ct=140;ds=1029,</mgmt/s>;rt=\"core.c.ev\";ct=142;obs"
+        );
+    }
+
+    #[test]
+    fn obsolete_path_fetch_is_rejected() {
         let mut service =
             GenericDataService::from_sid_contents(&[SID], DATA, "c").expect("service");
         let mut request = Packet::new();
@@ -554,14 +598,14 @@ mod tests {
                 .expect("response");
         assert_eq!(response.header.message_id, 77);
         assert_eq!(response.get_token(), &[1, 2]);
-        assert!(matches!(
+        assert_eq!(
             response.header.code,
-            MessageClass::Response(ResponseType::Content)
-        ));
+            MessageClass::Response(ResponseType::MethodNotAllowed)
+        );
     }
 
     #[test]
-    fn client_performs_distinct_remote_methods_and_immediate_mutations() {
+    fn public_client_fetch_uses_root_identifiers_and_preserves_methods() {
         use std::net::UdpSocket;
         use std::sync::mpsc;
         use std::thread;
@@ -629,7 +673,7 @@ mod tests {
                 RequestType::Fetch,
                 RequestType::IPatch,
                 RequestType::Fetch,
-                RequestType::Delete,
+                RequestType::IPatch,
                 RequestType::Get,
                 RequestType::Get,
             ]

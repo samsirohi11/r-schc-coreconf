@@ -315,7 +315,8 @@ fn handle_command(
             }
             return Ok(CommandResult::Successful);
         }
-        let coap = rule_list_request(*next_message_id, &[0xC1]);
+        let coap = rule_list_request(*next_message_id, &[0xC1])
+            .map_err(|error| format!("device rule list request failed: {error}"))?;
         *next_message_id = next_message_id.wrapping_add(1);
         let exchange = exchange_management(link, raw_link, &coap)
             .map_err(|error| format!("device rule list failed: {error}"))?;
@@ -337,7 +338,8 @@ fn handle_command(
             return Err("rule get accepts exactly one selector".to_owned());
         }
         if side == "device" {
-            let coap = rule_get_request(selector, *next_message_id, &[0xC2]);
+            let coap = rule_get_request(selector, *next_message_id, &[0xC2])
+                .map_err(|error| format!("device rule get request failed: {error}"))?;
             *next_message_id = next_message_id.wrapping_add(1);
             let exchange = exchange_management(link, raw_link, &coap)
                 .map_err(|error| format!("device rule get failed: {error}"))?;

@@ -39,19 +39,21 @@ fn prepared() -> PreparedContext {
 fn root_ipatch_payload(tree: &Value) -> Vec<u8> {
     let model = CoreconfModel::from_sid_str(SID).expect("model");
     let mut path = InstancePath::new();
-    path.push_delta(2574);
+    assert!(path.push_delta(2574).is_ok());
     let instance = Instance::new(
         path,
         tree.get("ietf-schc:schc").cloned().expect("SCHC root"),
     );
     Datastore::with_data(model, tree.clone())
+        .expect("root iPATCH datastore")
         .encode_instances(&[instance])
         .expect("root iPATCH payload")
 }
 
 fn handler_for_active(active: &Arc<ActiveContext>) -> RequestHandler {
     let model = CoreconfModel::from_sid_str(SID).expect("model");
-    let datastore = Datastore::with_backend(model.composite_model().clone(), active.backend());
+    let datastore = Datastore::with_backend(model.composite_model().clone(), active.backend())
+        .expect("active datastore");
     RequestHandler::new(datastore)
 }
 
@@ -146,12 +148,13 @@ fn mixed_root_ipatch_failure_is_atomic() {
     let active = Arc::new(ActiveContext::new(initial.clone()));
     let model = CoreconfModel::from_sid_str(SID).expect("model");
     let mut first_path = InstancePath::new();
-    first_path.push_delta(2574);
+    assert!(first_path.push_delta(2574).is_ok());
     let first = Instance::new(first_path, initial.tree()["ietf-schc:schc"].clone());
     let mut invalid_path = InstancePath::new();
-    invalid_path.push_delta(9999);
+    assert!(invalid_path.push_delta(9999).is_ok());
     let invalid = Instance::new(invalid_path, Value::Object(serde_json::Map::new()));
     let mut payload = Datastore::with_data(model, initial.tree().clone())
+        .expect("initial datastore")
         .encode_instances(&[first])
         .expect("first payload");
     payload.extend(
@@ -246,7 +249,8 @@ fn active_backend_datastore_is_live_source_of_truth() {
     let initial = prepared();
     let active = Arc::new(ActiveContext::new(initial.clone()));
     let model = CoreconfModel::from_sid_str(SID).expect("model");
-    let mut datastore = Datastore::with_backend(model.composite_model().clone(), active.backend());
+    let mut datastore = Datastore::with_backend(model.composite_model().clone(), active.backend())
+        .expect("active datastore");
     assert_eq!(datastore.get_all(), initial.tree().clone());
     let mut candidate = initial.tree().clone();
     candidate["ietf-schc:schc"]["rule"][2]["entry"][0]["target-value"][0]["value"] =
@@ -318,7 +322,8 @@ fn run_competing_writer(
     thread::spawn(move || {
         let model = CoreconfModel::from_sid_str(SID).expect("model");
         let mut datastore =
-            Datastore::with_backend(model.composite_model().clone(), active.backend());
+            Datastore::with_backend(model.composite_model().clone(), active.backend())
+                .expect("active datastore");
         let _base = datastore.get_all();
         barrier.wait();
         barrier.wait();
@@ -334,7 +339,8 @@ fn invalid_backend_candidate_has_no_hidden_pending_state() {
     let initial = prepared();
     let active = Arc::new(ActiveContext::new(initial.clone()));
     let model = CoreconfModel::from_sid_str(SID).expect("model");
-    let mut datastore = Datastore::with_backend(model.composite_model().clone(), active.backend());
+    let mut datastore = Datastore::with_backend(model.composite_model().clone(), active.backend())
+        .expect("active datastore");
     let mut invalid = initial.tree().clone();
     invalid["ietf-schc:schc"]["rule"][1]["entry"][0]["field-position"] = Value::from(2);
     assert!(datastore.replace_tree(invalid).is_err());

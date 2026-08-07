@@ -112,16 +112,23 @@ impl LoadedContext {
             .map_err(|error| ContextError::Schc(error.to_string()))?;
         let value = strict_cbor_value(sor)?;
         ensure_schc_root(&value)?;
+        let rustconf_sor = rustconf_compatible_sor(&value)?;
 
         // Use rustconf's model conversion, then normalize all ordered SCHC
-        // lists before emitting the canonical complete SoR.
+        // lists before emitting the canonical complete SoR. The accepted
+        // rustconf codec resolves identityrefs from their numeric SID values
+        // and deliberately rejects the SCHC identityref tag, so only its
+        // private conversion view removes tag 45. The canonical wire value
+        // remains tagged through encode_tree's restoration step.
         let initial_tree = model
-            .to_value(sor)
+            .to_value(&rustconf_sor)
             .map_err(|error| ContextError::Model(error.to_string()))?;
         let initial_tree = normalize_tree(initial_tree)?;
         let canonical_sor = encode_tree(&model, &initial_tree)?;
+        let canonical_value = strict_cbor_value(&canonical_sor)?;
+        let canonical_rustconf_sor = rustconf_compatible_sor(&canonical_value)?;
         let canonical_tree = model
-            .to_value(&canonical_sor)
+            .to_value(&canonical_rustconf_sor)
             .map_err(|error| ContextError::Model(error.to_string()))?;
         let canonical_tree = normalize_tree(canonical_tree)?;
         if canonical_tree != initial_tree {
@@ -177,6 +184,32 @@ impl LoadedContext {
     #[must_use]
     pub const fn protected_rules(&self) -> &ProtectedRules {
         &self.protected
+    }
+}
+
+fn rustconf_compatible_sor(value: &CborValue) -> Result<Vec<u8>> {
+    let value = strip_identityref_tags(value.clone());
+    let mut bytes = Vec::new();
+    ciborium::ser::into_writer(&value, &mut bytes)
+        .map_err(|error| ContextError::Cbor(error.to_string()))?;
+    let _ = strict_cbor_value(&bytes)?;
+    Ok(bytes)
+}
+
+fn strip_identityref_tags(value: CborValue) -> CborValue {
+    match value {
+        CborValue::Array(values) => {
+            CborValue::Array(values.into_iter().map(strip_identityref_tags).collect())
+        }
+        CborValue::Map(entries) => CborValue::Map(
+            entries
+                .into_iter()
+                .map(|(key, value)| (strip_identityref_tags(key), strip_identityref_tags(value)))
+                .collect(),
+        ),
+        CborValue::Tag(45, value) => strip_identityref_tags(*value),
+        CborValue::Tag(tag, value) => CborValue::Tag(tag, Box::new(strip_identityref_tags(*value))),
+        other => other,
     }
 }
 
