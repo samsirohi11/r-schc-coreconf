@@ -8,7 +8,7 @@ use std::io;
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::Arc;
 
-use schc_core::RuleId;
+use schc_core::{Rule, RuleId};
 use schc_runtime::{DeviceId, NodeRole, RuntimeError, SchcFrame};
 
 pub use schc_runtime::NodeRole as LinkRole;
@@ -24,8 +24,8 @@ pub const DEVICE_LOGICAL_ADDRESS: std::net::Ipv6Addr =
     std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
 /// The ordinary application UDP port in the logical packet.
 pub const APPLICATION_PORT: u16 = 5683;
-/// The protected context-management UDP port in the logical packet.
-pub const MANAGEMENT_PORT: u16 = 5684;
+/// The protected context-management UDP port used by both logical endpoints.
+pub const MANAGEMENT_PORT: u16 = 8724;
 
 /// The origin declared by the producer of a logical packet.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -97,6 +97,11 @@ pub struct LinkReport {
     pub schc_bit_len: Option<usize>,
     /// Number of bytes sent or received on the SCHC link.
     pub padded_byte_len: usize,
+    /// The selected rule structure used for protected-management accounting.
+    ///
+    /// This is retained in reports rather than inferred from a `RuleID` so the
+    /// diagnostic breakdown cannot silently become stale when a rule changes.
+    pub(crate) management_rule: Option<Rule>,
 }
 
 impl LinkReport {
@@ -117,6 +122,7 @@ impl LinkReport {
         traffic_class: TrafficClass,
         packet: &[u8],
         frame: &SchcFrame,
+        management_rule: Option<Rule>,
     ) -> Self {
         Self {
             operation: LinkOperation::Encode,
@@ -128,6 +134,7 @@ impl LinkReport {
             packet_size: packet.len(),
             schc_bit_len: Some(frame.bit_len()),
             padded_byte_len: frame.bytes().len(),
+            management_rule,
         }
     }
 
@@ -138,6 +145,7 @@ impl LinkReport {
         packet: &[u8],
         frame: &[u8],
         bit_len: usize,
+        management_rule: Option<Rule>,
     ) -> Self {
         Self {
             operation: LinkOperation::Decode,
@@ -152,6 +160,7 @@ impl LinkReport {
             // meaningful bit length without adding metadata to the datagram.
             schc_bit_len: Some(bit_len),
             padded_byte_len: frame.len(),
+            management_rule,
         }
     }
 }
@@ -342,12 +351,22 @@ impl SchcLink {
         let encoded = runtime.encode_detailed(&self.device, endpoint, flow, packet.as_bytes())?;
         let class = classify(&snapshot, encoded.rule_id())?;
         enforce_origin(origin, encoded.rule_id(), class)?;
+        let management_rule = (class == TrafficClass::ProtectedManagement)
+            .then(|| {
+                snapshot
+                    .rules()
+                    .iter()
+                    .find(|rule| rule.id() == encoded.rule_id())
+                    .cloned()
+            })
+            .flatten();
         let report = LinkReport::encoded(
             snapshot.generation(),
             encoded.rule_id(),
             class,
             packet.as_bytes(),
             encoded.frame(),
+            management_rule,
         );
         Ok(LinkEncoding {
             frame: encoded.into_frame(),
@@ -408,6 +427,15 @@ impl SchcLink {
                 actual: frame.to_vec(),
             });
         }
+        let management_rule = (class == TrafficClass::ProtectedManagement)
+            .then(|| {
+                snapshot
+                    .rules()
+                    .iter()
+                    .find(|rule| rule.id() == decoded.rule_id())
+                    .cloned()
+            })
+            .flatten();
         let report = LinkReport::decoded(
             snapshot.generation(),
             decoded.rule_id(),
@@ -415,6 +443,7 @@ impl SchcLink {
             packet.as_bytes(),
             frame,
             canonical.frame().bit_len(),
+            management_rule,
         );
         Ok(LinkDecoded {
             packet,

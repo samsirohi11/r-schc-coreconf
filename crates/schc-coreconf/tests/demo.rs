@@ -3,8 +3,8 @@
 use coreconf_model::CoreconfModel;
 use schc_core::{RuleContext, RuleId, RuleNature, SidRegistry};
 use schc_coreconf::{
-    canonical_sor_from_tree, canonicalize_sor, validate_sid_with_both_models, PreparedContext,
-    ProtectionPolicy,
+    canonical_sor_from_tree, canonicalize_sor, protected_management_rule_ids,
+    validate_sid_with_both_models, PreparedContext, ProtectionPolicy,
 };
 use schc_runtime::{DeviceId, DeviceProfile, Runtime};
 use serde_json::Value;
@@ -15,8 +15,8 @@ const INITIAL_RULES: &str = include_str!("../../../fixtures/demo/initial-rules.j
 const UPDATED_RULES: &str = include_str!("../../../fixtures/demo/updated-rules.json");
 const INITIAL_SOR: &[u8] = include_bytes!("../../../fixtures/demo/initial.sor");
 const UPDATED_SOR: &[u8] = include_bytes!("../../../fixtures/demo/updated.sor");
-const INITIAL_SOR_SHA256: &str = "f374d7269a98ed403eb793d348f54715f3d447e82f411e82c92326bea3899645";
-const UPDATED_SOR_SHA256: &str = "dcdc582a61ae0eb91c50ce7009a02a99ff475864a3cf6746adc78ac471370721";
+const INITIAL_SOR_SHA256: &str = "68d02911464462c59f5f943a1a65345f20dc15b58a7fced4a0d4d1e16410912c";
+const UPDATED_SOR_SHA256: &str = "46c7eecc2701dd63dff9f90da3cdaf4f0a42b37f067da6c05bab2e3b77a6428b";
 
 fn source(document: &str) -> Value {
     serde_json::from_str(document).expect("OpenSCHC rule source")
@@ -62,7 +62,7 @@ fn source_field_values(rule: &Value, fid: &str) -> Vec<(Value, Value)> {
 }
 
 fn protected_policy() -> ProtectionPolicy {
-    ProtectionPolicy::from_rule_ids([RuleId::new(16, 8), RuleId::new(17, 8)])
+    ProtectionPolicy::from_rule_ids(protected_management_rule_ids())
 }
 
 fn prepared(sor: &[u8], name: &str) -> PreparedContext {
@@ -107,15 +107,15 @@ fn checked_in_sors_have_stable_bytes_and_load_through_both_models() {
     let model = CoreconfModel::from_sid_str(SID).expect("rustconf model");
     assert_eq!(model.sid_file.module_name, initial_sid.module_name);
     assert_eq!(model.sid_file.sids, initial_sid.sids);
-    assert_eq!(rule_context(INITIAL_SOR).rules().rules().len(), 5);
-    assert_eq!(rule_context(UPDATED_SOR).rules().rules().len(), 5);
+    assert_eq!(rule_context(INITIAL_SOR).rules().rules().len(), 8);
+    assert_eq!(rule_context(UPDATED_SOR).rules().rules().len(), 8);
 }
 
 #[test]
 fn rule_sources_have_only_the_minimal_inventory_and_expected_natures() {
     let initial = source(INITIAL_RULES);
     let updated = source(UPDATED_RULES);
-    let expected_ids = [16, 17, 20, 21, 25];
+    let expected_ids = [16, 17, 26, 27, 28, 20, 21, 25];
     assert_eq!(
         initial
             .as_array()
@@ -137,18 +137,17 @@ fn rule_sources_have_only_the_minimal_inventory_and_expected_natures() {
             assert_eq!(rule["RuleIDLength"], 8);
         }
         let protected = source_rule(document, 16);
-        assert!(protected["Compression"].is_null());
-        assert_eq!(
-            protected["NoCompression"]
-                .as_array()
-                .expect("protected no-compression entries")
-                .len(),
-            0
-        );
+        assert!(protected["Compression"].is_array());
+        assert!(protected.get("NoCompression").is_none());
         let code = source_field(source_rule(document, 17), "COAP.CODE");
-        assert_eq!(code["MO"], "ignore");
-        assert_eq!(code["CDA"], "value-sent");
-        assert!(code.get("TV").is_none());
+        assert_eq!(code["MO"], "match-mapping");
+        assert_eq!(code["CDA"], "mapping-sent");
+        assert_eq!(
+            code["TV"],
+            serde_json::json!([
+                65, 66, 68, 69, 128, 129, 130, 132, 133, 136, 137, 140, 141, 143, 160
+            ])
+        );
 
         let fetch_rule = source_rule(document, 20);
         assert_eq!(source_field(fetch_rule, "COAP.CODE")["TV"], 5);
@@ -172,41 +171,15 @@ fn rule_sources_have_only_the_minimal_inventory_and_expected_natures() {
     let initial_context = rule_context(INITIAL_SOR);
     let updated_context = rule_context(UPDATED_SOR);
     for context in [&initial_context, &updated_context] {
-        assert_eq!(
-            context
-                .find_rule(RuleId::new(16, 8))
-                .expect("16/8")
-                .nature(),
-            RuleNature::NoCompression
-        );
-        assert_eq!(
-            context
-                .find_rule(RuleId::new(17, 8))
-                .expect("17/8")
-                .nature(),
-            RuleNature::Compression
-        );
-        assert_eq!(
-            context
-                .find_rule(RuleId::new(20, 8))
-                .expect("20/8")
-                .nature(),
-            RuleNature::Compression
-        );
-        assert_eq!(
-            context
-                .find_rule(RuleId::new(21, 8))
-                .expect("21/8")
-                .nature(),
-            RuleNature::Compression
-        );
-        assert_eq!(
-            context
-                .find_rule(RuleId::new(25, 8))
-                .expect("25/8")
-                .nature(),
-            RuleNature::Compression
-        );
+        for id in [16, 17, 20, 21, 25, 26, 27, 28] {
+            assert_eq!(
+                context
+                    .find_rule(RuleId::new(id, 8))
+                    .expect("rule")
+                    .nature(),
+                RuleNature::Compression
+            );
+        }
     }
     assert!(source_rule(&initial, 25).get("Compression").is_some());
     assert!(source_rule(&initial, 25).get("NoCompression").is_none());
@@ -249,7 +222,7 @@ fn updated_field_value(document: &Value, rule_id: u64, fid: &str) -> Value {
 fn protected_rules_are_identical_and_both_variants_build_runtime() {
     let initial = rule_context(INITIAL_SOR);
     let updated = rule_context(UPDATED_SOR);
-    for id in [RuleId::new(16, 8), RuleId::new(17, 8)] {
+    for id in protected_management_rule_ids() {
         assert_eq!(initial.find_rule(id), updated.find_rule(id));
     }
 
@@ -257,11 +230,11 @@ fn protected_rules_are_identical_and_both_variants_build_runtime() {
     let updated_prepared = prepared(UPDATED_SOR, "demo-updated");
     assert_eq!(
         initial_prepared.protected_rule_ids(),
-        vec![RuleId::new(16, 8), RuleId::new(17, 8)]
+        protected_management_rule_ids().to_vec()
     );
     assert_eq!(
         updated_prepared.protected_rule_ids(),
-        vec![RuleId::new(16, 8), RuleId::new(17, 8)]
+        protected_management_rule_ids().to_vec()
     );
     let _: &Runtime = initial_prepared.runtime();
     let _: &Runtime = updated_prepared.runtime();

@@ -28,8 +28,8 @@ use thiserror::Error;
 
 use crate::{
     ActiveContext, ContextSnapshot, ContextTag, Ipv6UdpCoapPacket, LinkError, LinkReport,
-    PreparedContext, RawUdpLink, SchcLink, TrafficOrigin, TrafficRoute, APPLICATION_PORT,
-    CORE_LOGICAL_ADDRESS, DEVICE_LOGICAL_ADDRESS, MANAGEMENT_PORT,
+    PreparedContext, RawUdpLink, SchcLink, TrafficOrigin, TrafficRoute, CORE_LOGICAL_ADDRESS,
+    DEVICE_LOGICAL_ADDRESS, MANAGEMENT_PORT,
 };
 
 /// Marker used as the first byte of the compact context-check FETCH payload.
@@ -752,7 +752,10 @@ impl ResolvedRuleUpdate {
         packet.header.message_id = message_id;
         packet.header.code = MessageClass::Request(RequestType::IPatch);
         packet.header.set_type(MessageType::Confirmable);
-        packet.set_token(token.to_vec());
+        // Protected management uses a zero-length token; the endpoint and
+        // bounded CoAP MID provide the correlation key.
+        let _ = token;
+        packet.set_token(Vec::new());
         packet.add_option(CoapOption::UriPath, b"schc".to_vec());
         packet.add_option(CoapOption::ContentFormat, vec![142]);
         packet.payload = self.ipatch_payload()?;
@@ -860,6 +863,170 @@ pub struct ContextCheckResult {
     pub device_tag: ContextTag,
     /// Whether the two tags are equal.
     pub equal: bool,
+}
+
+/// Bit-level accounting for one protected management SCHC report.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct ManagementBitBreakdown {
+    /// Bits used by the selected `RuleID`.
+    pub rule_id_bits: usize,
+    /// Bits used by the CoAP response-code mapping, when present.
+    pub method_or_response_mapping_bits: usize,
+    /// CoAP MID residue bits.
+    pub mid_residue_bits: usize,
+    /// Exact CORECONF CoAP payload bits, excluding its SCHC length prefix.
+    pub payload_bits: usize,
+    /// Bits used by the variable payload length prefix.
+    pub payload_length_bits: usize,
+    /// Bits used by dynamic management option values such as If-Match.
+    pub option_residue_bits: usize,
+    /// Zero padding bits in the sent frame's final byte.
+    pub byte_padding_bits: usize,
+    /// Residue bits not accounted for by the fields above; must be zero.
+    pub unaccounted_residue_bits: usize,
+}
+
+impl ManagementBitBreakdown {
+    /// Returns the protected management transport overhead.
+    ///
+    /// This is the exact `RuleID`, method/response mapping, and MID residue.
+    /// The CORECONF payload, its variable-length prefix, dynamic options, and
+    /// final byte padding are reported separately and are excluded.
+    #[must_use]
+    pub const fn transport_residue_bits(self) -> usize {
+        self.rule_id_bits + self.method_or_response_mapping_bits + self.mid_residue_bits
+    }
+}
+
+/// Computes and validates the bit accounting for one protected management report.
+///
+/// Fixed IPv6, UDP, CoAP, URI, and content-format fields are reconstructed by
+/// the selected rule and therefore do not appear as residue. The selected rule
+/// structure is retained in the report so this accounting cannot claim a
+/// mapping or MID shape that differs from the loaded rule.
+///
+/// # Errors
+///
+/// Returns an error when the report is not protected management traffic, its
+/// packet is invalid, its MID is outside the compressed range, its rule
+/// structure is unavailable, or its bit accounting is inconsistent.
+pub fn management_bit_breakdown(
+    report: &LinkReport,
+) -> Result<ManagementBitBreakdown, InspectionError> {
+    if report.traffic_class != crate::TrafficClass::ProtectedManagement {
+        return Err(InspectionError::UnexpectedResponse(
+            "bit breakdown requires a protected management report".into(),
+        ));
+    }
+    let packet = Ipv6UdpCoapPacket::parse(&report.packet_bytes)
+        .map_err(|error| InspectionError::Coap(error.to_string()))?;
+    let message = packet.coap_message();
+    if message.message_id() >= 128 {
+        return Err(InspectionError::UnexpectedResponse(
+            "management MID is outside the 7-bit compressed range".into(),
+        ));
+    }
+    let rule = report.management_rule.as_ref().ok_or_else(|| {
+        InspectionError::UnexpectedResponse(
+            "management report has no selected rule structure".into(),
+        )
+    })?;
+    let mut method_or_response_mapping_bits = 0;
+    let mut mid_residue_bits = 0;
+    let mut payload_length_bits = 0;
+    let mut option_residue_bits = 0;
+    for field in rule.fields() {
+        match &field.field {
+            FieldRef::Coap("fid-coap-code") if field.action == Cda::MappingSent => {
+                let TargetValue::Mapping(values) = &field.target else {
+                    return Err(InspectionError::UnexpectedResponse(
+                        "management code mapping has no mapping target".into(),
+                    ));
+                };
+                method_or_response_mapping_bits = mapping_index_bits(values.len());
+            }
+            FieldRef::Coap("fid-coap-mid") => {
+                let FieldLength::FixedBits(field_bits) = &field.length else {
+                    return Err(InspectionError::UnexpectedResponse(
+                        "management MID rule entry is not fixed-width".into(),
+                    ));
+                };
+                mid_residue_bits = match (field.matching, field.action) {
+                    (MatchingOperator::Msb(msb_bits), Cda::Lsb) => {
+                        (*field_bits).checked_sub(msb_bits).ok_or_else(|| {
+                            InspectionError::UnexpectedResponse(
+                                "management MID MSB exceeds its field width".into(),
+                            )
+                        })?
+                    }
+                    (_, Cda::ValueSent) => *field_bits,
+                    _ => 0,
+                };
+            }
+            FieldRef::Payload if field.action == Cda::ValueSent => {
+                payload_length_bits = variable_length_prefix_bits(message.payload().len());
+            }
+            FieldRef::CoapOption { number } if field.action == Cda::ValueSent => {
+                option_residue_bits += message
+                    .options()
+                    .iter()
+                    .filter(|option| u64::from(option.number()) == *number)
+                    .map(|option| option.value().len() * 8)
+                    .sum::<usize>();
+            }
+            _ => {}
+        }
+    }
+    let payload_bits = message.payload().len() * 8;
+    let rule_id_bits = report.rule_id.bit_len();
+    let meaningful_bits = report.schc_bit_len.ok_or_else(|| {
+        InspectionError::UnexpectedResponse("management report has no meaningful bit length".into())
+    })?;
+    let accounted_bits = rule_id_bits
+        + method_or_response_mapping_bits
+        + mid_residue_bits
+        + payload_bits
+        + payload_length_bits
+        + option_residue_bits;
+    if meaningful_bits < accounted_bits {
+        return Err(InspectionError::UnexpectedResponse(format!(
+            "management report has {meaningful_bits} meaningful bits but accounting needs {accounted_bits}"
+        )));
+    }
+    let byte_padding_bits = report
+        .padded_byte_len
+        .checked_mul(8)
+        .and_then(|bits| bits.checked_sub(meaningful_bits))
+        .ok_or_else(|| {
+            InspectionError::UnexpectedResponse("management report padding is invalid".into())
+        })?;
+    Ok(ManagementBitBreakdown {
+        rule_id_bits,
+        method_or_response_mapping_bits,
+        mid_residue_bits,
+        payload_bits,
+        payload_length_bits,
+        option_residue_bits,
+        byte_padding_bits,
+        unaccounted_residue_bits: meaningful_bits - accounted_bits,
+    })
+}
+
+fn mapping_index_bits(mapping_len: usize) -> usize {
+    if mapping_len <= 1 {
+        return 0;
+    }
+    (usize::BITS - (mapping_len - 1).leading_zeros()) as usize
+}
+
+fn variable_length_prefix_bits(value: usize) -> usize {
+    if value <= 14 {
+        4
+    } else if value <= 254 {
+        12
+    } else {
+        28
+    }
 }
 
 /// A protected request/response exchange and its existing link reports.
@@ -1960,12 +2127,14 @@ pub fn rule_get_request(
         .map_err(|error| InspectionError::Coap(error.to_string()))
 }
 
-fn base_request(method: RequestType, message_id: u16, token: &[u8]) -> Packet {
+fn base_request(method: RequestType, message_id: u16, _token: &[u8]) -> Packet {
     let mut packet = Packet::new();
     packet.header.message_id = message_id;
     packet.header.code = MessageClass::Request(method);
     packet.header.set_type(MessageType::Confirmable);
-    packet.set_token(token.to_vec());
+    // Protected management uses a zero-length token; the endpoint and bounded
+    // CoAP MID provide the correlation key.
+    packet.set_token(Vec::new());
     packet.add_option(CoapOption::UriPath, b"schc".to_vec());
     packet
 }
@@ -1984,15 +2153,18 @@ fn exchange_management_response(
     let request = Ipv6UdpCoapPacket::new(
         CORE_LOGICAL_ADDRESS,
         DEVICE_LOGICAL_ADDRESS,
-        APPLICATION_PORT,
+        MANAGEMENT_PORT,
         MANAGEMENT_PORT,
         coap_datagram,
     )
     .map_err(|error| InspectionError::Coap(error.to_string()))?;
     let encoded = link.encode(TrafficOrigin::Management, &request)?;
-    if encoded.report().rule_id != RuleId::new(16, 8) {
+    if !matches!(
+        encoded.report().rule_id,
+        id if [16_u64, 26, 27, 28].contains(&id.value()) && id.bit_len() == 8
+    ) {
         return Err(InspectionError::UnexpectedResponse(format!(
-            "management request selected RuleID {}/{} instead of 16/8",
+            "management request selected unsupported protected RuleID {}/{}",
             encoded.report().rule_id.value(),
             encoded.report().rule_id.bit_len()
         )));
@@ -2012,7 +2184,7 @@ fn exchange_management_response(
     if response.source() != DEVICE_LOGICAL_ADDRESS
         || response.destination() != CORE_LOGICAL_ADDRESS
         || response.source_port() != MANAGEMENT_PORT
-        || response.destination_port() != APPLICATION_PORT
+        || response.destination_port() != MANAGEMENT_PORT
     {
         return Err(InspectionError::UnexpectedResponse(
             "management response logical orientation is invalid".into(),

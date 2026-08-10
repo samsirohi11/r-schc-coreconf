@@ -20,6 +20,22 @@ use schc_coreconf::{
 };
 
 const CONSOLE_POLL: Duration = Duration::from_millis(50);
+const MANAGEMENT_MID_MODULUS: u16 = 128;
+
+/// Allocates one MID from the stateless seven-bit reconstruction window.
+///
+/// Management exchanges are synchronous and have at most one outstanding
+/// request, so a completed exchange releases its MID for reuse after the
+/// bounded 0..=127 cycle. No value outside that reconstruction window is
+/// emitted on the protected link.
+fn next_management_message_id(next: &mut u16) -> u16 {
+    if *next >= MANAGEMENT_MID_MODULUS {
+        *next = 0;
+    }
+    let message_id = *next;
+    *next = (*next + 1) % MANAGEMENT_MID_MODULUS;
+    message_id
+}
 
 fn main() {
     if let Err(error) = run() {
@@ -282,9 +298,8 @@ fn handle_command(
     }
     if command == "context check" {
         let tag = active.snapshot().tag();
-        let token = vec![0xC0];
-        let coap = context_check_request(tag, *next_message_id, &token);
-        *next_message_id = next_message_id.wrapping_add(1);
+        let message_id = next_management_message_id(next_message_id);
+        let coap = context_check_request(tag, message_id, &[]);
         let exchange = exchange_management(link, raw_link, &coap)
             .map_err(|error| format!("context check failed: {error}"))?;
         print_report("CORE MGMT TX", &exchange.request_report, debug);
@@ -315,9 +330,9 @@ fn handle_command(
             }
             return Ok(CommandResult::Successful);
         }
-        let coap = rule_list_request(*next_message_id, &[0xC1])
+        let message_id = next_management_message_id(next_message_id);
+        let coap = rule_list_request(message_id, &[])
             .map_err(|error| format!("device rule list request failed: {error}"))?;
-        *next_message_id = next_message_id.wrapping_add(1);
         let exchange = exchange_management(link, raw_link, &coap)
             .map_err(|error| format!("device rule list failed: {error}"))?;
         let summaries = decode_rule_list_payload(&exchange.payload, inspection.model())
@@ -338,9 +353,9 @@ fn handle_command(
             return Err("rule get accepts exactly one selector".to_owned());
         }
         if side == "device" {
-            let coap = rule_get_request(selector, *next_message_id, &[0xC2])
+            let message_id = next_management_message_id(next_message_id);
+            let coap = rule_get_request(selector, message_id, &[])
                 .map_err(|error| format!("device rule get request failed: {error}"))?;
-            *next_message_id = next_message_id.wrapping_add(1);
             let exchange = exchange_management(link, raw_link, &coap)
                 .map_err(|error| format!("device rule get failed: {error}"))?;
             let detail = decode_rule_detail_payload(
@@ -412,16 +427,15 @@ where
             )
         })?;
     let base_tag = request.if_match.then_some(snapshot.tag());
-    let message_id = *next_message_id;
+    let message_id = next_management_message_id(next_message_id);
     let datagram = update
-        .ipatch_datagram(message_id, &[0xC3], base_tag)
+        .ipatch_datagram(message_id, &[], base_tag)
         .map_err(|error| {
             format!(
                 "rule update {}/{} entry={} rejected: {error}; device=not-sent; local=unchanged",
                 request.rule.value, request.rule.bits, update.entry_index
             )
         })?;
-    *next_message_id = next_message_id.wrapping_add(1);
 
     let device_code = send_device(&datagram).map_err(|error| {
         format!(
@@ -518,12 +532,14 @@ mod tests {
     use std::cell::RefCell;
     use std::sync::Arc;
 
-    use coap_lite::{MessageClass, Packet, ResponseType};
-    use schc_core::RuleId;
-    use schc_coreconf::{ActiveContext, InspectionService, PreparedContext, ProtectionPolicy};
+    use coap_lite::{MessageClass, MessageType, Packet, RequestType, ResponseType};
+    use schc_coreconf::{
+        protected_management_rule_ids, ActiveContext, InspectionService, PreparedContext,
+        ProtectionPolicy,
+    };
     use schc_runtime::{DeviceId, DeviceProfile};
 
-    use super::{execute_rule_update, CommandResult};
+    use super::{execute_rule_update, validate_changed_response, CommandResult};
 
     const SID: &str = include_str!("../../../../fixtures/demo/ietf-schc@2026-05-07.sid");
     const SOR: &[u8] = include_bytes!("../../../../fixtures/demo/initial.sor");
@@ -534,10 +550,19 @@ mod tests {
             SOR,
             DeviceId::new(device).expect("device"),
             DeviceProfile::default(),
-            ProtectionPolicy::from_rule_ids([RuleId::new(16, 8), RuleId::new(17, 8)]),
+            ProtectionPolicy::from_rule_ids(protected_management_rule_ids()),
         )
         .expect("prepared");
         Arc::new(ActiveContext::new(prepared))
+    }
+
+    #[test]
+    fn management_mid_allocator_reuses_the_bounded_reconstruction_window() {
+        let mut next = 127;
+        assert_eq!(super::next_management_message_id(&mut next), 127);
+        assert_eq!(next, 0);
+        assert_eq!(super::next_management_message_id(&mut next), 0);
+        assert_eq!(next, 1);
     }
 
     #[test]
@@ -643,6 +668,38 @@ mod tests {
         let after = core.snapshot();
         assert_eq!(after.tree(), before.tree());
         assert_eq!(after.generation(), before.generation());
+    }
+
+    #[test]
+    fn local_changed_response_rejects_wrong_mid_or_token() {
+        let mut request = Packet::new();
+        request.header.message_id = 41;
+        request.header.code = MessageClass::Request(RequestType::IPatch);
+        request.header.set_type(MessageType::Confirmable);
+        request.set_token(Vec::new());
+        let request_bytes = request.to_bytes().expect("request");
+
+        let mut wrong_mid = Packet::new();
+        wrong_mid.header.message_id = 42;
+        wrong_mid.header.code = MessageClass::Response(ResponseType::Changed);
+        wrong_mid.header.set_type(MessageType::Acknowledgement);
+        wrong_mid.set_token(Vec::new());
+        assert!(validate_changed_response(
+            &request_bytes,
+            &wrong_mid.to_bytes().expect("wrong MID response")
+        )
+        .is_err());
+
+        let mut wrong_token = Packet::new();
+        wrong_token.header.message_id = 41;
+        wrong_token.header.code = MessageClass::Response(ResponseType::Changed);
+        wrong_token.header.set_type(MessageType::Acknowledgement);
+        wrong_token.set_token(vec![1]);
+        assert!(validate_changed_response(
+            &request_bytes,
+            &wrong_token.to_bytes().expect("wrong token response")
+        )
+        .is_err());
     }
 
     #[test]

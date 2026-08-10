@@ -66,7 +66,7 @@ fn run() -> Result<(), String> {
                 let request = decoded.packet();
                 if request.source() != CORE_LOGICAL_ADDRESS
                     || request.destination() != DEVICE_LOGICAL_ADDRESS
-                    || request.source_port() != APPLICATION_PORT
+                    || request.source_port() != MANAGEMENT_PORT
                     || request.destination_port() != MANAGEMENT_PORT
                 {
                     return Err(
@@ -81,7 +81,7 @@ fn run() -> Result<(), String> {
                     DEVICE_LOGICAL_ADDRESS,
                     CORE_LOGICAL_ADDRESS,
                     MANAGEMENT_PORT,
-                    APPLICATION_PORT,
+                    MANAGEMENT_PORT,
                     &response_datagram,
                 )
                 .map_err(|error| format!("construct management response: {error}"))?;

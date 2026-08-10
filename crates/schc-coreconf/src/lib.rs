@@ -29,11 +29,11 @@ pub use link::{
 pub use management::{
     context_check_request, context_check_response, decode_context_check_payload,
     decode_rule_detail_payload, decode_rule_list_payload, exchange_management,
-    exchange_management_update, format_rule_detail, format_rule_list, parse_rule_selector,
-    parse_rule_update_command, rule_get_request, rule_list_request, ContextCheckResult,
-    ContextStatus, InspectionError, InspectionService, ManagementExchange, ResolvedRuleUpdate,
-    RuleDetail, RuleEntry, RuleEntrySelector, RuleSelector, RuleSummary, RuleUpdateRequest,
-    CONTEXT_CHECK_MARKER,
+    exchange_management_update, format_rule_detail, format_rule_list, management_bit_breakdown,
+    parse_rule_selector, parse_rule_update_command, rule_get_request, rule_list_request,
+    ContextCheckResult, ContextStatus, InspectionError, InspectionService, ManagementBitBreakdown,
+    ManagementExchange, ResolvedRuleUpdate, RuleDetail, RuleEntry, RuleEntrySelector, RuleSelector,
+    RuleSummary, RuleUpdateRequest, CONTEXT_CHECK_MARKER,
 };
 pub use packet::{
     CoapMessage, CoapOption, Ipv6UdpCoapPacket, PacketError, PacketMetadata, PacketResult,
@@ -41,6 +41,18 @@ pub use packet::{
     MAX_COAP_DATAGRAM_LEN, UDP_HEADER_LEN, UDP_NEXT_HEADER,
 };
 pub use policy::{ProtectedRule, ProtectedRules, ProtectionPolicy};
+
+/// Returns the immutable protected management rule identities used by the prototype.
+#[must_use]
+pub fn protected_management_rule_ids() -> [RuleId; 5] {
+    [
+        RuleId::new(16, 8),
+        RuleId::new(17, 8),
+        RuleId::new(26, 8),
+        RuleId::new(27, 8),
+        RuleId::new(28, 8),
+    ]
+}
 
 use coreconf_model::{CoreconfError, SidFile};
 use schc_core::{RuleId, SidRegistry};

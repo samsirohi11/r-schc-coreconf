@@ -6,8 +6,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use schc_core::RuleId;
-use schc_coreconf::{ActiveContext, LinkReport, PreparedContext, ProtectionPolicy, RawUdpLink};
+use schc_coreconf::{
+    management_bit_breakdown, protected_management_rule_ids, ActiveContext, LinkReport,
+    PreparedContext, ProtectionPolicy, RawUdpLink,
+};
 use schc_runtime::{DeviceId, DeviceProfile};
 
 const DEFAULT_SID: &str = include_str!("../../../../../fixtures/demo/ietf-schc@2026-05-07.sid");
@@ -128,7 +130,7 @@ impl Args {
             &sor,
             device_id,
             DeviceProfile::default(),
-            ProtectionPolicy::from_rule_ids([RuleId::new(16, 8), RuleId::new(17, 8)]),
+            ProtectionPolicy::from_rule_ids(protected_management_rule_ids()),
         )
         .map_err(|error| error.to_string())?;
         Ok(Arc::new(ActiveContext::new(prepared)))
@@ -172,6 +174,22 @@ pub(crate) fn print_report(prefix: &str, report: &LinkReport, debug: bool) {
             hex_bytes(&report.packet_bytes),
             hex_bytes(&report.frame_bytes)
         );
+    }
+    if report.traffic_class == schc_coreconf::TrafficClass::ProtectedManagement {
+        if let Ok(breakdown) = management_bit_breakdown(report) {
+            print!(
+                " rule_id_bits={} code_mapping_bits={} mid_residue_bits={} transport_overhead_bits={} payload_bits={} payload_length_bits={} option_residue_bits={} byte_padding_bits={} unaccounted_residue_bits={}",
+                breakdown.rule_id_bits,
+                breakdown.method_or_response_mapping_bits,
+                breakdown.mid_residue_bits,
+                breakdown.transport_residue_bits(),
+                breakdown.payload_bits,
+                breakdown.payload_length_bits,
+                breakdown.option_residue_bits,
+                breakdown.byte_padding_bits,
+                breakdown.unaccounted_residue_bits,
+            );
+        }
     }
     println!();
 }

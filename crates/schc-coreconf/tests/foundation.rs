@@ -9,8 +9,9 @@ use coreconf_runtime::{
 };
 use schc_core::{RuleContext, RuleId, SidRegistry};
 use schc_coreconf::{
-    canonical_sor_from_tree, canonicalize_sor, derive_protected_management_rule_ids, tree_from_sor,
-    ActiveContext, ContextError, PreparedContext, ProtectionPolicy,
+    canonical_sor_from_tree, canonicalize_sor, derive_protected_management_rule_ids,
+    protected_management_rule_ids, tree_from_sor, ActiveContext, ContextError, PreparedContext,
+    ProtectionPolicy,
 };
 use schc_runtime::{DeviceId, DeviceProfile};
 use serde_json::Value;
@@ -26,9 +27,9 @@ fn device() -> DeviceId {
 }
 
 fn policy() -> ProtectionPolicy {
-    // Protection is an integration policy over the exact 16/8 and 17/8
-    // identities, independent of each rule's wire nature.
-    ProtectionPolicy::from_rule_ids([RuleId::new(16, 8), RuleId::new(17, 8)])
+    // Protection is an integration policy over the exact protected
+    // management identities, independent of ordinary application rules.
+    ProtectionPolicy::from_rule_ids(protected_management_rule_ids())
 }
 
 fn prepared() -> PreparedContext {

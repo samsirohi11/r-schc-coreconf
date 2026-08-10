@@ -7,9 +7,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use schc_core::RuleId;
 use schc_coreconf::{
-    format_rule_detail, ActiveContext, InspectionService, PreparedContext, ProtectionPolicy,
+    format_rule_detail, protected_management_rule_ids, ActiveContext, InspectionService,
+    PreparedContext, ProtectionPolicy,
 };
 use schc_runtime::{DeviceId, DeviceProfile};
 use support::TestProcess;
@@ -29,7 +29,7 @@ fn prepared(sor: &[u8], device_id: &str) -> PreparedContext {
         sor,
         DeviceId::new(device_id).expect("device ID"),
         DeviceProfile::default(),
-        ProtectionPolicy::from_rule_ids([RuleId::new(16, 8), RuleId::new(17, 8)]),
+        ProtectionPolicy::from_rule_ids(protected_management_rule_ids()),
     )
     .expect("prepared context")
 }
@@ -117,7 +117,7 @@ fn real_console_inspection_reports_remote_mismatch_and_detail() {
         updated_tree,
         DeviceId::new("console-device").expect("device ID"),
         DeviceProfile::default(),
-        ProtectionPolicy::from_rule_ids([RuleId::new(16, 8), RuleId::new(17, 8)]),
+        ProtectionPolicy::from_rule_ids(protected_management_rule_ids()),
     )
     .expect("updated context");
     let updated = prepared(updated_source.sor(), "console-device");
@@ -191,7 +191,7 @@ fn real_console_inspection_reports_remote_mismatch_and_detail() {
         "core stdout: {core_stdout}"
     );
     assert!(core_stdout.contains("CORE MGMT RX class=ProtectedManagement rule=17/8"));
-    assert!(core_stdout.contains("RULE 16/8 nature=no-compression"));
+    assert!(core_stdout.contains("RULE 16/8 nature=compression"));
     assert!(core_stdout.contains("RULE 20/8 nature=compression"));
     for line in initial_lines {
         assert!(
@@ -259,6 +259,38 @@ fn real_console_rule_update_synchronizes_contexts_over_protected_link() {
     assert_no_stderr("device", &device_stderr);
     assert!(
         device_stdout.contains("DEVICE RX class=ProtectedManagement rule=16/8"),
+        "device stdout: {device_stdout}"
+    );
+    assert!(
+        device_stdout.contains("DEVICE MGMT TX class=ProtectedManagement rule=17/8"),
+        "device stdout: {device_stdout}"
+    );
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn real_console_default_rule_update_uses_dedicated_compressed_rule() {
+    let (mut device, mut core) = start_processes(None, None);
+    core.write_stdin(b"rule update 20/8 fid=ipv6.app-iid tv=6\nquit\n");
+    let core_status = core.wait_timeout(Duration::from_secs(20));
+    assert!(core_status.success(), "core status: {core_status}");
+    let (core_stdout, core_stderr) = core.output();
+    assert_no_stderr("core", &core_stderr);
+    assert!(
+        core_stdout.contains("CORE MGMT TX class=ProtectedManagement rule=27/8"),
+        "core stdout: {core_stdout}"
+    );
+    assert!(
+        core_stdout.contains("CORE MGMT RX class=ProtectedManagement rule=17/8"),
+        "core stdout: {core_stdout}"
+    );
+    assert!(core_stdout.contains("RULE UPDATE 20/8 entry=9 device=2.04 local=2.04"));
+
+    device.kill();
+    let (device_stdout, device_stderr) = device.output();
+    assert_no_stderr("device", &device_stderr);
+    assert!(
+        device_stdout.contains("DEVICE RX class=ProtectedManagement rule=27/8"),
         "device stdout: {device_stdout}"
     );
     assert!(

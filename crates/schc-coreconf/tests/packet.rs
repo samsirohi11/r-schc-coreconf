@@ -11,7 +11,7 @@ use schc_coreconf::{
 const DEVICE: Ipv6Addr = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
 const CORE: Ipv6Addr = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 2);
 const APPLICATION_PORT: u16 = 5683;
-const MANAGEMENT_PORT: u16 = 5684;
+const MANAGEMENT_PORT: u16 = 8724;
 
 fn message(
     message_type: u8,
@@ -110,7 +110,7 @@ fn fixed_protected_packets_demonstrate_inspection_and_ipatch_traffic() {
     let management_inspection_request = packet(
         CORE,
         DEVICE,
-        APPLICATION_PORT,
+        MANAGEMENT_PORT,
         MANAGEMENT_PORT,
         &message(0, 1, 0x2001, &[], vec![option(11, b"schc")], &[]),
     );
@@ -119,7 +119,7 @@ fn fixed_protected_packets_demonstrate_inspection_and_ipatch_traffic() {
         PacketExpectation {
             source: CORE,
             destination: DEVICE,
-            source_port: APPLICATION_PORT,
+            source_port: MANAGEMENT_PORT,
             destination_port: MANAGEMENT_PORT,
             message_type: 0,
             code: 1,
@@ -134,7 +134,7 @@ fn fixed_protected_packets_demonstrate_inspection_and_ipatch_traffic() {
         DEVICE,
         CORE,
         MANAGEMENT_PORT,
-        APPLICATION_PORT,
+        MANAGEMENT_PORT,
         &message(2, 69, 0x2001, &[], vec![], b"inspection"),
     );
     assert_eq!(
@@ -143,7 +143,7 @@ fn fixed_protected_packets_demonstrate_inspection_and_ipatch_traffic() {
     );
     assert_eq!(
         management_inspection_response.destination_port(),
-        APPLICATION_PORT
+        MANAGEMENT_PORT
     );
     assert_eq!(management_inspection_response.coap_message().code(), 69);
     assert_eq!(management_inspection_response.coap_payload(), b"inspection");
@@ -151,13 +151,13 @@ fn fixed_protected_packets_demonstrate_inspection_and_ipatch_traffic() {
     let management_update_request = packet(
         CORE,
         DEVICE,
-        APPLICATION_PORT,
+        MANAGEMENT_PORT,
         MANAGEMENT_PORT,
         &message(
             0,
             7,
             0x2002,
-            &[1, 2],
+            &[],
             vec![option(11, b"schc"), option(12, &[42])],
             b"iPATCH",
         ),
@@ -167,12 +167,12 @@ fn fixed_protected_packets_demonstrate_inspection_and_ipatch_traffic() {
         PacketExpectation {
             source: CORE,
             destination: DEVICE,
-            source_port: APPLICATION_PORT,
+            source_port: MANAGEMENT_PORT,
             destination_port: MANAGEMENT_PORT,
             message_type: 0,
             code: 7,
             message_id: 0x2002,
-            token: &[1, 2],
+            token: &[],
             options: &[(11, b"schc"), (12, &[42])],
             payload: b"iPATCH",
         },
@@ -182,13 +182,13 @@ fn fixed_protected_packets_demonstrate_inspection_and_ipatch_traffic() {
         DEVICE,
         CORE,
         MANAGEMENT_PORT,
-        APPLICATION_PORT,
-        &message(2, 68, 0x2002, &[1, 2], vec![], &[]),
+        MANAGEMENT_PORT,
+        &message(2, 68, 0x2002, &[], vec![], &[]),
     );
     assert_eq!(management_update_response.source_port(), MANAGEMENT_PORT);
     assert_eq!(
         management_update_response.destination_port(),
-        APPLICATION_PORT
+        MANAGEMENT_PORT
     );
     assert_eq!(management_update_response.coap_message().code(), 68);
     assert!(management_update_response.coap_payload().is_empty());

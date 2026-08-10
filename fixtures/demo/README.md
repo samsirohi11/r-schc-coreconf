@@ -5,8 +5,11 @@ They are not YANG datastore JSON.
 
 `initial-rules.json` contains these exact rules:
 
-- `16/8`: protected management request using a no-compression full-packet passthrough rule.
-- `17/8`: protected management response using a compression rule whose response code is carried in the residue.
+- `16/8`: protected payload-bearing context FETCH request with a fixed method and URI path.
+- `17/8`: protected response rule for payload-bearing Content/error and payloadless Changed responses, with a fifteen-entry response-code mapping.
+- `26/8`: protected payload-bearing inspection FETCH request with Content-Format 141.
+- `27/8`: protected default iPATCH request with Content-Format 142.
+- `28/8`: protected iPATCH request with an eight-byte If-Match value.
 - `20/8`: ordinary application FETCH request for the current public rustconf root FETCH shape, with an intentionally nonmatching application IID of `::5`.
 - `21/8`: ordinary application FETCH response on UDP port 5683 with CBOR Content-Format option value 142 and a format-142 instance-sequence payload carried as residue.
 - `25/8`: ordinary header-compression fallback that carries the remaining packet bytes.
@@ -16,20 +19,23 @@ The fixed data-client request uses `2001:db8::2` as its application/core source 
 It is handled by rule `25/8` before the update and rule `20/8` after it.
 The optimized rule carries only the request residue, so the demonstration can prove fewer SCHC bits without changing the logical request.
 
-Rule `16/8` uses the pinned `rule2sor` `NoCompression` form as a complete-packet passthrough.
-The packet bytes are carried after the exact protected RuleID, which keeps standard CoAP management options such as If-Match available while preserving exact RuleID authorization.
-The integration does not rely on an empty compression rule being interpreted as a passthrough.
-The ordinary Rule `25/8` fallback is a header-only compression rule with the remaining packet carried as suffix because rule2sor permits only one `NoCompression` entry.
-The integration policy protects exact rule identities `16/8` and `17/8`.
+The protected management rules compress the fixed IPv6, UDP, CoAP, URI, and Content-Format fields.
+They use zero-length CoAP tokens and encode CoAP MID with MSB(9)/LSB, which carries seven MID bits for the bounded range 0..=127.
+The payload field is modeled as `PAYLOAD` and r-schc reconstructs the CoAP `0xff` payload marker rather than sending it as residue.
+The default iPATCH rule and the If-Match iPATCH rule are separate so the optional dynamic option remains exact.
+The integration policy protects the exact rule identities `16/8`, `17/8`, `26/8`, `27/8`, and `28/8`.
+The ordinary Rule `25/8` fallback remains a header-only compression rule with the remaining packet carried as suffix.
 
 The fixed logical addresses are `2001:db8::1` for the device and `2001:db8::2` for the application/core.
 Application traffic uses UDP port 5683.
-Protected management requests use core/application-side UDP port 5683 and device-side UDP port 5684.
-Protected management responses reverse those endpoints.
+Protected management requests and responses use UDP port 8724 at both logical endpoints.
+The outer raw SCHC-link UDP ports remain configurable process arguments.
 The data client uses the public rustconf root FETCH shape to fetch `/demo-data:config/count`.
 The resulting CoAP FETCH request has code 5, one Uri-Path option `c`, one Content-Format option with numeric value `141`, and an identifier-sequence payload selecting `/demo-data:config/count`.
 Management requests use path `schc`.
-The management request code and response code are carried so inspection and iPATCH share the protected rules.
+The protected request rules carry fixed current methods, while the response rule maps 2.01, 2.02, 2.04, 2.05, 4.00, 4.01, 4.02, 4.04, 4.05, 4.08, 4.09, 4.12, 4.13, 4.15, and 5.00 codes using four mapping bits.
+The management request and response MIDs are correlated by endpoint and the bounded seven-bit MID residue.
+The core reuses MIDs modulo 128 only after each synchronous exchange completes; this is a bounded stateless transport window, not a loss-recovery scheme.
 The fixture entries use `BI` direction indicators so each rule is a complete bidirectional field path.
 Exact request, response, management, and application separation comes from fixed field values and the matched RuleID.
 Dispatch uses the exact matched RuleID and does not authorize management by URI or port alone.

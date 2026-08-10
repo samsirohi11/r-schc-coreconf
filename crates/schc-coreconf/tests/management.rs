@@ -8,13 +8,13 @@ use coap_lite::{CoapOption, MessageClass, MessageType, Packet, RequestType, Resp
 use coreconf_model::instance_id::{decode_instances_with_model, PathComponent};
 use coreconf_runtime::coap_types::{ContentFormat, Interface, Method};
 use coreconf_runtime::Datastore;
-use schc_core::{RuleId, SidRegistry};
+use schc_core::SidRegistry;
 use schc_coreconf::{
     context_check_request, context_check_response, decode_rule_detail_payload,
     decode_rule_list_payload, format_rule_detail, format_rule_list, parse_rule_selector,
-    parse_rule_update_command, rule_get_request, rule_list_request, ActiveContext, ContextTag,
-    InspectionError, InspectionService, PreparedContext, ProtectionPolicy, RuleDetail, RuleEntry,
-    CONTEXT_TAG_LEN,
+    parse_rule_update_command, protected_management_rule_ids, rule_get_request, rule_list_request,
+    ActiveContext, ContextTag, InspectionError, InspectionService, PreparedContext,
+    ProtectionPolicy, RuleDetail, RuleEntry, CONTEXT_TAG_LEN,
 };
 use schc_runtime::{DeviceId, DeviceProfile};
 use serde_json::Value;
@@ -28,7 +28,7 @@ fn active() -> Arc<ActiveContext> {
         SOR,
         DeviceId::new("management-test-device").expect("device"),
         DeviceProfile::default(),
-        ProtectionPolicy::from_rule_ids([RuleId::new(16, 8), RuleId::new(17, 8)]),
+        ProtectionPolicy::from_rule_ids(protected_management_rule_ids()),
     )
     .expect("prepared");
     Arc::new(ActiveContext::new(prepared))
@@ -94,7 +94,7 @@ fn tags_are_stable_and_have_lowercase_wire_format() {
         tree,
         DeviceId::new("management-test-device").expect("device"),
         DeviceProfile::default(),
-        ProtectionPolicy::from_rule_ids([RuleId::new(16, 8), RuleId::new(17, 8)]),
+        ProtectionPolicy::from_rule_ids(protected_management_rule_ids()),
     )
     .expect("changed context");
     assert_ne!(a.tag(), changed.tag());
@@ -108,6 +108,7 @@ fn compact_context_check_has_only_marker_and_tag_on_mismatch() {
     let tag = ContextTag::new([1; CONTEXT_TAG_LEN]);
     let request = context_check_request(tag, 9, &[0x44]);
     let request_packet = Packet::from_bytes(&request).expect("request");
+    assert!(request_packet.get_token().is_empty());
     assert_eq!(request_packet.payload.len(), CONTEXT_TAG_LEN + 1);
     let mut response = Packet::new();
     response.header.code = MessageClass::Response(ResponseType::Content);
@@ -133,7 +134,7 @@ fn device_context_check_reports_updated_tag_without_context_payload() {
         tree,
         DeviceId::new("management-test-device").expect("device"),
         DeviceProfile::default(),
-        ProtectionPolicy::from_rule_ids([RuleId::new(16, 8), RuleId::new(17, 8)]),
+        ProtectionPolicy::from_rule_ids(protected_management_rule_ids()),
     )
     .expect("changed context");
     let device = Arc::new(ActiveContext::new(changed));
@@ -147,7 +148,7 @@ fn device_context_check_reports_updated_tag_without_context_payload() {
     let result = context_check_response(&response, core.tag()).expect("check");
     assert!(!result.equal);
     assert_eq!(result.device_tag, device.tag());
-    assert_eq!(response.len(), 4 + 1 + 1 + 1 + CONTEXT_TAG_LEN + 1);
+    assert_eq!(response.len(), 4 + 1 + 1 + CONTEXT_TAG_LEN + 1);
 }
 
 #[test]
@@ -208,6 +209,7 @@ fn inspection_projects_summaries_and_rejects_mutations() {
 fn rule_list_fetch_requests_one_root_identifier_with_format_141() {
     let packet = Packet::from_bytes(&rule_list_request(21, &[0xC1]).expect("rule-list request"))
         .expect("request packet");
+    assert!(packet.get_token().is_empty());
     assert_eq!(
         packet
             .get_option(CoapOption::ContentFormat)
@@ -372,6 +374,7 @@ fn ipatch_datagram_builder_emits_exact_optional_if_match_option() {
         default_packet.header.code,
         MessageClass::Request(RequestType::IPatch)
     );
+    assert!(default_packet.get_token().is_empty());
     assert_eq!(
         default_packet
             .get_option(CoapOption::UriPath)
@@ -401,6 +404,7 @@ fn ipatch_datagram_builder_emits_exact_optional_if_match_option() {
         .iter()
         .collect::<Vec<_>>();
     assert_eq!(if_match, vec![&tag.bytes().to_vec()]);
+    assert!(tagged_packet.get_token().is_empty());
     assert_eq!(
         tagged_packet.payload,
         tagged_update.ipatch_payload().expect("payload")
@@ -945,7 +949,7 @@ fn remote_decoders_display_updated_device_rule_values() {
         tree,
         DeviceId::new("management-device-updated").expect("device"),
         DeviceProfile::default(),
-        ProtectionPolicy::from_rule_ids([RuleId::new(16, 8), RuleId::new(17, 8)]),
+        ProtectionPolicy::from_rule_ids(protected_management_rule_ids()),
     )
     .expect("updated context");
     let device = Arc::new(ActiveContext::new(prepared));

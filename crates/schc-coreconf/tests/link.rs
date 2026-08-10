@@ -12,9 +12,11 @@ use support::TestProcess;
 use coreconf_model::instance_id::{encode_identifiers, InstancePath};
 use schc_core::{RuleId, SidRegistry};
 use schc_coreconf::{
-    temporary_ordinary_response, ActiveContext, GenericDataService, Ipv6UdpCoapPacket, LinkRole,
-    PreparedContext, ProtectionPolicy, RawUdpLink, SchcLink, TrafficClass, TrafficOrigin,
-    TrafficRoute, APPLICATION_PORT, CORE_LOGICAL_ADDRESS, DEVICE_LOGICAL_ADDRESS, MANAGEMENT_PORT,
+    context_check_request, management_bit_breakdown, protected_management_rule_ids,
+    rule_get_request, rule_list_request, temporary_ordinary_response, ActiveContext,
+    GenericDataService, Ipv6UdpCoapPacket, LinkRole, PreparedContext, ProtectionPolicy, RawUdpLink,
+    SchcLink, TrafficClass, TrafficOrigin, TrafficRoute, APPLICATION_PORT, CORE_LOGICAL_ADDRESS,
+    DEVICE_LOGICAL_ADDRESS, MANAGEMENT_PORT,
 };
 use schc_runtime::{DeviceId, DeviceProfile};
 
@@ -34,7 +36,7 @@ fn active(name: &str) -> Arc<ActiveContext> {
             SOR,
             DeviceId::new(name).expect("device ID"),
             DeviceProfile::default(),
-            ProtectionPolicy::from_rule_ids([RuleId::new(16, 8), RuleId::new(17, 8)]),
+            ProtectionPolicy::from_rule_ids(protected_management_rule_ids()),
         )
         .expect("initial context"),
     ))
@@ -427,9 +429,9 @@ fn protected_rules_authorize_management_and_application_origin_cannot_impersonat
     let request = packet(
         CORE_LOGICAL_ADDRESS,
         DEVICE_LOGICAL_ADDRESS,
-        APPLICATION_PORT,
         MANAGEMENT_PORT,
-        &coap(0, 1, 0x2001, &[], Some(b"schc")),
+        MANAGEMENT_PORT,
+        &coap(0, 5, 1, &[], Some(b"schc")),
     );
     let encoded = core
         .encode(TrafficOrigin::Management, &request)
@@ -446,8 +448,8 @@ fn protected_rules_authorize_management_and_application_origin_cannot_impersonat
         DEVICE_LOGICAL_ADDRESS,
         CORE_LOGICAL_ADDRESS,
         MANAGEMENT_PORT,
-        APPLICATION_PORT,
-        &coap(2, 69, 0x2001, &[], None),
+        MANAGEMENT_PORT,
+        &coap(2, 69, 1, &[], None),
     );
     let response_frame = device
         .encode(TrafficOrigin::Management, &response)
@@ -463,6 +465,345 @@ fn protected_rules_authorize_management_and_application_origin_cannot_impersonat
         application.is_err(),
         "application origin must not select a protected management RuleID"
     );
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn current_management_shapes_round_trip_with_complete_bit_accounting() {
+    let core = SchcLink::new(active("core-management-measurement"), LinkRole::Core);
+    let device = SchcLink::new(active("device-management-measurement"), LinkRole::Device);
+
+    let request_packet = |datagram: Vec<u8>| {
+        packet(
+            CORE_LOGICAL_ADDRESS,
+            DEVICE_LOGICAL_ADDRESS,
+            MANAGEMENT_PORT,
+            MANAGEMENT_PORT,
+            &datagram,
+        )
+    };
+    let response_packet = |code: u8, message_id: u16, payload: &[u8]| {
+        packet(
+            DEVICE_LOGICAL_ADDRESS,
+            CORE_LOGICAL_ADDRESS,
+            MANAGEMENT_PORT,
+            MANAGEMENT_PORT,
+            &schc_coreconf::CoapMessage::from_parts(
+                1,
+                2,
+                code,
+                message_id,
+                Vec::new(),
+                Vec::new(),
+                payload.to_vec(),
+            )
+            .expect("management response CoAP")
+            .to_vec(),
+        )
+    };
+    let assert_report = |report: &schc_coreconf::LinkReport,
+                         expected_rule: RuleId,
+                         expected_packet: usize,
+                         expected_bits: usize,
+                         expected_padded: usize| {
+        assert_eq!(report.rule_id, expected_rule);
+        assert_eq!(report.packet_bytes.len(), report.packet_size);
+        assert_eq!(report.packet_size, expected_packet);
+        assert_eq!(report.frame_bytes.len(), report.padded_byte_len);
+        assert_eq!(report.padded_byte_len, expected_padded);
+        assert_eq!(report.schc_bit_len, Some(expected_bits));
+        assert!(report.schc_bit_len.expect("meaningful bits") <= report.padded_byte_len * 8);
+        let breakdown = management_bit_breakdown(report).expect("management bit breakdown");
+        assert_eq!(breakdown.rule_id_bits, 8);
+        assert_eq!(breakdown.mid_residue_bits, 7);
+        assert_eq!(
+            breakdown.transport_residue_bits(),
+            15 + breakdown.method_or_response_mapping_bits
+        );
+        assert_eq!(breakdown.unaccounted_residue_bits, 0);
+        assert_eq!(
+            report.schc_bit_len.expect("meaningful bits"),
+            breakdown.rule_id_bits
+                + breakdown.method_or_response_mapping_bits
+                + breakdown.mid_residue_bits
+                + breakdown.payload_bits
+                + breakdown.payload_length_bits
+                + breakdown.option_residue_bits
+        );
+    };
+
+    let requests = [
+        (
+            "context check",
+            context_check_request(core.active_context().tag(), 1, &[0xaa]),
+            RuleId::new(16, 8),
+            67,
+            91,
+            12,
+        ),
+        (
+            "rule list",
+            rule_list_request(2, &[0xaa]).expect("rule list request"),
+            RuleId::new(26, 8),
+            63,
+            43,
+            6,
+        ),
+        (
+            "rule detail",
+            rule_get_request(
+                schc_coreconf::parse_rule_selector("20/8").expect("selector"),
+                3,
+                &[0xaa],
+            )
+            .expect("rule detail request"),
+            RuleId::new(26, 8),
+            67,
+            75,
+            10,
+        ),
+        (
+            "rule update",
+            schc_coreconf::CoapMessage::from_parts(
+                1,
+                0,
+                7,
+                4,
+                Vec::new(),
+                vec![
+                    schc_coreconf::CoapOption::new(11, b"schc".to_vec()).expect("URI"),
+                    schc_coreconf::CoapOption::new(12, vec![142]).expect("format"),
+                ],
+                vec![0; 22],
+            )
+            .expect("update request CoAP")
+            .to_vec(),
+            RuleId::new(27, 8),
+            82,
+            203,
+            26,
+        ),
+        (
+            "rule update with If-Match",
+            schc_coreconf::CoapMessage::from_parts(
+                1,
+                0,
+                7,
+                5,
+                Vec::new(),
+                vec![
+                    schc_coreconf::CoapOption::new(1, vec![0; 8]).expect("If-Match"),
+                    schc_coreconf::CoapOption::new(11, b"schc".to_vec()).expect("URI"),
+                    schc_coreconf::CoapOption::new(12, vec![142]).expect("format"),
+                ],
+                vec![0; 22],
+            )
+            .expect("tagged update request CoAP")
+            .to_vec(),
+            RuleId::new(28, 8),
+            91,
+            267,
+            34,
+        ),
+    ];
+    for (label, datagram, expected_rule, expected_packet, expected_bits, expected_padded) in
+        requests
+    {
+        let request = request_packet(datagram);
+        assert!(request.coap_message().token().is_empty(), "{label} token");
+        let encoded = core
+            .encode(TrafficOrigin::Management, &request)
+            .unwrap_or_else(|error| panic!("{label} encode failed: {error}"));
+        assert_report(
+            encoded.report(),
+            expected_rule,
+            expected_packet,
+            expected_bits,
+            expected_padded,
+        );
+        let decoded = device
+            .decode(encoded.frame().bytes())
+            .unwrap_or_else(|error| panic!("{label} decode failed: {error}"));
+        assert_eq!(
+            decoded.packet().as_bytes(),
+            request.as_bytes(),
+            "{label} packet"
+        );
+        assert_eq!(
+            decoded.report().frame_bytes,
+            encoded.report().frame_bytes,
+            "{label} frame"
+        );
+        assert_report(
+            decoded.report(),
+            expected_rule,
+            expected_packet,
+            expected_bits,
+            expected_padded,
+        );
+    }
+
+    for (label, response, expected_payload, expected_mapping_bits) in [
+        (
+            "content",
+            response_packet(69, 6, b"content"),
+            7_usize,
+            4_usize,
+        ),
+        ("changed", response_packet(68, 7, b""), 0, 4),
+        ("error", response_packet(128, 8, b"error"), 5, 4),
+    ] {
+        let encoded = device
+            .encode(TrafficOrigin::Management, &response)
+            .unwrap_or_else(|error| panic!("{label} response encode failed: {error}"));
+        let (expected_packet, expected_bits, expected_padded) = match label {
+            "content" => (60, 79, 10),
+            "changed" => (52, 23, 3),
+            "error" => (58, 63, 8),
+            _ => unreachable!("known response shape"),
+        };
+        assert_report(
+            encoded.report(),
+            RuleId::new(17, 8),
+            expected_packet,
+            expected_bits,
+            expected_padded,
+        );
+        let breakdown = management_bit_breakdown(encoded.report()).expect("response breakdown");
+        assert_eq!(
+            breakdown.payload_bits,
+            expected_payload * 8,
+            "{label} payload"
+        );
+        assert_eq!(
+            breakdown.method_or_response_mapping_bits, expected_mapping_bits,
+            "{label} code mapping"
+        );
+        let decoded = core
+            .decode(encoded.frame().bytes())
+            .unwrap_or_else(|error| panic!("{label} response decode failed: {error}"));
+        assert_eq!(
+            decoded.packet().as_bytes(),
+            response.as_bytes(),
+            "{label} packet"
+        );
+        assert_eq!(
+            decoded.report().frame_bytes,
+            encoded.report().frame_bytes,
+            "{label} frame"
+        );
+        assert_report(
+            decoded.report(),
+            RuleId::new(17, 8),
+            expected_packet,
+            expected_bits,
+            expected_padded,
+        );
+    }
+
+    // The response mapping covers every response code currently exposed by
+    // rustconf, including the error codes reachable from the management
+    // service and the precondition failure used by If-Match.
+    for code in [
+        65_u8, 66, 68, 69, 128, 129, 130, 132, 133, 136, 137, 140, 141, 143, 160,
+    ] {
+        let response = response_packet(code, 9, &[]);
+        let encoded = device
+            .encode(TrafficOrigin::Management, &response)
+            .unwrap_or_else(|error| panic!("response code {code} encode failed: {error}"));
+        assert_report(encoded.report(), RuleId::new(17, 8), 52, 23, 3);
+        let decoded = core
+            .decode(encoded.frame().bytes())
+            .unwrap_or_else(|error| panic!("response code {code} decode failed: {error}"));
+        assert_eq!(decoded.packet().as_bytes(), response.as_bytes());
+        assert_eq!(decoded.report().frame_bytes, encoded.report().frame_bytes);
+    }
+}
+
+#[test]
+fn protected_response_identity_rejects_wrong_endpoint_mid_type_and_token() {
+    let device = SchcLink::new(active("device-management-identity"), LinkRole::Device);
+
+    let wrong_endpoint = packet(
+        CORE_LOGICAL_ADDRESS,
+        DEVICE_LOGICAL_ADDRESS,
+        MANAGEMENT_PORT,
+        MANAGEMENT_PORT,
+        &coap(2, 68, 1, &[], None),
+    );
+    assert!(device
+        .encode(TrafficOrigin::Management, &wrong_endpoint)
+        .is_err());
+
+    let wrong_mid = packet(
+        DEVICE_LOGICAL_ADDRESS,
+        CORE_LOGICAL_ADDRESS,
+        MANAGEMENT_PORT,
+        MANAGEMENT_PORT,
+        &coap(2, 68, 128, &[], None),
+    );
+    assert!(device
+        .encode(TrafficOrigin::Management, &wrong_mid)
+        .is_err());
+
+    let wrong_type = packet(
+        DEVICE_LOGICAL_ADDRESS,
+        CORE_LOGICAL_ADDRESS,
+        MANAGEMENT_PORT,
+        MANAGEMENT_PORT,
+        &coap(0, 68, 1, &[], None),
+    );
+    assert!(device
+        .encode(TrafficOrigin::Management, &wrong_type)
+        .is_err());
+
+    let wrong_token = packet(
+        DEVICE_LOGICAL_ADDRESS,
+        CORE_LOGICAL_ADDRESS,
+        MANAGEMENT_PORT,
+        MANAGEMENT_PORT,
+        &coap(2, 68, 1, &[1], None),
+    );
+    assert!(device
+        .encode(TrafficOrigin::Management, &wrong_token)
+        .is_err());
+}
+
+#[test]
+fn management_mid_msb_lsb_round_trips_bounded_out_of_order_and_rejects_128() {
+    let core = SchcLink::new(active("core-management-mid"), LinkRole::Core);
+    let device = SchcLink::new(active("device-management-mid"), LinkRole::Device);
+    let mut frames = Vec::new();
+    for message_id in [127_u16, 1] {
+        let datagram = context_check_request(core.active_context().tag(), message_id, &[0xff]);
+        let request = packet(
+            CORE_LOGICAL_ADDRESS,
+            DEVICE_LOGICAL_ADDRESS,
+            MANAGEMENT_PORT,
+            MANAGEMENT_PORT,
+            &datagram,
+        );
+        let encoded = core
+            .encode(TrafficOrigin::Management, &request)
+            .expect("bounded MID encodes");
+        let decoded = device
+            .decode(encoded.frame().bytes())
+            .expect("bounded MID decodes");
+        assert_eq!(decoded.packet().as_bytes(), request.as_bytes());
+        assert_eq!(decoded.packet().coap_message().message_id(), message_id);
+        frames.push(encoded);
+    }
+    assert_ne!(frames[0].frame().bytes(), frames[1].frame().bytes());
+
+    let datagram = context_check_request(core.active_context().tag(), 128, &[]);
+    let request = packet(
+        CORE_LOGICAL_ADDRESS,
+        DEVICE_LOGICAL_ADDRESS,
+        MANAGEMENT_PORT,
+        MANAGEMENT_PORT,
+        &datagram,
+    );
+    assert!(core.encode(TrafficOrigin::Management, &request).is_err());
 }
 
 #[test]
@@ -530,9 +871,9 @@ fn dispatch_seam_uses_rule_route_not_management_looking_coap_details() {
     let protected_request = packet(
         CORE_LOGICAL_ADDRESS,
         DEVICE_LOGICAL_ADDRESS,
-        APPLICATION_PORT,
         MANAGEMENT_PORT,
-        &coap(0, 1, 0x2402, &[], Some(b"schc")),
+        MANAGEMENT_PORT,
+        &coap(0, 5, 2, &[], Some(b"schc")),
     );
     let protected_frame = core
         .encode(TrafficOrigin::Management, &protected_request)
@@ -574,9 +915,9 @@ fn malformed_frames_are_rejected_and_rule_identity_includes_bit_length() {
     let management_request = packet(
         CORE_LOGICAL_ADDRESS,
         DEVICE_LOGICAL_ADDRESS,
-        APPLICATION_PORT,
         MANAGEMENT_PORT,
-        &coap(0, 1, 4, &[], Some(b"schc")),
+        MANAGEMENT_PORT,
+        &coap(0, 5, 3, &[], Some(b"schc")),
     );
     let management_frame = core
         .encode(TrafficOrigin::Management, &management_request)

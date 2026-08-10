@@ -24,7 +24,8 @@ The repository currently composes source-pinned development dependencies.
 The target release boundary uses versioned `r-schc` and `rustconf` crates, keeps those repositories independently usable, and separates the application server from the SCHC device as a fourth process.
 See [the composition contract](docs/COMPOSITION.md) for dependency ownership, the four-role target, replaceable inputs, synchronization invariants, and the rule lifecycle profile.
 
-The protected management RuleIDs are `16/8` and `17/8`.
+The protected management RuleIDs are `16/8` (payload-bearing context FETCH), `17/8` (responses), `26/8` (payload-bearing inspection FETCH), `27/8` (default iPATCH), and `28/8` (If-Match iPATCH).
+All logical management packets use UDP port `8724` at both endpoints.
 Rule `20/8` is the ordinary optimized FETCH request rule.
 Rule `21/8` is the ordinary response rule.
 Rule `25/8` is the ordinary header-compression fallback used before the Rule 20 update.
@@ -109,6 +110,7 @@ Both processes also accept `help` at any time.
 The device is a background service and prints `WAITING role=device` while it waits for frames.
 
 Traffic reports are concise by default and include the selected RuleID, packet size, SCHC bit count, padded frame size, and compression ratio.
+Protected management reports also expose RuleID, code-mapping, MID, transport overhead, payload, payload-length, dynamic-option, padding, and unaccounted residue bits.
 Pass `--debug` to `schc-coreconf-core` or `schc-coreconf-device` when full `packet_hex` and `frame_hex` fields are needed for wire-level diagnosis.
 The final demonstration script enables this mode automatically for its proof checks.
 
