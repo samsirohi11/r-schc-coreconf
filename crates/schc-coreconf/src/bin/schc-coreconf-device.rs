@@ -4,11 +4,12 @@ mod common;
 
 use std::io::{self, Write};
 
+use coap_lite::Packet;
 use common::{bind_raw_link, print_report, Args, DEVICE_POLL};
 use schc_coreconf::{
-    GenericDataService, InspectionService, Ipv6UdpCoapPacket, LinkError, LinkRole, SchcLink,
-    TrafficOrigin, TrafficRoute, APPLICATION_PORT, CORE_LOGICAL_ADDRESS, DEVICE_LOGICAL_ADDRESS,
-    MANAGEMENT_PORT,
+    is_duplicate_rule_request, GenericDataService, InspectionService, Ipv6UdpCoapPacket, LinkError,
+    LinkRole, SchcLink, TrafficOrigin, TrafficRoute, APPLICATION_PORT, CORE_LOGICAL_ADDRESS,
+    DEVICE_LOGICAL_ADDRESS, MANAGEMENT_PORT,
 };
 
 fn main() {
@@ -73,6 +74,52 @@ fn run() -> Result<(), String> {
                         "management request had unexpected logical address or port orientation"
                             .to_owned(),
                     );
+                }
+                let duplicate = Packet::from_bytes(request.coap_datagram())
+                    .map_err(|error| format!("parse management request: {error}"))?;
+                let is_duplicate = is_duplicate_rule_request(decoded.rule_id(), &duplicate);
+                if is_duplicate {
+                    let before_generation = inspection.status().generation;
+                    match inspection.handle_datagram_no_response(request.coap_datagram()) {
+                        Ok(None) => {
+                            let after_generation = inspection.status().generation;
+                            let result = if after_generation == before_generation + 1 {
+                                "installed"
+                            } else {
+                                "idempotent"
+                            };
+                            println!(
+                                "DEVICE PROTECTED rule={}/{} action=duplicate result={} no_response=yes generation={}",
+                                decoded.rule_id().value(),
+                                decoded.rule_id().bit_len(),
+                                result,
+                                after_generation
+                            );
+                        }
+                        Ok(Some(_)) => {
+                            println!(
+                                "DEVICE PROTECTED rule={}/{} action=duplicate result=error error=unexpected-response no_response=yes",
+                                decoded.rule_id().value(),
+                                decoded.rule_id().bit_len()
+                            );
+                        }
+                        Err(error) => {
+                            println!(
+                                "DEVICE PROTECTED rule={}/{} action=duplicate result=error error={} no_response=yes generation={}",
+                                decoded.rule_id().value(),
+                                decoded.rule_id().bit_len(),
+                                error,
+                                before_generation
+                            );
+                        }
+                    }
+                    io::stdout()
+                        .flush()
+                        .map_err(|error| format!("flush protected report: {error}"))?;
+                    if args.once {
+                        return Ok(());
+                    }
+                    continue;
                 }
                 let response_datagram = inspection
                     .handle_datagram(request.coap_datagram())

@@ -269,6 +269,65 @@ fn real_console_rule_update_synchronizes_contexts_over_protected_link() {
 
 #[test]
 #[allow(clippy::too_many_lines)]
+fn real_console_duplicate_rule_is_atomic_idempotent_and_no_response() {
+    let (mut device, mut core) = start_processes(None, None);
+    core.write_stdin(
+        b"context status\nrule duplicate 20/8 22/8 entry=9 tv=2\nrule duplicate 20/8 22/8 entry=9 tv=2\nrule get core 20/8\nrule get core 22/8\ncontext status\nquit\n",
+    );
+    let core_status = core.wait_timeout(Duration::from_secs(20));
+    assert!(core_status.success(), "core status: {core_status}");
+    let (core_stdout, core_stderr) = core.output();
+    assert_no_stderr("core", &core_stderr);
+    assert!(
+        core_stdout.contains("CORE MGMT TX class=ProtectedManagement rule=29/8"),
+        "core stdout: {core_stdout}"
+    );
+    assert!(
+        core_stdout.contains("local=installed"),
+        "core stdout: {core_stdout}"
+    );
+    assert!(
+        core_stdout.contains("local=idempotent"),
+        "core stdout: {core_stdout}"
+    );
+    assert!(
+        core_stdout.contains("RULE 22/8 nature=compression"),
+        "core stdout: {core_stdout}"
+    );
+    assert!(
+        core_stdout.contains("ENTRY 9 fid=fid-ipv6-appiid"),
+        "core stdout: {core_stdout}"
+    );
+    assert!(
+        core_stdout.contains("tv=0x0000000000000002"),
+        "core stdout: {core_stdout}"
+    );
+    let statuses = core_stdout
+        .lines()
+        .filter(|line| line.starts_with("CONTEXT generation="))
+        .collect::<Vec<_>>();
+    assert_eq!(statuses.len(), 2, "core stdout: {core_stdout}");
+    assert!(statuses[1].contains("generation=2"));
+
+    device.kill();
+    let (device_stdout, device_stderr) = device.output();
+    assert_no_stderr("device", &device_stderr);
+    assert!(
+        device_stdout.contains("DEVICE RX class=ProtectedManagement rule=29/8"),
+        "device stdout: {device_stdout}"
+    );
+    assert!(
+        device_stdout.contains("action=duplicate") && device_stdout.contains("no_response=yes"),
+        "device stdout: {device_stdout}"
+    );
+    assert!(
+        !device_stdout.contains("DEVICE MGMT TX"),
+        "device unexpectedly sent a response: {device_stdout}"
+    );
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
 fn real_console_default_rule_update_uses_dedicated_compressed_rule() {
     let (mut device, mut core) = start_processes(None, None);
     core.write_stdin(b"rule update 20/8 fid=ipv6.app-iid tv=6\nquit\n");

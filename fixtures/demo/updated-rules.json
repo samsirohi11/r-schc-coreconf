@@ -138,6 +138,34 @@
     ]
   },
   {
+    "RuleID": 29,
+    "RuleIDLength": 8,
+    "Compression": [
+      {"FID":"IPV6.VER","FL":4,"FP":1,"DI":"BI","TV":6,"MO":"equal","CDA":"not-sent"},
+      {"FID":"IPV6.TC","FL":8,"FP":1,"DI":"BI","TV":0,"MO":"equal","CDA":"not-sent"},
+      {"FID":"IPV6.FL","FL":20,"FP":1,"DI":"BI","TV":0,"MO":"equal","CDA":"not-sent"},
+      {"FID":"IPV6.LEN","FL":16,"FP":1,"DI":"BI","MO":"ignore","CDA":"compute-length"},
+      {"FID":"IPV6.NXT","FL":8,"FP":1,"DI":"BI","TV":17,"MO":"equal","CDA":"not-sent"},
+      {"FID":"IPV6.HOP_LMT","FL":8,"FP":1,"DI":"BI","TV":64,"MO":"equal","CDA":"not-sent"},
+      {"FID":"IPV6.DEV_PREFIX","FL":64,"FP":1,"DI":"BI","TV":"2001:db8::/64","MO":"equal","CDA":"not-sent"},
+      {"FID":"IPV6.DEV_IID","FL":64,"FP":1,"DI":"BI","TV":"::1","MO":"equal","CDA":"not-sent"},
+      {"FID":"IPV6.APP_PREFIX","FL":64,"FP":1,"DI":"BI","TV":"2001:db8::/64","MO":"equal","CDA":"not-sent"},
+      {"FID":"IPV6.APP_IID","FL":64,"FP":1,"DI":"BI","TV":"::2","MO":"equal","CDA":"not-sent"},
+      {"FID":"UDP.DEV_PORT","FL":16,"FP":1,"DI":"BI","TV":8724,"MO":"equal","CDA":"not-sent"},
+      {"FID":"UDP.APP_PORT","FL":16,"FP":1,"DI":"BI","TV":8724,"MO":"equal","CDA":"not-sent"},
+      {"FID":"UDP.LEN","FL":16,"FP":1,"DI":"BI","MO":"ignore","CDA":"compute-length"},
+      {"FID":"UDP.CKSUM","FL":16,"FP":1,"DI":"BI","MO":"ignore","CDA":"compute-checksum"},
+      {"FID":"COAP.VER","FL":2,"FP":1,"DI":"BI","TV":1,"MO":"equal","CDA":"not-sent"},
+      {"FID":"COAP.TYPE","FL":2,"FP":1,"DI":"DW","TV":1,"MO":"equal","CDA":"not-sent"},
+      {"FID":"COAP.TKL","FL":4,"FP":1,"DI":"BI","TV":0,"MO":"equal","CDA":"not-sent"},
+      {"FID":"COAP.CODE","FL":8,"FP":1,"DI":"DW","TV":2,"MO":"equal","CDA":"not-sent"},
+      {"FID":"COAP.MID","FL":16,"FP":1,"DI":"BI","TV":0,"MO":"MSB","MO.VAL":9,"CDA":"LSB"},
+      {"FID":"COAP.option(11)","FL":32,"FP":1,"DI":"BI","TV":"schc","MO":"equal","CDA":"not-sent"},
+      {"FID":"COAP.option(12)","FL":8,"FP":1,"DI":"BI","TV":142,"MO":"equal","CDA":"not-sent"},
+      {"FID":"PAYLOAD","FL":"var","FP":1,"DI":"BI","MO":"ignore","CDA":"value-sent","TV":""}
+    ]
+  },
+  {
     "RuleID": 20,
     "RuleIDLength": 8,
     "Compression": [

@@ -10,6 +10,7 @@ They are not YANG datastore JSON.
 - `26/8`: protected payload-bearing inspection FETCH request with Content-Format 141.
 - `27/8`: protected default iPATCH request with Content-Format 142.
 - `28/8`: protected iPATCH request with an eight-byte If-Match value.
+- `29/8`: protected fixed NON POST duplicate-rule request with a variable modeled RPC payload.
 - `20/8`: ordinary application FETCH request for the current public rustconf root FETCH shape, with an intentionally nonmatching application IID of `::5`.
 - `21/8`: ordinary application FETCH response on UDP port 5683 with CBOR Content-Format option value 142 and a format-142 instance-sequence payload carried as residue.
 - `25/8`: ordinary header-compression fallback that carries the remaining packet bytes.
@@ -20,10 +21,11 @@ It is handled by rule `25/8` before the update and rule `20/8` after it.
 The optimized rule carries only the request residue, so the demonstration can prove fewer SCHC bits without changing the logical request.
 
 The protected management rules compress the fixed IPv6, UDP, CoAP, URI, and Content-Format fields.
+Rule `29/8` fixes CoAP NON POST and code 0.02, uses the same seven-bit MID residue, and carries only the modeled duplicate-rule payload as the final variable field.
 They use zero-length CoAP tokens and encode CoAP MID with MSB(9)/LSB, which carries seven MID bits for the bounded range 0..=127.
 The payload field is modeled as `PAYLOAD` and r-schc reconstructs the CoAP `0xff` payload marker rather than sending it as residue.
 The default iPATCH rule and the If-Match iPATCH rule are separate so the optional dynamic option remains exact.
-The integration policy protects the exact rule identities `16/8`, `17/8`, `26/8`, `27/8`, and `28/8`.
+The integration policy protects the exact rule identities `16/8`, `17/8`, `26/8`, `27/8`, `28/8`, and `29/8`.
 The ordinary Rule `25/8` fallback remains a header-only compression rule with the remaining packet carried as suffix.
 
 The fixed logical addresses are `2001:db8::1` for the device and `2001:db8::2` for the application/core.

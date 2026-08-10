@@ -15,8 +15,8 @@ const INITIAL_RULES: &str = include_str!("../../../fixtures/demo/initial-rules.j
 const UPDATED_RULES: &str = include_str!("../../../fixtures/demo/updated-rules.json");
 const INITIAL_SOR: &[u8] = include_bytes!("../../../fixtures/demo/initial.sor");
 const UPDATED_SOR: &[u8] = include_bytes!("../../../fixtures/demo/updated.sor");
-const INITIAL_SOR_SHA256: &str = "68d02911464462c59f5f943a1a65345f20dc15b58a7fced4a0d4d1e16410912c";
-const UPDATED_SOR_SHA256: &str = "46c7eecc2701dd63dff9f90da3cdaf4f0a42b37f067da6c05bab2e3b77a6428b";
+const INITIAL_SOR_SHA256: &str = "0d38bc044f31f5ad9ce8817bcc3a536ccfbfc9b4bd0cada4cff3e9652a1be384";
+const UPDATED_SOR_SHA256: &str = "2fa672f9a3acb0ed32d7d84eabf589ace9cc5e4ce148821bc0fe3aac9f4855c0";
 
 fn source(document: &str) -> Value {
     serde_json::from_str(document).expect("OpenSCHC rule source")
@@ -107,15 +107,15 @@ fn checked_in_sors_have_stable_bytes_and_load_through_both_models() {
     let model = CoreconfModel::from_sid_str(SID).expect("rustconf model");
     assert_eq!(model.sid_file.module_name, initial_sid.module_name);
     assert_eq!(model.sid_file.sids, initial_sid.sids);
-    assert_eq!(rule_context(INITIAL_SOR).rules().rules().len(), 8);
-    assert_eq!(rule_context(UPDATED_SOR).rules().rules().len(), 8);
+    assert_eq!(rule_context(INITIAL_SOR).rules().rules().len(), 9);
+    assert_eq!(rule_context(UPDATED_SOR).rules().rules().len(), 9);
 }
 
 #[test]
 fn rule_sources_have_only_the_minimal_inventory_and_expected_natures() {
     let initial = source(INITIAL_RULES);
     let updated = source(UPDATED_RULES);
-    let expected_ids = [16, 17, 26, 27, 28, 20, 21, 25];
+    let expected_ids = [16, 17, 26, 27, 28, 29, 20, 21, 25];
     assert_eq!(
         initial
             .as_array()
@@ -171,7 +171,7 @@ fn rule_sources_have_only_the_minimal_inventory_and_expected_natures() {
     let initial_context = rule_context(INITIAL_SOR);
     let updated_context = rule_context(UPDATED_SOR);
     for context in [&initial_context, &updated_context] {
-        for id in [16, 17, 20, 21, 25, 26, 27, 28] {
+        for id in [16, 17, 20, 21, 25, 26, 27, 28, 29] {
             assert_eq!(
                 context
                     .find_rule(RuleId::new(id, 8))

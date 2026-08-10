@@ -24,7 +24,7 @@ The repository currently composes source-pinned development dependencies.
 The target release boundary uses versioned `r-schc` and `rustconf` crates, keeps those repositories independently usable, and separates the application server from the SCHC device as a fourth process.
 See [the composition contract](docs/COMPOSITION.md) for dependency ownership, the four-role target, replaceable inputs, synchronization invariants, and the rule lifecycle profile.
 
-The protected management RuleIDs are `16/8` (payload-bearing context FETCH), `17/8` (responses), `26/8` (payload-bearing inspection FETCH), `27/8` (default iPATCH), and `28/8` (If-Match iPATCH).
+The protected management RuleIDs are `16/8` (context FETCH), `17/8` (responses), `26/8` (inspection FETCH), `27/8` (default iPATCH), `28/8` (If-Match iPATCH), and `29/8` (NON POST duplicate-rule).
 All logical management packets use UDP port `8724` at both endpoints.
 Rule `20/8` is the ordinary optimized FETCH request rule.
 Rule `21/8` is the ordinary response rule.
@@ -121,6 +121,11 @@ context status
 context check
 rule list core|device
 rule get core|device <value>/<bits>
+rule duplicate <source>/<bits> <destination>/<bits> [entry=<index> tv=<value> mo=<identity> cda=<identity> ...]
+
+Each `entry=<index>` starts one override group, followed by one or more of `tv=<value>`, `mo=<identity>`, and `cda=<identity>`.
+Duplicate target replacements accept unsigned decimal values only when replacing an existing fixed-width binary target, preserving that target's width.
+The `mo=` and `cda=` arguments accept only the currently supported identity names.
 rule update <value>/<bits> entry=<index> tv=<value> [--if-match]
 rule update <value>/<bits> fid=<field> [fp=<position>] [di=<direction>] tv=<value> [--if-match]
 help
@@ -140,6 +145,27 @@ reload
 help
 quit
 ```
+
+## Duplicate-rule measurement
+
+The dedicated duplicate-rule request uses protected M Rule `29/8`.
+For `rule duplicate 20/8 22/8 entry=9 tv=2`, the complete modeled RPC payload is 43 bytes:
+`a1190a78a101a301a2010802140456a189190a0e171608170909000248000000000000000205a201080216`.
+The fixed payload with only source and destination selectors is 19 bytes.
+The one override's inner CORECONF instance map is 22 bytes, comprising 14 bytes of selector/structure and 8 encoded target-value bytes.
+The complete logical IPv6/UDP/CoAP packet is 103 bytes:
+`60000000003f114020010db800000000000000000000000220010db800000000000000000000000122142214003f3c1850020025b473636863118effa1190a78a101a301a2010802140456a189190a0e171608170909000248000000000000000205a201080216`.
+Its meaningful SCHC frame is 371 bits and its padded link frame is 47 bytes:
+`1d4be57423214f142034603440210042808ad431232141c2e2c102e121200049000000000000000040b440210042c0`.
+The breakdown is 8 RuleID bits, 7 MID residue bits, zero method/type/path/content-format residue bits, 12 payload-length bits, 344 payload bits, and 5 padding bits.
+The fixed management transport overhead is therefore 15 bits.
+A successful duplicate management measurement must account for all meaningful residue bits; unaccounted residue is an error.
+
+The application request is 128 meaningful SCHC bits and 16 padded bytes with fallback Rule `25/8`.
+After duplication it is 82 meaningful bits and 11 padded bytes with Rule `22/8`.
+The saving is 46 meaningful bits per packet.
+The management break-even count is `ceil(371 / 46) = 9` application packets.
+The process test verifies identical logical packets, sender/receiver frame bytes in both directions, application delivery, source immutability, idempotent replay, and no duplicate-rule response.
 
 ## Manual process commands
 
@@ -207,8 +233,10 @@ This prototype uses one device, fixed localhost UDP endpoints, and three process
 The application CORECONF server and datastore are still embedded in the SCHC device process.
 It does not implement Linux TUN integration, kernel-routed IPv6, SCHC fragmentation, OSCORE, QUIC, TCP, or remote administration.
 It does not provide automatic RuleID allocation, context epochs, retries, rollback, replay journals, or concurrent multi-device routing.
-The core applies an update locally only after the device acknowledges it.
-A local failure after device success reports possible divergence and requires an operator to run `context check`.
+The core sends duplicate-rule once as a NON POST and does not wait for or require a response.
+It then applies the exact same operation locally and reports `remote=not-acknowledged`.
+A local failure after sending reports possible divergence and requires an operator to run `context check`.
+An identical installed duplicate is idempotent with no new publication; a conflicting destination is rejected without mutation.
 The management rule inventory is intentionally small and uses exact protected RuleID policy rather than generalized M-Rule creation.
 
 ## Troubleshooting

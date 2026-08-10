@@ -333,6 +333,118 @@ fn final_real_process_demo_reuses_logical_request_and_shrinks_raw_frame() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
+fn final_real_process_duplicate_rule_selects_new_rule_without_ack() {
+    let (device_reservation, device_link) = reserve_address();
+    let (core_reservation, core_link) = reserve_address();
+    let (app_reservation, core_app) = reserve_address();
+    let app_sid = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/demo/demo-data.sid");
+    let app_data = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/demo/app-data.json");
+    let device_args = vec![
+        "--debug".to_owned(),
+        "--link-bind".to_owned(),
+        device_link.to_string(),
+        "--link-peer".to_owned(),
+        core_link.to_string(),
+        "--app-sid".to_owned(),
+        app_sid.to_string_lossy().into_owned(),
+        "--app-data".to_owned(),
+        app_data.to_string_lossy().into_owned(),
+    ];
+    let core_args = vec![
+        "--debug".to_owned(),
+        "--link-bind".to_owned(),
+        core_link.to_string(),
+        "--link-peer".to_owned(),
+        device_link.to_string(),
+        "--app-bind".to_owned(),
+        core_app.to_string(),
+    ];
+    drop(device_reservation);
+    let device = TestProcess::spawn(env!("CARGO_BIN_EXE_schc-coreconf-device"), &device_args);
+    device
+        .ready
+        .recv_timeout(Duration::from_secs(5))
+        .expect("device readiness");
+    drop(core_reservation);
+    drop(app_reservation);
+    let mut core = TestProcess::spawn(env!("CARGO_BIN_EXE_schc-coreconf-core"), &core_args);
+    core.ready
+        .recv_timeout(Duration::from_secs(5))
+        .expect("core readiness");
+
+    let before = run_data_fetch(&app_sid, core_app, b"fetch /demo-data:config/count\nquit\n");
+    assert!(
+        before.lines().any(|line| line == "7"),
+        "before output: {before}"
+    );
+    core.write_stdin(b"rule duplicate 20/8 22/8 entry=9 tv=2\n");
+    core.wait_for_stdout("RULE DUPLICATE 20/8 -> 22/8", Duration::from_secs(15));
+    let after = run_data_fetch(&app_sid, core_app, b"fetch /demo-data:config/count\nquit\n");
+    assert!(
+        after.lines().any(|line| line == "7"),
+        "after output: {after}"
+    );
+    core.write_stdin(b"rule duplicate 20/8 22/8 entry=9 tv=2\nrule get device 20/8\nrule get device 22/8\nquit\n");
+    let status = core.wait_timeout(Duration::from_secs(20));
+    assert!(status.success(), "core status: {status}");
+    let (core_stdout, core_stderr) = core.output();
+    assert!(core_stderr.is_empty(), "core stderr: {core_stderr}");
+    assert!(
+        core_stdout.contains("local=installed"),
+        "core output: {core_stdout}"
+    );
+    assert!(
+        core_stdout.contains("local=idempotent"),
+        "core output: {core_stdout}"
+    );
+    assert!(
+        core_stdout.contains("tv=0x0000000000000005"),
+        "source rule output: {core_stdout}"
+    );
+    assert!(
+        core_stdout.contains("tv=0x0000000000000002"),
+        "destination rule output: {core_stdout}"
+    );
+    let (device_stdout, device_stderr) = device.output();
+    assert!(device_stderr.is_empty(), "device stderr: {device_stderr}");
+    assert!(
+        device_stdout.contains("action=duplicate") && device_stdout.contains("no_response=yes"),
+        "device output: {device_stdout}"
+    );
+    assert_eq!(
+        device_stdout.matches("DEVICE MGMT TX").count(),
+        2,
+        "device management query responses: {device_stdout}"
+    );
+    let core_tx = process_reports(&core_stdout, "CORE TX class=Ordinary ");
+    let core_rx = process_reports(&core_stdout, "CORE RX class=Ordinary ");
+    let device_rx = process_reports(&device_stdout, "DEVICE RX class=Ordinary ");
+    let device_tx = process_reports(&device_stdout, "DEVICE TX class=Ordinary ");
+    assert_eq!(core_tx.len(), 2, "core output: {core_stdout}");
+    assert_eq!(core_rx.len(), 2, "core output: {core_stdout}");
+    assert_eq!(device_rx.len(), 2, "device output: {device_stdout}");
+    assert_eq!(device_tx.len(), 2, "device output: {device_stdout}");
+    println!("DUP_APP_BEFORE_BITS={} BYTES={} AFTER_BITS={} BYTES={} PACKET_HEX={} FRAME_BEFORE={} FRAME_AFTER={}", core_tx[0].frame_bits, core_tx[0].frame_bytes, core_tx[1].frame_bits, core_tx[1].frame_bytes, core_tx[0].packet_hex, core_tx[0].frame_hex, core_tx[1].frame_hex);
+    assert_eq!(core_tx[0].rule, "25/8");
+    assert_eq!(core_tx[1].rule, "22/8");
+    assert!(core_tx[1].frame_bits < core_tx[0].frame_bits);
+    assert_eq!(core_tx[0].packet_hex, core_tx[1].packet_hex);
+    assert_eq!(core_tx[0].frame_hex, device_rx[0].frame_hex);
+    assert_eq!(core_tx[1].frame_hex, device_rx[1].frame_hex);
+    assert_eq!(core_tx[0].packet_hex, device_rx[0].packet_hex);
+    assert_eq!(core_tx[1].packet_hex, device_rx[1].packet_hex);
+    assert_eq!(device_tx[0].frame_hex, core_rx[0].frame_hex);
+    assert_eq!(device_tx[1].frame_hex, core_rx[1].frame_hex);
+    assert_eq!(device_tx[0].packet_hex, core_rx[0].packet_hex);
+    assert_eq!(device_tx[1].packet_hex, core_rx[1].packet_hex);
+    assert_eq!(core_rx[0].rule, "21/8");
+    assert_eq!(core_rx[1].rule, "21/8");
+}
+
+#[test]
 fn ordinary_request_and_response_reconstruct_exactly_with_reports() {
     let core = SchcLink::new(active("core-ordinary"), LinkRole::Core);
     let device = SchcLink::new(active("device-ordinary"), LinkRole::Device);

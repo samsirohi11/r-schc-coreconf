@@ -57,7 +57,8 @@ The target boundaries must permit replacement of the application SID, SCHC SID r
 
 Protected management authorization is based on an exact RuleID and RuleID width, not only on a URI, port, or rule value.
 An update is prepared and validated against a detached context before either active context is published.
-The device acknowledgment must identify the expected old and new context tags before the core publishes the prepared context.
+The device acknowledgment must identify the expected old and new context tags before the core publishes the prepared context for synchronous iPATCH updates.
+The duplicate-rule prototype is the deliberate exception: Rule `29/8` carries a CoAP NON POST, the device applies it atomically without sending a response, and the core applies the same deterministic request locally without treating local publication as remote acknowledgment.
 A successful update must leave the core and device with the same canonical context tag.
 
 Ordinary application packet bytes must remain identical when a context update changes only the selected SCHC representation.
@@ -67,5 +68,8 @@ The demonstration must compare sender and receiver packet bytes, selected RuleID
 
 Generic create, update, and delete operations use CORECONF iPATCH against the SCHC rule datastore.
 The SCHC `duplicate-rule` operation is modeled as a POST RPC because it has operation semantics beyond a generic datastore edit.
+The existing SID-modeled `from`, `to`, and binary `ipatch-sequence` input is retained.
+The binary sequence uses deterministic CORECONF instance maps whose paths contain the destination RuleID and stable `entry-index`, without repeating FID, FP, or DI.
 An optional patch applied during duplication addresses list entries by their explicit `entry-index` key rather than by vector position.
+The operation copies only ordinary rules, validates the complete candidate through rustconf and r-schc, publishes once for a new destination, and treats identical replays as no-op success.
 Custom create-rule and delete-rule RPCs are not part of the initial profile because they would duplicate standard datastore mutation semantics.

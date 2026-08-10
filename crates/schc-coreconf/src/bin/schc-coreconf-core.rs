@@ -13,10 +13,10 @@ use common::{bind_raw_link, print_report, Args, OPERATION_TIMEOUT};
 use schc_coreconf::{
     context_check_request, decode_context_check_payload, decode_rule_detail_payload,
     decode_rule_list_payload, exchange_management, exchange_management_update, format_rule_detail,
-    format_rule_list, parse_rule_selector, parse_rule_update_command, rule_get_request,
-    rule_list_request, ActiveContext, ContextStatus, InspectionService, Ipv6UdpCoapPacket,
-    LinkRole, SchcLink, TrafficOrigin, TrafficRoute, APPLICATION_PORT, CORE_LOGICAL_ADDRESS,
-    DEVICE_LOGICAL_ADDRESS,
+    format_rule_list, parse_rule_duplicate_command, parse_rule_selector, parse_rule_update_command,
+    rule_get_request, rule_list_request, ActiveContext, ContextStatus, DuplicateRuleResult,
+    InspectionService, Ipv6UdpCoapPacket, LinkRole, SchcLink, TrafficOrigin, TrafficRoute,
+    APPLICATION_PORT, CORE_LOGICAL_ADDRESS, DEVICE_LOGICAL_ADDRESS,
 };
 
 const CONSOLE_POLL: Duration = Duration::from_millis(50);
@@ -208,6 +208,7 @@ fn print_console_help() {
     println!("  context check");
     println!("  rule list <core|device>");
     println!("  rule get <core|device> <value>/<bits>");
+    println!("  rule duplicate <source>/<bits> <destination>/<bits> [entry=<index> tv=<value> mo=<identity> cda=<identity> ...]");
     println!("  rule update <value>/<bits> entry=<index> tv=<value> [--if-match]");
     println!("  rule update <value>/<bits> fid=<field> [fp=<position>] [di=<direction>] tv=<value> [--if-match]");
     println!("  help");
@@ -257,6 +258,43 @@ fn handle_command(
         print_console_help();
         io::stdout().flush().map_err(|error| error.to_string())?;
         return Ok(CommandResult::Continue);
+    }
+    if command.starts_with("rule duplicate") {
+        return execute_rule_duplicate(
+            command,
+            inspection,
+            active,
+            next_message_id,
+            |datagram| {
+                let request = Ipv6UdpCoapPacket::new(
+                    CORE_LOGICAL_ADDRESS,
+                    DEVICE_LOGICAL_ADDRESS,
+                    schc_coreconf::MANAGEMENT_PORT,
+                    schc_coreconf::MANAGEMENT_PORT,
+                    datagram,
+                )
+                .map_err(|error| error.to_string())?;
+                let encoded = link
+                    .encode(TrafficOrigin::Management, &request)
+                    .map_err(|error| error.to_string())?;
+                if encoded.report().rule_id != schc_core::RuleId::new(29, 8) {
+                    return Err(format!(
+                        "duplicate-rule selected {}/{} instead of 29/8",
+                        encoded.report().rule_id.value(),
+                        encoded.report().rule_id.bit_len()
+                    ));
+                }
+                print_report("CORE MGMT TX", encoded.report(), debug);
+                raw_link
+                    .send_frame(encoded.frame())
+                    .map_err(|error| error.to_string())
+            },
+            |service, datagram| {
+                service
+                    .handle_datagram_no_response(datagram)
+                    .map_err(|error| error.to_string())
+            },
+        );
     }
     if command.starts_with("rule update") {
         return execute_rule_update(
@@ -388,6 +426,63 @@ fn handle_command(
 }
 
 #[allow(clippy::too_many_lines)]
+fn execute_rule_duplicate<SendDevice, ApplyLocal>(
+    command: &str,
+    inspection: &mut InspectionService,
+    active: &std::sync::Arc<schc_coreconf::ActiveContext>,
+    next_message_id: &mut u16,
+    send_device: SendDevice,
+    apply_local: ApplyLocal,
+) -> Result<CommandResult, String>
+where
+    SendDevice: FnOnce(&[u8]) -> Result<(), String>,
+    ApplyLocal: FnOnce(&mut InspectionService, &[u8]) -> Result<Option<Vec<u8>>, String>,
+{
+    let request = parse_rule_duplicate_command(command).map_err(|error| {
+        format!("rule duplicate rejected: {error}; device=not-sent; local=unchanged")
+    })?;
+    let datagram = inspection
+        .duplicate_rule_datagram(&request, next_management_message_id(next_message_id))
+        .map_err(|error| {
+            format!("rule duplicate rejected: {error}; device=not-sent; local=unchanged")
+        })?;
+    send_device(&datagram)
+        .map_err(|error| format!("rule duplicate sent=no; local=unchanged: {error}"))?;
+    let before_generation = active.generation();
+    let response = apply_local(inspection, &datagram).map_err(|error| {
+        format!("rule duplicate sent=yes remote=not-acknowledged local=failed: {error}; possible divergence - run context check")
+    })?;
+    if response.is_some() {
+        return Err("rule duplicate local handler unexpectedly produced a response; possible divergence - run context check".into());
+    }
+    let after_generation = active.generation();
+    let tag = inspection.status().tag;
+    let result = if after_generation == before_generation + 1 {
+        DuplicateRuleResult::Applied {
+            generation: after_generation,
+            tag,
+        }
+    } else {
+        DuplicateRuleResult::Idempotent {
+            generation: after_generation,
+            tag,
+        }
+    };
+    match result {
+        DuplicateRuleResult::Applied { generation, tag } => println!(
+            "RULE DUPLICATE {}/{} -> {}/{} overrides={} sent=yes remote=not-acknowledged local=installed generation={} tag={}",
+            request.source.value, request.source.bits, request.destination.value, request.destination.bits,
+            request.overrides.len(), generation, tag
+        ),
+        DuplicateRuleResult::Idempotent { generation, tag } => println!(
+            "RULE DUPLICATE {}/{} -> {}/{} overrides={} sent=yes remote=not-acknowledged local=idempotent generation={} tag={}",
+            request.source.value, request.source.bits, request.destination.value, request.destination.bits,
+            request.overrides.len(), generation, tag
+        ),
+    }
+    Ok(CommandResult::Successful)
+}
+
 fn execute_rule_update<SendDevice, ApplyLocal>(
     command: &str,
     inspection: &mut InspectionService,

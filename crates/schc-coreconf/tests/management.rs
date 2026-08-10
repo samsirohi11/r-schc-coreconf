@@ -8,19 +8,30 @@ use coap_lite::{CoapOption, MessageClass, MessageType, Packet, RequestType, Resp
 use coreconf_model::instance_id::{decode_instances_with_model, PathComponent};
 use coreconf_runtime::coap_types::{ContentFormat, Interface, Method};
 use coreconf_runtime::Datastore;
-use schc_core::SidRegistry;
+use schc_core::{RuleId, SidRegistry};
 use schc_coreconf::{
     context_check_request, context_check_response, decode_rule_detail_payload,
-    decode_rule_list_payload, format_rule_detail, format_rule_list, parse_rule_selector,
-    parse_rule_update_command, protected_management_rule_ids, rule_get_request, rule_list_request,
-    ActiveContext, ContextTag, InspectionError, InspectionService, PreparedContext,
-    ProtectionPolicy, RuleDetail, RuleEntry, CONTEXT_TAG_LEN,
+    decode_rule_list_payload, format_rule_detail, format_rule_list, is_duplicate_rule_request,
+    parse_rule_selector, parse_rule_update_command, protected_management_rule_ids,
+    rule_get_request, rule_list_request, ActiveContext, ContextTag, InspectionError,
+    InspectionService, Ipv6UdpCoapPacket, LinkRole, PreparedContext, ProtectionPolicy, RuleDetail,
+    RuleEntry, SchcLink, TrafficOrigin, CONTEXT_TAG_LEN, CORE_LOGICAL_ADDRESS,
+    DEVICE_LOGICAL_ADDRESS, MANAGEMENT_PORT,
 };
 use schc_runtime::{DeviceId, DeviceProfile};
 use serde_json::Value;
 
 const SID: &str = include_str!("../../../fixtures/demo/ietf-schc@2026-05-07.sid");
 const SOR: &[u8] = include_bytes!("../../../fixtures/demo/initial.sor");
+
+fn hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        write!(&mut output, "{byte:02x}").expect("String writes cannot fail");
+    }
+    output
+}
 
 fn active() -> Arc<ActiveContext> {
     let prepared = PreparedContext::from_sor_with_policy(
@@ -800,6 +811,308 @@ fn device_ipatch_rejects_both_configured_protected_rule_ids_without_publication(
         assert_eq!(after.tag(), before.tag());
         assert!(Arc::ptr_eq(&after.runtime_arc(), &before_runtime));
     }
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn duplicate_rule_is_modeled_atomic_and_idempotent_without_response() {
+    let active = active();
+    let before = active.snapshot();
+    let source_before = before.tree()["ietf-schc:schc"]["rule"][2].clone();
+    let mut service = InspectionService::new(active.clone()).expect("service");
+    let request =
+        schc_coreconf::parse_rule_duplicate_command("rule duplicate 20/8 22/8 entry=9 tv=2")
+            .expect("duplicate request");
+    let mut base_request = request.clone();
+    base_request.overrides.clear();
+    let base_payload = service
+        .duplicate_rule_payload(&base_request)
+        .expect("base duplicate payload");
+    assert_eq!(base_payload.len(), 19);
+    println!(
+        "DUPLICATE_FIXED_RPC_PAYLOAD_BYTES={} HEX={}",
+        base_payload.len(),
+        hex(&base_payload)
+    );
+    let datagram = service
+        .duplicate_rule_datagram(&request, 37)
+        .expect("duplicate datagram");
+    let packet = Packet::from_bytes(&datagram).expect("duplicate packet");
+    assert_eq!(packet.payload.len(), 43);
+    println!("DUPLICATE_RPC_PAYLOAD_HEX={}", hex(&packet.payload));
+    println!("DUPLICATE_COAP_HEX={}", hex(&datagram));
+    let logical = Ipv6UdpCoapPacket::new(
+        CORE_LOGICAL_ADDRESS,
+        DEVICE_LOGICAL_ADDRESS,
+        MANAGEMENT_PORT,
+        MANAGEMENT_PORT,
+        &datagram,
+    )
+    .expect("logical duplicate packet");
+    println!(
+        "DUPLICATE_LOGICAL_IPV6_UDP_COAP_HEX={}",
+        hex(logical.as_bytes())
+    );
+    let encoded = SchcLink::new(active.clone(), LinkRole::Core)
+        .encode(TrafficOrigin::Management, &logical)
+        .expect("duplicate SCHC frame");
+    let breakdown = schc_coreconf::management_bit_breakdown(encoded.report()).expect("breakdown");
+    println!("DUPLICATE_FRAME_HEX={}", hex(encoded.frame().bytes()));
+    println!(
+        "DUPLICATE_FRAME_BITS={} DUPLICATE_FRAME_BYTES={} DUPLICATE_PACKET_BYTES={}",
+        encoded.frame().bit_len(),
+        encoded.frame().bytes().len(),
+        logical.as_bytes().len()
+    );
+    assert_eq!(logical.as_bytes().len(), 103);
+    assert_eq!(encoded.frame().bit_len(), 371);
+    assert_eq!(encoded.frame().bytes().len(), 47);
+    assert_eq!(breakdown.rule_id_bits, 8);
+    assert_eq!(breakdown.mid_residue_bits, 7);
+    assert_eq!(breakdown.method_or_response_mapping_bits, 0);
+    assert_eq!(breakdown.payload_length_bits, 12);
+    assert_eq!(breakdown.payload_bits, 344);
+    assert_eq!(breakdown.byte_padding_bits, 5);
+    assert_eq!(breakdown.unaccounted_residue_bits, 0);
+    let mut residue_report = encoded.report().clone();
+    residue_report.schc_bit_len = Some(372);
+    assert!(schc_coreconf::management_bit_breakdown(&residue_report).is_err());
+    assert_eq!(breakdown.transport_residue_bits(), 15);
+    println!("DUPLICATE_BREAKDOWN rule_id_bits={} mid_residue_bits={} method_bits={} payload_length_bits={} payload_bits={} padding_bits={}", breakdown.rule_id_bits, breakdown.mid_residue_bits, breakdown.method_or_response_mapping_bits, breakdown.payload_length_bits, breakdown.payload_bits, breakdown.byte_padding_bits);
+    assert_eq!(packet.header.code, MessageClass::Request(RequestType::Post));
+    assert_eq!(packet.header.get_type(), MessageType::NonConfirmable);
+    assert!(packet.get_token().is_empty());
+    assert_eq!(
+        packet
+            .get_option(CoapOption::ContentFormat)
+            .unwrap()
+            .front(),
+        Some(&vec![142])
+    );
+    assert!(service
+        .handle_datagram_no_response(&datagram)
+        .expect("duplicate processing")
+        .is_none());
+    let after = active.snapshot();
+    assert_eq!(after.generation(), before.generation() + 1);
+    assert_eq!(after.tree()["ietf-schc:schc"]["rule"][2], source_before);
+    assert_eq!(
+        service
+            .detail(parse_rule_selector("22/8").expect("destination"))
+            .expect("destination detail")
+            .entries
+            .iter()
+            .find(|entry| entry.entry_index == 9)
+            .unwrap()
+            .target,
+        "0x0000000000000002"
+    );
+    let generation = active.generation();
+    assert!(service
+        .handle_datagram_no_response(&datagram)
+        .expect("replay processing")
+        .is_none());
+    assert_eq!(active.generation(), generation);
+    let multiple = schc_coreconf::parse_rule_duplicate_command(
+        "rule duplicate 20/8 23/8 entry=9 tv=2 mo=equal cda=not-sent",
+    )
+    .unwrap();
+    let multiple_datagram = service.duplicate_rule_datagram(&multiple, 38).unwrap();
+    assert!(service
+        .handle_datagram_no_response(&multiple_datagram)
+        .unwrap()
+        .is_none());
+    assert_eq!(active.generation(), generation + 1);
+}
+
+#[test]
+fn duplicate_rule_rejects_modeled_output_before_publication() {
+    let active = active();
+    let mut service = InspectionService::new(active.clone()).expect("service");
+    let request =
+        schc_coreconf::parse_rule_duplicate_command("rule duplicate 20/8 22/8 entry=9 tv=2")
+            .expect("duplicate request");
+    let datagram = service.duplicate_rule_datagram(&request, 44).unwrap();
+    let mut packet = Packet::from_bytes(&datagram).expect("duplicate packet");
+    let mut payload: CborValue =
+        ciborium::de::from_reader(Cursor::new(&packet.payload)).expect("RPC payload");
+    let CborValue::Map(root) = &mut payload else {
+        panic!("RPC root is not a map");
+    };
+    let (_, operation) = root
+        .iter_mut()
+        .find(|(key, _)| *key == CborValue::Integer(2680.into()))
+        .expect("duplicate-rule root");
+    let CborValue::Map(operation) = operation else {
+        panic!("duplicate-rule operation is not a map");
+    };
+    operation.push((
+        CborValue::Integer(2.into()),
+        CborValue::Map(vec![(
+            CborValue::Integer(1.into()),
+            CborValue::Integer(0.into()),
+        )]),
+    ));
+    packet.payload.clear();
+    ciborium::ser::into_writer(&payload, &mut packet.payload).expect("malformed RPC payload");
+    let malformed = packet.to_bytes().expect("malformed duplicate datagram");
+    let before = active.snapshot();
+    let source_before = before.tree()["ietf-schc:schc"]["rule"][2].clone();
+    assert!(service.handle_datagram_no_response(&malformed).is_err());
+    let after = active.snapshot();
+    assert_eq!(after.tree(), before.tree());
+    assert_eq!(after.generation(), before.generation());
+    assert_eq!(after.tag(), before.tag());
+    assert_eq!(after.tree()["ietf-schc:schc"]["rule"][2], source_before);
+    assert!(service
+        .detail(parse_rule_selector("22/8").expect("destination"))
+        .is_err());
+}
+
+#[test]
+fn duplicate_rule_dispatch_requires_exact_rule_29() {
+    let active = active();
+    let service = InspectionService::new(active).expect("service");
+    let request =
+        schc_coreconf::parse_rule_duplicate_command("rule duplicate 20/8 22/8 entry=9 tv=2")
+            .expect("duplicate request");
+    let datagram = service.duplicate_rule_datagram(&request, 45).unwrap();
+    let packet = Packet::from_bytes(&datagram).expect("duplicate packet");
+    assert!(is_duplicate_rule_request(RuleId::new(29, 8), &packet));
+    assert!(!is_duplicate_rule_request(RuleId::new(28, 8), &packet));
+}
+
+#[test]
+fn duplicate_rule_udp_port_override_preserves_binary_width_and_replays_idempotently() {
+    let active = active();
+    let mut service = InspectionService::new(active.clone()).expect("service");
+    let source = parse_rule_selector("20/8").expect("source");
+    let request =
+        schc_coreconf::parse_rule_duplicate_command("rule duplicate 20/8 23/8 entry=10 tv=5683")
+            .expect("duplicate request");
+    let source_before = service.detail(source).expect("source detail");
+    let datagram = service.duplicate_rule_datagram(&request, 46).unwrap();
+    let packet = Packet::from_bytes(&datagram).expect("duplicate packet");
+    assert!(hex(&packet.payload).contains("421633"));
+    assert!(service
+        .handle_datagram_no_response(&datagram)
+        .expect("install")
+        .is_none());
+    let generation = active.generation();
+    assert_eq!(service.detail(source).expect("source after"), source_before);
+    let destination = service
+        .detail(parse_rule_selector("23/8").expect("destination"))
+        .expect("destination detail");
+    assert_eq!(
+        destination
+            .entries
+            .iter()
+            .find(|entry| entry.entry_index == 10)
+            .expect("UDP device-port entry")
+            .target,
+        "0x1633"
+    );
+    assert!(service
+        .handle_datagram_no_response(&datagram)
+        .expect("idempotent replay")
+        .is_none());
+    assert_eq!(active.generation(), generation);
+}
+
+#[test]
+fn duplicate_rule_parser_supports_multiple_groups_and_rejects_incomplete_forms() {
+    let request = schc_coreconf::parse_rule_duplicate_command(
+        "rule duplicate 20/8 22/8 entry=9 tv=2 mo=equal cda=not-sent entry=10 cda=value-sent",
+    )
+    .expect("duplicate parser");
+    assert_eq!(request.source, parse_rule_selector("20/8").unwrap());
+    assert_eq!(request.destination, parse_rule_selector("22/8").unwrap());
+    assert_eq!(request.overrides.len(), 2);
+    assert_eq!(request.overrides[0].entry_index, 9);
+    assert_eq!(request.overrides[0].target_value.as_deref(), Some("2"));
+    assert_eq!(request.overrides[1].cda.as_deref(), Some("value-sent"));
+    for command in [
+        "rule duplicate 20/8",
+        "rule duplicate 20/8 22/8 tv=2",
+        "rule duplicate 20/8 22/8 entry=9",
+        "rule duplicate 20/8 22/8 entry=9 tv=2 tv=3",
+        "rule duplicate 20/8 22/8 entry=9 unknown=x",
+        "rule duplicate 20/8 22/8 entry=9 tv=2 entry=9 cda=not-sent",
+    ] {
+        assert!(
+            schc_coreconf::parse_rule_duplicate_command(command).is_err(),
+            "{command}"
+        );
+    }
+}
+
+#[test]
+fn duplicate_rule_rejects_conflicts_and_invalid_operations_without_publication() {
+    let active = active();
+    let mut service = InspectionService::new(active.clone()).expect("service");
+    let before = active.snapshot();
+    for command in [
+        "rule duplicate 16/8 22/8 entry=0 tv=2",
+        "rule duplicate 20/8 22/8 entry=999 tv=2",
+        "rule duplicate 20/8 22/8 entry=9 tv=not-a-number",
+        "rule duplicate 20/8 22/8 entry=9 mo=not-an-operator",
+        "rule duplicate 20/8 22/8 entry=9 cda=not-an-action",
+    ] {
+        let request = schc_coreconf::parse_rule_duplicate_command(command).expect("syntax");
+        assert!(
+            service.duplicate_rule_datagram(&request, 40).is_err(),
+            "{command}"
+        );
+        let after = active.snapshot();
+        assert_eq!(after.tree(), before.tree(), "{command}");
+        assert_eq!(after.generation(), before.generation(), "{command}");
+    }
+    let conflict_request =
+        schc_coreconf::parse_rule_duplicate_command("rule duplicate 20/8 21/8 entry=9 tv=2")
+            .unwrap();
+    let conflict_datagram = service
+        .duplicate_rule_datagram(&conflict_request, 40)
+        .unwrap();
+    assert!(service
+        .handle_datagram_no_response(&conflict_datagram)
+        .is_err());
+    assert_eq!(active.generation(), before.generation());
+
+    let valid =
+        schc_coreconf::parse_rule_duplicate_command("rule duplicate 20/8 22/8 entry=9 tv=2")
+            .unwrap();
+    let datagram = service.duplicate_rule_datagram(&valid, 41).unwrap();
+    service.handle_datagram_no_response(&datagram).unwrap();
+    let installed = active.snapshot();
+    let generation = installed.generation();
+    let mut conflict =
+        schc_coreconf::parse_rule_duplicate_command("rule duplicate 20/8 22/8 entry=9 tv=3")
+            .unwrap();
+    conflict.overrides[0].target_value = Some("3".into());
+    let conflict_datagram = service.duplicate_rule_datagram(&conflict, 42).unwrap();
+    assert!(service
+        .handle_datagram_no_response(&conflict_datagram)
+        .is_err());
+    assert_eq!(active.generation(), generation);
+    assert_eq!(active.snapshot().tree(), installed.tree());
+}
+
+#[test]
+fn duplicate_rule_rejects_trailing_inner_value_without_mutation() {
+    let active = active();
+    let mut service = InspectionService::new(active.clone()).expect("service");
+    let request =
+        schc_coreconf::parse_rule_duplicate_command("rule duplicate 20/8 22/8 entry=9 tv=2")
+            .unwrap();
+    let datagram = service.duplicate_rule_datagram(&request, 43).unwrap();
+    let mut packet = Packet::from_bytes(&datagram).unwrap();
+    packet.payload.push(0);
+    let malformed = packet.to_bytes().unwrap();
+    let before = active.snapshot();
+    assert!(service.handle_datagram_no_response(&malformed).is_err());
+    let after = active.snapshot();
+    assert_eq!(after.tree(), before.tree());
+    assert_eq!(after.generation(), before.generation());
 }
 
 #[test]

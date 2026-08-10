@@ -5,13 +5,16 @@
 //! Context checks use a compact marker and eight-byte tag because the fixed
 //! management rules do not describe an `ETag` option.
 
+use std::collections::BTreeSet;
 use std::fmt;
+use std::io::Cursor;
 use std::sync::Arc;
 
 use ciborium::value::Value as CborValue;
 use coap_lite::{CoapOption, MessageClass, MessageType, Packet, RequestType, ResponseType};
 use coreconf_model::instance_id::{
-    decode_instances_with_model, encode_identifiers, Instance, InstancePath, PathComponent,
+    decode_instances_with_model, decode_instances_with_model_to_identifier_at_path,
+    encode_identifiers, Instance, InstancePath, PathComponent,
 };
 use coreconf_model::{CompositeModel, CoreconfModel};
 use coreconf_runtime::coap_types::{ContentFormat, Interface, Method, Request};
@@ -46,6 +49,17 @@ const FIELD_LENGTH_SID: i64 = 2625;
 const TARGET_VALUE_LIST_SID: i64 = 2629;
 const TARGET_VALUE_INDEX_SID: i64 = 2630;
 const TARGET_VALUE_VALUE_SID: i64 = 2631;
+const MATCHING_OPERATOR_SID: i64 = 2632;
+const CDA_SID: i64 = 2636;
+const DUPLICATE_RULE_SID: i64 = 2680;
+const DUPLICATE_INPUT_SID: i64 = 2681;
+const DUPLICATE_FROM_SID: i64 = 2682;
+const DUPLICATE_FROM_LENGTH_SID: i64 = 2683;
+const DUPLICATE_FROM_VALUE_SID: i64 = 2684;
+const DUPLICATE_IPATCH_SID: i64 = 2685;
+const DUPLICATE_TO_SID: i64 = 2686;
+const DUPLICATE_TO_LENGTH_SID: i64 = 2687;
+const DUPLICATE_TO_VALUE_SID: i64 = 2688;
 
 /// Errors returned by context inspection and its protected exchange.
 #[derive(Debug, Error)]
@@ -330,6 +344,176 @@ pub fn parse_rule_update_command(input: &str) -> Result<RuleUpdateRequest, Inspe
 
 fn invalid_update(message: impl Into<String>) -> InspectionError {
     InspectionError::InvalidUpdate(message.into())
+}
+
+/// One entry-index-based override in a duplicate-rule request.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct RuleDuplicateOverride {
+    /// Stable zero-based source entry index.
+    pub entry_index: usize,
+    /// Optional decimal target value replacement.
+    pub target_value: Option<String>,
+    /// Optional matching-operator identity.
+    pub matching_operator: Option<String>,
+    /// Optional compression/decompression action identity.
+    pub cda: Option<String>,
+}
+
+/// A parsed atomic duplicate-rule request.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct RuleDuplicateRequest {
+    /// Existing ordinary source rule.
+    pub source: RuleSelector,
+    /// New destination rule.
+    pub destination: RuleSelector,
+    /// Zero or more entry-index overrides.
+    pub overrides: Vec<RuleDuplicateOverride>,
+}
+
+/// Result of processing a duplicate-rule operation.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum DuplicateRuleResult {
+    /// A new destination was validated and published.
+    Applied {
+        /// New active-context generation.
+        generation: u64,
+        /// New active-context tag.
+        tag: ContextTag,
+    },
+    /// The requested deterministic destination was already installed.
+    Idempotent {
+        /// Existing active-context generation.
+        generation: u64,
+        /// Existing active-context tag.
+        tag: ContextTag,
+    },
+}
+
+/// Parses the compact duplicate-rule console syntax.
+///
+/// The syntax is `rule duplicate <source>/<bits> <destination>/<bits>` followed
+/// by zero or more groups of `entry=INDEX`, `tv=VALUE`, `mo=ID`, and `cda=ID`.
+/// Each `entry=INDEX` starts one group, each group must contain at least one
+/// leaf, and each leaf occurs at most once per group.
+/// Target replacements accept unsigned decimal values only when replacing an
+/// existing fixed-width binary target.
+/// `mo=` and `cda=` accept only the currently supported identity names.
+///
+/// # Errors
+///
+/// Returns an error for malformed selectors, incomplete groups, duplicate
+/// leaves, or unsupported arguments.
+#[allow(clippy::similar_names, clippy::too_many_lines)]
+pub fn parse_rule_duplicate_command(input: &str) -> Result<RuleDuplicateRequest, InspectionError> {
+    let mut words = input.split_whitespace();
+    if words.next() != Some("rule") || words.next() != Some("duplicate") {
+        return Err(InspectionError::InvalidUpdate(
+            "expected 'rule duplicate <source>/<bits> <destination>/<bits> ...'".into(),
+        ));
+    }
+    let source = words
+        .next()
+        .ok_or_else(|| invalid_update("missing duplicate source RuleID"))
+        .and_then(parse_rule_selector)
+        .map_err(|error| invalid_update(format!("invalid source RuleID: {error}")))?;
+    let destination = words
+        .next()
+        .ok_or_else(|| invalid_update("missing duplicate destination RuleID"))
+        .and_then(parse_rule_selector)
+        .map_err(|error| invalid_update(format!("invalid destination RuleID: {error}")))?;
+
+    let mut overrides = Vec::new();
+    let mut current: Option<RuleDuplicateOverride> = None;
+    for argument in words {
+        let (kind, value) = argument.split_once('=').ok_or_else(|| {
+            invalid_update(format!(
+                "malformed duplicate argument '{argument}'; expected key=value"
+            ))
+        })?;
+        if value.is_empty() {
+            return Err(invalid_update(format!(
+                "duplicate argument '{kind}' has an empty value"
+            )));
+        }
+        match kind {
+            "entry" => {
+                if let Some(previous) = current.take() {
+                    if previous.target_value.is_none()
+                        && previous.matching_operator.is_none()
+                        && previous.cda.is_none()
+                    {
+                        return Err(invalid_update(format!(
+                            "entry {} has no override leaves",
+                            previous.entry_index
+                        )));
+                    }
+                    overrides.push(previous);
+                }
+                let entry_index = parse_unsigned_argument(value, "entry")?;
+                if overrides
+                    .iter()
+                    .any(|candidate| candidate.entry_index == entry_index)
+                {
+                    return Err(invalid_update(format!(
+                        "duplicate override entry={entry_index}"
+                    )));
+                }
+                current = Some(RuleDuplicateOverride {
+                    entry_index,
+                    target_value: None,
+                    matching_operator: None,
+                    cda: None,
+                });
+            }
+            "tv" | "mo" | "cda" => {
+                let current_override = current.as_mut().ok_or_else(|| {
+                    invalid_update(format!("'{kind}' must follow an entry=INDEX"))
+                })?;
+                match kind {
+                    "tv" if current_override
+                        .target_value
+                        .replace(value.to_owned())
+                        .is_some() =>
+                    {
+                        return Err(invalid_update("duplicate tv in one override"));
+                    }
+                    "mo" if current_override
+                        .matching_operator
+                        .replace(value.to_owned())
+                        .is_some() =>
+                    {
+                        return Err(invalid_update("duplicate mo in one override"));
+                    }
+                    "cda" if current_override.cda.replace(value.to_owned()).is_some() => {
+                        return Err(invalid_update("duplicate cda in one override"));
+                    }
+                    _ => {}
+                }
+            }
+            _ => {
+                return Err(invalid_update(format!(
+                    "unknown duplicate argument '{kind}'"
+                )))
+            }
+        }
+    }
+    if let Some(previous) = current {
+        if previous.target_value.is_none()
+            && previous.matching_operator.is_none()
+            && previous.cda.is_none()
+        {
+            return Err(invalid_update(format!(
+                "entry {} has no override leaves",
+                previous.entry_index
+            )));
+        }
+        overrides.push(previous);
+    }
+    Ok(RuleDuplicateRequest {
+        source,
+        destination,
+        overrides,
+    })
 }
 
 fn parse_unsigned_argument(value: &str, key: &str) -> Result<usize, InspectionError> {
@@ -988,9 +1172,9 @@ pub fn management_bit_breakdown(
         + payload_bits
         + payload_length_bits
         + option_residue_bits;
-    if meaningful_bits < accounted_bits {
+    if meaningful_bits != accounted_bits {
         return Err(InspectionError::UnexpectedResponse(format!(
-            "management report has {meaningful_bits} meaningful bits but accounting needs {accounted_bits}"
+            "management report has {meaningful_bits} meaningful bits but accounted fields total {accounted_bits}"
         )));
     }
     let byte_padding_bits = report
@@ -1176,6 +1360,132 @@ impl InspectionService {
         request.resolve_entry_index(&detail)
     }
 
+    /// Builds one deterministic modeled duplicate-rule RPC payload.
+    ///
+    /// The outer value is the existing SID-modeled RPC input. Its binary
+    /// `ipatch-sequence` contains one CORECONF instance map per override,
+    /// using the stable entry-index key and SID paths for the changed leaves.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the source or overrides are invalid, or the
+    /// accepted CORECONF model rejects the encoding.
+    pub fn duplicate_rule_payload(
+        &self,
+        request: &RuleDuplicateRequest,
+    ) -> Result<Vec<u8>, InspectionError> {
+        let snapshot = self.active.snapshot();
+        let inner = duplicate_inner_payload(self.model.composite_model(), &snapshot, request)?;
+        encode_duplicate_rpc_payload(&self.model, request, &inner)
+    }
+
+    /// Builds a complete NON POST duplicate-rule management datagram.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when payload construction or CoAP serialization fails.
+    pub fn duplicate_rule_datagram(
+        &self,
+        request: &RuleDuplicateRequest,
+        message_id: u16,
+    ) -> Result<Vec<u8>, InspectionError> {
+        let payload = self.duplicate_rule_payload(request)?;
+        let mut packet = base_request(RequestType::Post, message_id, &[]);
+        packet.header.set_type(MessageType::NonConfirmable);
+        packet.add_option(CoapOption::ContentFormat, vec![142]);
+        packet.payload = payload;
+        packet
+            .to_bytes()
+            .map_err(|error| InspectionError::Coap(error.to_string()))
+    }
+
+    /// Handles a duplicate-rule NON POST without creating a response.
+    ///
+    /// Other management requests are returned to the existing response path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the request or atomic candidate is invalid.
+    pub fn handle_datagram_no_response(
+        &mut self,
+        datagram: &[u8],
+    ) -> Result<Option<Vec<u8>>, InspectionError> {
+        let packet = Packet::from_bytes(datagram)
+            .map_err(|error| InspectionError::Coap(error.to_string()))?;
+        if is_duplicate_rule_coap_shape(&packet) {
+            let operation = decode_duplicate_operation(&self.model, &packet.payload)?;
+            self.apply_duplicate_operation(&operation)?;
+            return Ok(None);
+        }
+        Ok(Some(self.handle_datagram(datagram)?))
+    }
+
+    fn apply_duplicate_operation(
+        &self,
+        operation: &DecodedDuplicateOperation,
+    ) -> Result<DuplicateRuleResult, InspectionError> {
+        let _writer = self
+            .active
+            .writer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let snapshot = self.active.snapshot();
+        let expected = expected_duplicate_tree(
+            &self.model,
+            &snapshot,
+            &operation.request,
+            &operation.instances,
+        )?;
+        let destination = operation.request.destination.rule_id();
+        let existing = snapshot
+            .rules()
+            .iter()
+            .find(|rule| rule.id() == destination)
+            .cloned();
+        let expected_rule = find_tree_rule(
+            &expected,
+            self.model.composite_model(),
+            operation.request.destination,
+        )?
+        .ok_or_else(|| invalid_duplicate("constructed destination rule is missing"))?;
+        let recipe = self.active.recipe();
+        let prepared = PreparedContext::from_tree(
+            recipe.sid_json.as_ref(),
+            expected,
+            recipe.device_id.clone(),
+            recipe.profile.clone(),
+            recipe.policy.clone(),
+        )
+        .map_err(|error| InspectionError::InvalidUpdate(error.to_string()))?;
+        self.active
+            .validate_candidate(&snapshot, &prepared)
+            .map_err(|error| InspectionError::InvalidUpdate(error.to_string()))?;
+        if existing.is_some() {
+            let existing_tree_rule = find_tree_rule(
+                snapshot.tree(),
+                self.model.composite_model(),
+                operation.request.destination,
+            )?
+            .ok_or_else(|| invalid_duplicate("existing destination rule is missing"))?;
+            if existing_tree_rule != expected_rule {
+                return Err(InspectionError::InvalidUpdate(format!(
+                    "duplicate destination {} already exists with different contents",
+                    operation.request.destination
+                )));
+            }
+            return Ok(DuplicateRuleResult::Idempotent {
+                generation: snapshot.generation(),
+                tag: snapshot.tag(),
+            });
+        }
+        self.active.publish_locked(&prepared);
+        let after = self.active.snapshot();
+        Ok(DuplicateRuleResult::Applied {
+            generation: after.generation(),
+            tag: after.tag(),
+        })
+    }
+
     /// Handles one complete logical CoAP datagram.
     ///
     /// GET and FETCH are delegated to rustconf. The supported root iPATCH is
@@ -1188,6 +1498,13 @@ impl InspectionService {
     /// Returns an error when the CoAP datagram is malformed or the response
     /// cannot be serialized.
     pub fn handle_datagram(&mut self, datagram: &[u8]) -> Result<Vec<u8>, InspectionError> {
+        let peek = Packet::from_bytes(datagram)
+            .map_err(|error| InspectionError::Coap(error.to_string()))?;
+        if is_duplicate_rule_coap_shape(&peek) {
+            return Err(InspectionError::UnexpectedResponse(
+                "duplicate-rule NON POST must use handle_datagram_no_response".into(),
+            ));
+        }
         let request = Packet::from_bytes(datagram)
             .map_err(|error| InspectionError::Coap(error.to_string()))?;
         if matches!(
@@ -1450,6 +1767,810 @@ impl InspectionService {
             coreconf_runtime::coap_types::ContentFormat::YangDataCborSid,
         );
         packet_without_content_format(request, response)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
+enum DuplicateLeaf {
+    Target,
+    MatchingOperator,
+    Cda,
+}
+
+#[derive(Debug)]
+struct DecodedDuplicateOperation {
+    request: RuleDuplicateRequest,
+    instances: Vec<Instance>,
+}
+
+fn invalid_duplicate(message: impl Into<String>) -> InspectionError {
+    InspectionError::InvalidUpdate(format!("duplicate-rule: {}", message.into()))
+}
+
+/// Returns whether a decoded packet is the dedicated duplicate-rule request.
+///
+/// The exact protected `RuleID` is part of classification so a packet with a
+/// duplicate-like CoAP shape under another protected `RuleID` cannot dispatch to
+/// the duplicate operation.
+#[must_use]
+pub fn is_duplicate_rule_request(rule_id: RuleId, packet: &Packet) -> bool {
+    rule_id == RuleId::new(29, 8) && is_duplicate_rule_coap_shape(packet)
+}
+
+fn is_duplicate_rule_coap_shape(packet: &Packet) -> bool {
+    packet.header.code == MessageClass::Request(RequestType::Post)
+        && packet.header.get_type() == MessageType::NonConfirmable
+        && packet.get_token().is_empty()
+        && packet.get_option(CoapOption::UriPath).is_some_and(|paths| {
+            paths.len() == 1 && paths.front().is_some_and(|path| path.as_slice() == b"schc")
+        })
+        && packet
+            .get_option(CoapOption::ContentFormat)
+            .is_some_and(|formats| {
+                formats.len() == 1
+                    && formats
+                        .front()
+                        .is_some_and(|format| format.as_slice() == [142])
+            })
+}
+
+fn validate_duplicate_model_shape(model: &CompositeModel) -> Result<(), InspectionError> {
+    for sid in [
+        DUPLICATE_RULE_SID,
+        DUPLICATE_INPUT_SID,
+        DUPLICATE_FROM_SID,
+        DUPLICATE_FROM_LENGTH_SID,
+        DUPLICATE_FROM_VALUE_SID,
+        DUPLICATE_IPATCH_SID,
+        DUPLICATE_TO_SID,
+        DUPLICATE_TO_LENGTH_SID,
+        DUPLICATE_TO_VALUE_SID,
+        MATCHING_OPERATOR_SID,
+        CDA_SID,
+    ] {
+        if model.get_identifier(sid).is_none() {
+            return Err(invalid_duplicate(format!(
+                "SID model is missing identifier {sid}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn rule_key(model: &CompositeModel, sid: i64) -> Result<String, InspectionError> {
+    model
+        .get_identifier(sid)
+        .and_then(|identifier| identifier.rsplit('/').next())
+        .filter(|key| !key.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| invalid_duplicate(format!("SID model is missing rule key {sid}")))
+}
+
+fn find_tree_rule(
+    tree: &Value,
+    model: &CompositeModel,
+    selector: RuleSelector,
+) -> Result<Option<Value>, InspectionError> {
+    let root_key = rule_key(model, SCHC_ROOT_SID)?;
+    let list_key = rule_key(model, RULE_LIST_SID)?;
+    let value_key = rule_key(model, RULE_ID_VALUE_SID)?;
+    let length_key = rule_key(model, RULE_ID_LENGTH_SID)?;
+    Ok(tree
+        .get(&root_key)
+        .and_then(Value::as_object)
+        .and_then(|root| root.get(&list_key))
+        .and_then(Value::as_array)
+        .and_then(|rules| {
+            rules.iter().find(|rule| {
+                rule.get(&value_key).and_then(Value::as_u64) == Some(selector.value)
+                    && rule.get(&length_key).and_then(Value::as_u64) == Some(selector.bits as u64)
+            })
+        })
+        .cloned())
+}
+
+fn set_tree_rule_key(
+    rule: &mut Value,
+    model: &CompositeModel,
+    sid: i64,
+    value: Value,
+) -> Result<(), InspectionError> {
+    let key = rule_key(model, sid)?;
+    let object = rule
+        .as_object_mut()
+        .ok_or_else(|| invalid_duplicate("source rule is not an object"))?;
+    object.insert(key, value);
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
+fn expected_duplicate_tree(
+    model: &CoreconfModel,
+    snapshot: &ContextSnapshot,
+    request: &RuleDuplicateRequest,
+    instances: &[Instance],
+) -> Result<Value, InspectionError> {
+    validate_duplicate_model_shape(model.composite_model())?;
+    let source_rule = find_tree_rule(snapshot.tree(), model.composite_model(), request.source)?
+        .ok_or(InspectionError::MissingRule {
+            value: request.source.value,
+            bits: request.source.bits,
+        })?;
+    let source_typed = snapshot
+        .rules()
+        .iter()
+        .find(|rule| rule.id() == request.source.rule_id())
+        .ok_or_else(|| invalid_duplicate("source rule is absent from the typed snapshot"))?;
+    if source_typed.nature() == RuleNature::Management
+        || snapshot
+            .protected_rules()
+            .contains(request.source.rule_id())
+    {
+        return Err(invalid_duplicate(
+            "source RuleID is protected or management",
+        ));
+    }
+    if snapshot
+        .protected_rules()
+        .contains(request.destination.rule_id())
+    {
+        return Err(invalid_duplicate("destination RuleID is protected"));
+    }
+    if request.source == request.destination {
+        return Err(invalid_duplicate(
+            "source and destination RuleIDs must differ",
+        ));
+    }
+
+    let root_key = rule_key(model.composite_model(), SCHC_ROOT_SID)?;
+    let list_key = rule_key(model.composite_model(), RULE_LIST_SID)?;
+    let value_key = rule_key(model.composite_model(), RULE_ID_VALUE_SID)?;
+    let length_key = rule_key(model.composite_model(), RULE_ID_LENGTH_SID)?;
+    let mut destination_rule = source_rule;
+    set_tree_rule_key(
+        &mut destination_rule,
+        model.composite_model(),
+        RULE_ID_VALUE_SID,
+        json!(request.destination.value),
+    )?;
+    set_tree_rule_key(
+        &mut destination_rule,
+        model.composite_model(),
+        RULE_ID_LENGTH_SID,
+        json!(request.destination.bits),
+    )?;
+
+    let mut candidate = snapshot.tree().clone();
+    let rules = candidate
+        .get_mut(&root_key)
+        .and_then(Value::as_object_mut)
+        .and_then(|root| root.get_mut(&list_key))
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| invalid_duplicate("active tree is missing the rule list"))?;
+    rules.retain(|rule| {
+        !(rule.get(&value_key).and_then(Value::as_u64) == Some(request.destination.value)
+            && rule.get(&length_key).and_then(Value::as_u64)
+                == Some(request.destination.bits as u64))
+    });
+    rules.push(destination_rule);
+    rules.sort_by(|left, right| {
+        left.get(&length_key)
+            .and_then(Value::as_u64)
+            .unwrap_or_default()
+            .cmp(
+                &right
+                    .get(&length_key)
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default(),
+            )
+            .then_with(|| {
+                left.get(&value_key)
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default()
+                    .cmp(
+                        &right
+                            .get(&value_key)
+                            .and_then(Value::as_u64)
+                            .unwrap_or_default(),
+                    )
+            })
+    });
+
+    let mut datastore = Datastore::with_data(model.clone(), candidate)
+        .map_err(|error| invalid_duplicate(format!("candidate tree is invalid: {error}")))?;
+    let mut seen = BTreeSet::new();
+    for instance in instances {
+        let (entry_index, leaf) = duplicate_leaf_from_path(&instance.path, request.destination)?;
+        let key = (entry_index, leaf);
+        if !seen.insert(key) {
+            return Err(invalid_duplicate(format!(
+                "duplicate override for entry {entry_index} leaf {leaf:?}"
+            )));
+        }
+        let value = instance
+            .value
+            .clone()
+            .ok_or_else(|| invalid_duplicate("override values cannot delete leaves"))?;
+        let sid = instance
+            .path
+            .absolute_sid()
+            .ok_or_else(|| invalid_duplicate("override path has no leaf SID"))?;
+        let keys = instance
+            .path
+            .components
+            .iter()
+            .filter_map(|component| match component {
+                PathComponent::KeyValue(value) => Some(value.clone()),
+                PathComponent::SidDelta(_) => None,
+            })
+            .collect::<Vec<_>>();
+        let xpath = datastore
+            .create_xpath(sid, &keys)
+            .map_err(|error| invalid_duplicate(error.to_string()))?;
+        datastore
+            .set_path(&xpath, value)
+            .map_err(|error| invalid_duplicate(error.to_string()))?;
+    }
+    Ok(datastore.get_all())
+}
+
+fn duplicate_leaf_from_path(
+    path: &InstancePath,
+    destination: RuleSelector,
+) -> Result<(usize, DuplicateLeaf), InspectionError> {
+    let mut absolute = 0_i64;
+    let mut sids = Vec::new();
+    let mut keys = Vec::new();
+    for component in &path.components {
+        match component {
+            PathComponent::SidDelta(delta) => {
+                absolute += delta;
+                sids.push(absolute);
+            }
+            PathComponent::KeyValue(value) => keys.push(value.clone()),
+        }
+    }
+    let Some(value) = keys.first().and_then(Value::as_u64) else {
+        return Err(invalid_duplicate(
+            "override path is missing destination value",
+        ));
+    };
+    let Some(bits) = keys.get(1).and_then(Value::as_u64) else {
+        return Err(invalid_duplicate(
+            "override path is missing destination length",
+        ));
+    };
+    if value != destination.value || bits != destination.bits as u64 {
+        return Err(invalid_duplicate(
+            "override path destination does not match RPC destination",
+        ));
+    }
+    let Some(entry) = keys.get(2).and_then(Value::as_u64) else {
+        return Err(invalid_duplicate("override path is missing entry-index"));
+    };
+    let entry =
+        usize::try_from(entry).map_err(|_| invalid_duplicate("entry-index is too large"))?;
+    let leaf = match sids.as_slice() {
+        [2574, 2597, 2620, 2632] => DuplicateLeaf::MatchingOperator,
+        [2574, 2597, 2620, 2636] => DuplicateLeaf::Cda,
+        [2574, 2597, 2620, 2629, 2631] if keys.len() == 4 => DuplicateLeaf::Target,
+        _ => {
+            return Err(invalid_duplicate(
+                "override path names an unsupported field",
+            ))
+        }
+    };
+    if matches!(leaf, DuplicateLeaf::Target) && keys.get(3).and_then(Value::as_u64) != Some(0) {
+        return Err(invalid_duplicate("target-value index must be zero"));
+    }
+    Ok((entry, leaf))
+}
+
+fn duplicate_override_path(
+    destination: RuleSelector,
+    entry_index: usize,
+    leaf: DuplicateLeaf,
+) -> Result<InstancePath, InspectionError> {
+    let mut path = InstancePath::new();
+    let mut previous = 0;
+    for sid in [SCHC_ROOT_SID, RULE_LIST_SID] {
+        push_sid(&mut path, &mut previous, sid)?;
+    }
+    path.push_key(json!(destination.value));
+    path.push_key(json!(destination.bits));
+    push_sid(&mut path, &mut previous, RULE_ENTRY_LIST_SID)?;
+    path.push_key(json!(entry_index));
+    match leaf {
+        DuplicateLeaf::Target => {
+            push_sid(&mut path, &mut previous, TARGET_VALUE_LIST_SID)?;
+            path.push_key(json!(0));
+            push_sid(&mut path, &mut previous, TARGET_VALUE_VALUE_SID)?;
+        }
+        DuplicateLeaf::MatchingOperator => {
+            push_sid(&mut path, &mut previous, MATCHING_OPERATOR_SID)?;
+        }
+        DuplicateLeaf::Cda => {
+            push_sid(&mut path, &mut previous, CDA_SID)?;
+        }
+    }
+    Ok(path)
+}
+
+#[allow(clippy::too_many_lines)]
+fn duplicate_inner_payload(
+    model: &CompositeModel,
+    snapshot: &ContextSnapshot,
+    request: &RuleDuplicateRequest,
+) -> Result<Vec<u8>, InspectionError> {
+    find_tree_rule(snapshot.tree(), model, request.source)?.ok_or(
+        InspectionError::MissingRule {
+            value: request.source.value,
+            bits: request.source.bits,
+        },
+    )?;
+    let source_rule = snapshot
+        .rules()
+        .iter()
+        .find(|rule| rule.id() == request.source.rule_id())
+        .ok_or_else(|| invalid_duplicate("source rule is absent"))?;
+    if source_rule.nature() == RuleNature::Management
+        || snapshot
+            .protected_rules()
+            .contains(request.source.rule_id())
+    {
+        return Err(invalid_duplicate(
+            "source RuleID is protected or management",
+        ));
+    }
+    if snapshot
+        .protected_rules()
+        .contains(request.destination.rule_id())
+    {
+        return Err(invalid_duplicate("destination RuleID is protected"));
+    }
+    let detail = detail_from_rule(source_rule);
+    let mut output = Vec::new();
+    for override_ in &request.overrides {
+        let entry = detail
+            .entries
+            .iter()
+            .find(|entry| entry.entry_index == override_.entry_index)
+            .ok_or_else(|| {
+                invalid_duplicate(format!("unknown entry-index {}", override_.entry_index))
+            })?;
+        if override_.target_value.is_none()
+            && override_.matching_operator.is_none()
+            && override_.cda.is_none()
+        {
+            return Err(invalid_duplicate(format!(
+                "entry {} has no override leaves",
+                override_.entry_index
+            )));
+        }
+        let mut fields = Vec::new();
+        if let Some(target) = &override_.target_value {
+            let current = source_rule
+                .fields()
+                .iter()
+                .find(|field| field.entry_index == override_.entry_index)
+                .and_then(|field| match &field.target {
+                    TargetValue::Bytes(bytes) => Some(bytes.clone()),
+                    _ => None,
+                })
+                .ok_or_else(|| {
+                    invalid_duplicate("target override requires one binary source target")
+                })?;
+            let field_length = Value::Number(
+                (entry.length.parse::<u64>().map_err(|_| {
+                    invalid_duplicate("target override requires a fixed numeric field length")
+                })?)
+                .into(),
+            );
+            let bytes = binary_bytes(&numeric_target_value(target, &current, &field_length)?)?;
+            let path = duplicate_override_path(
+                request.destination,
+                override_.entry_index,
+                DuplicateLeaf::Target,
+            )?;
+            fields.push((path, CborValue::Bytes(bytes)));
+        }
+        if let Some(matching) = &override_.matching_operator {
+            let identity = duplicate_identity_sid(model, matching, true)?;
+            fields.push((
+                duplicate_override_path(
+                    request.destination,
+                    override_.entry_index,
+                    DuplicateLeaf::MatchingOperator,
+                )?,
+                CborValue::Integer(identity.into()),
+            ));
+        }
+        if let Some(cda) = &override_.cda {
+            let identity = duplicate_identity_sid(model, cda, false)?;
+            fields.push((
+                duplicate_override_path(
+                    request.destination,
+                    override_.entry_index,
+                    DuplicateLeaf::Cda,
+                )?,
+                CborValue::Integer(identity.into()),
+            ));
+        }
+        let entries = fields
+            .into_iter()
+            .map(|(path, value)| {
+                let key =
+                    coreconf_model::codec::json_to_cbor_value(model, &path.to_cbor_value(), 0)
+                        .map_err(|error| invalid_duplicate(error.to_string()))?;
+                Ok((key, value))
+            })
+            .collect::<Result<Vec<_>, InspectionError>>()?;
+        ciborium::ser::into_writer(&CborValue::Map(entries), &mut output)
+            .map_err(|error| invalid_duplicate(format!("override encoding failed: {error}")))?;
+    }
+    Ok(output)
+}
+
+fn duplicate_identity_sid(
+    model: &CompositeModel,
+    input: &str,
+    matching: bool,
+) -> Result<i64, InspectionError> {
+    let allowed = if matching {
+        [
+            "equal",
+            "ignore",
+            "match-mapping",
+            "mo-equal",
+            "mo-ignore",
+            "mo-match-mapping",
+        ]
+        .as_slice()
+    } else {
+        [
+            "not-sent",
+            "value-sent",
+            "mapping-sent",
+            "lsb",
+            "compute",
+            "deviid",
+            "appiid",
+            "cda-not-sent",
+            "cda-value-sent",
+            "cda-mapping-sent",
+            "cda-lsb",
+            "cda-compute",
+            "cda-deviid",
+            "cda-appiid",
+        ]
+        .as_slice()
+    };
+    if !allowed.contains(&input) {
+        return Err(invalid_duplicate(format!(
+            "invalid {} identity '{input}'",
+            if matching { "matching operator" } else { "CDA" }
+        )));
+    }
+    let canonical = if matching && !input.starts_with("mo-") {
+        format!("mo-{input}")
+    } else if !matching && !input.starts_with("cda-") {
+        format!("cda-{input}")
+    } else {
+        input.to_owned()
+    };
+    model
+        .identity_sid_for_value(&Value::String(canonical))
+        .map_err(|error| invalid_duplicate(error.to_string()))
+}
+
+fn encode_duplicate_rpc_payload(
+    model: &CoreconfModel,
+    request: &RuleDuplicateRequest,
+    inner: &[u8],
+) -> Result<Vec<u8>, InspectionError> {
+    validate_duplicate_model_shape(model.composite_model())?;
+    let integer = |value: i64| CborValue::Integer(value.into());
+    let uint = |value: u64| CborValue::Integer(value.into());
+    let source_bits = u64::try_from(request.source.bits)
+        .map_err(|_| invalid_duplicate("source RuleID length is too large"))?;
+    let destination_bits = u64::try_from(request.destination.bits)
+        .map_err(|_| invalid_duplicate("destination RuleID length is too large"))?;
+    if request.source.value > u64::from(u32::MAX) || request.destination.value > u64::from(u32::MAX)
+    {
+        return Err(invalid_duplicate(
+            "duplicate-rule RuleID values must fit the modeled uint32 selectors",
+        ));
+    }
+    let from = CborValue::Map(vec![
+        (integer(1), uint(source_bits)),
+        (integer(2), uint(request.source.value)),
+    ]);
+    let to = CborValue::Map(vec![
+        (integer(1), uint(destination_bits)),
+        (integer(2), uint(request.destination.value)),
+    ]);
+    let mut input_entries = vec![
+        (integer(1), from),
+        (integer(4), CborValue::Bytes(inner.to_vec())),
+        (integer(5), to),
+    ];
+    if inner.is_empty() {
+        input_entries.remove(1);
+    }
+    let value = CborValue::Map(vec![(integer(1), CborValue::Map(input_entries))]);
+    let root = CborValue::Map(vec![(integer(DUPLICATE_RULE_SID), value)]);
+    let mut payload = Vec::new();
+    ciborium::ser::into_writer(&root, &mut payload)
+        .map_err(|error| invalid_duplicate(format!("modeled RPC encoding failed: {error}")))?;
+    Ok(payload)
+}
+
+fn base64_encode(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut output = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let first = chunk[0];
+        let second = chunk.get(1).copied().unwrap_or(0);
+        let third = chunk.get(2).copied().unwrap_or(0);
+        output.push(ALPHABET[usize::from(first >> 2)] as char);
+        output.push(ALPHABET[usize::from((first & 0x03) << 4 | second >> 4)] as char);
+        output.push(if chunk.len() > 1 {
+            ALPHABET[usize::from((second & 0x0f) << 2 | third >> 6)] as char
+        } else {
+            '='
+        });
+        output.push(if chunk.len() > 2 {
+            ALPHABET[usize::from(third & 0x3f)] as char
+        } else {
+            '='
+        });
+    }
+    output
+}
+
+fn base64_decode(input: &str) -> Result<Vec<u8>, InspectionError> {
+    if !input.len().is_multiple_of(4) {
+        return Err(invalid_duplicate("ipatch-sequence is not canonical base64"));
+    }
+    let mut table = [255_u8; 256];
+    for (index, byte) in b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+        .iter()
+        .enumerate()
+    {
+        table[usize::from(*byte)] = u8::try_from(index).expect("base64 alphabet index fits u8");
+    }
+    let bytes = input.as_bytes();
+    let mut output = Vec::with_capacity(input.len() / 4 * 3);
+    for chunk in bytes.chunks_exact(4) {
+        let a = table[usize::from(chunk[0])];
+        let b = table[usize::from(chunk[1])];
+        if a == 255 || b == 255 {
+            return Err(invalid_duplicate("ipatch-sequence contains invalid base64"));
+        }
+        let c = if chunk[2] == b'=' {
+            0
+        } else {
+            table[usize::from(chunk[2])]
+        };
+        let d = if chunk[3] == b'=' {
+            0
+        } else {
+            table[usize::from(chunk[3])]
+        };
+        if c == 255 || d == 255 || (chunk[2] == b'=' && chunk[3] != b'=') {
+            return Err(invalid_duplicate(
+                "ipatch-sequence contains invalid base64 padding",
+            ));
+        }
+        output.push((a << 2) | (b >> 4));
+        if chunk[2] != b'=' {
+            output.push((b << 4) | (c >> 2));
+        }
+        if chunk[3] != b'=' {
+            output.push((c << 6) | d);
+        }
+    }
+    if base64_encode(&output) != input {
+        return Err(invalid_duplicate("ipatch-sequence is not canonical base64"));
+    }
+    Ok(output)
+}
+
+fn decode_duplicate_operation(
+    model: &CoreconfModel,
+    payload: &[u8],
+) -> Result<DecodedDuplicateOperation, InspectionError> {
+    validate_duplicate_model_shape(model.composite_model())?;
+    let outer = strict_one_cbor_map(payload)?;
+    reject_duplicate_cbor_keys(&outer)?;
+    let instances =
+        decode_instances_with_model_to_identifier_at_path(model.composite_model(), payload, false)
+            .map_err(|error| invalid_duplicate(format!("RPC payload decode failed: {error}")))?;
+    if instances.len() != 1
+        || instances[0].path.components != vec![PathComponent::SidDelta(DUPLICATE_RULE_SID)]
+    {
+        return Err(invalid_duplicate(
+            "RPC payload must contain exactly one duplicate-rule instance",
+        ));
+    }
+    let value = instances[0]
+        .value
+        .clone()
+        .ok_or_else(|| invalid_duplicate("RPC input cannot be deleted"))?;
+    let operation = value
+        .as_object()
+        .ok_or_else(|| invalid_duplicate("RPC operation value is not an object"))?;
+    if operation.len() != 1 || !operation.contains_key("input") {
+        return Err(invalid_duplicate(
+            "RPC operation must contain exactly the input container",
+        ));
+    }
+    let input = operation
+        .get("input")
+        .and_then(Value::as_object)
+        .ok_or_else(|| invalid_duplicate("RPC input container is missing"))?;
+    if input
+        .keys()
+        .any(|key| !matches!(key.as_str(), "from" | "to" | "ipatch-sequence"))
+    {
+        return Err(invalid_duplicate("RPC input contains an unknown field"));
+    }
+    let from = input
+        .get("from")
+        .and_then(Value::as_object)
+        .ok_or_else(|| invalid_duplicate("RPC source selector is missing"))?;
+    let to = input
+        .get("to")
+        .and_then(Value::as_object)
+        .ok_or_else(|| invalid_duplicate("RPC destination selector is missing"))?;
+    let selector = |object: &serde_json::Map<String, Value>,
+                    label: &str|
+     -> Result<RuleSelector, InspectionError> {
+        if object.len() != 2
+            || !object.contains_key("rule-id-value")
+            || !object.contains_key("rule-id-length")
+        {
+            return Err(invalid_duplicate(format!(
+                "RPC {label} selector has unsupported fields"
+            )));
+        }
+        RuleSelector::new(
+            object["rule-id-value"]
+                .as_u64()
+                .ok_or_else(|| invalid_duplicate(format!("RPC {label} value is invalid")))?,
+            object["rule-id-length"]
+                .as_u64()
+                .and_then(|bits| usize::try_from(bits).ok())
+                .ok_or_else(|| invalid_duplicate(format!("RPC {label} length is invalid")))?,
+        )
+        .map_err(|error| invalid_duplicate(error.to_string()))
+    };
+    let source = selector(from, "source")?;
+    let destination = selector(to, "destination")?;
+    let inner = input
+        .get("ipatch-sequence")
+        .map(|value| match value {
+            Value::String(encoded) => base64_decode(encoded),
+            _ => binary_bytes(value),
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let inner_instances = decode_duplicate_inner(model.composite_model(), &inner, destination)?;
+    let mut entries = BTreeSet::new();
+    for instance in &inner_instances {
+        let (entry, _) = duplicate_leaf_from_path(&instance.path, destination)?;
+        entries.insert(entry);
+    }
+    let overrides = entries
+        .into_iter()
+        .map(|entry_index| RuleDuplicateOverride {
+            entry_index,
+            target_value: None,
+            matching_operator: None,
+            cda: None,
+        })
+        .collect();
+    Ok(DecodedDuplicateOperation {
+        request: RuleDuplicateRequest {
+            source,
+            destination,
+            overrides,
+        },
+        instances: inner_instances,
+    })
+}
+
+fn decode_duplicate_inner(
+    model: &CompositeModel,
+    bytes: &[u8],
+    destination: RuleSelector,
+) -> Result<Vec<Instance>, InspectionError> {
+    let mut cursor = Cursor::new(bytes);
+    let mut instances = Vec::new();
+    let mut groups = BTreeSet::new();
+    while usize::try_from(cursor.position()).is_ok_and(|position| position < bytes.len()) {
+        let start = usize::try_from(cursor.position())
+            .map_err(|_| invalid_duplicate("ipatch-sequence is too large"))?;
+        let value: CborValue = ciborium::de::from_reader(&mut cursor)
+            .map_err(|error| invalid_duplicate(format!("invalid ipatch-sequence CBOR: {error}")))?;
+        let end = usize::try_from(cursor.position())
+            .map_err(|_| invalid_duplicate("ipatch-sequence is too large"))?;
+        let CborValue::Map(entries) = &value else {
+            return Err(invalid_duplicate("ipatch-sequence members must be maps"));
+        };
+        if entries.is_empty() || entries.len() > 3 {
+            return Err(invalid_duplicate(
+                "each override map must contain one to three leaves",
+            ));
+        }
+        reject_duplicate_cbor_keys(&value)?;
+        let mut canonical = Vec::new();
+        ciborium::ser::into_writer(&value, &mut canonical)
+            .map_err(|error| invalid_duplicate(error.to_string()))?;
+        if canonical != bytes[start..end] {
+            return Err(invalid_duplicate("noncanonical ipatch-sequence map"));
+        }
+        let member = &bytes[start..end];
+        let decoded = decode_instances_with_model_to_identifier_at_path(model, member, false)
+            .map_err(|error| invalid_duplicate(format!("invalid override value: {error}")))?;
+        if decoded.len() != entries.len() {
+            return Err(invalid_duplicate("override map did not decode completely"));
+        }
+        let mut seen = BTreeSet::new();
+        let mut group_entries = BTreeSet::new();
+        for instance in decoded {
+            let (entry, leaf) = duplicate_leaf_from_path(&instance.path, destination)?;
+            if !seen.insert((entry, leaf)) {
+                return Err(invalid_duplicate("duplicate override leaf"));
+            }
+            group_entries.insert(entry);
+            instances.push(instance);
+        }
+        // One map is one override group. A second map for the same entry
+        // would make the entry-index override ambiguous rather than merging
+        // two independently ordered operations.
+        if group_entries.iter().any(|entry| groups.contains(entry)) {
+            return Err(invalid_duplicate("duplicate entry-index override group"));
+        }
+        groups.extend(group_entries);
+    }
+    Ok(instances)
+}
+
+fn strict_one_cbor_map(bytes: &[u8]) -> Result<CborValue, InspectionError> {
+    let mut cursor = Cursor::new(bytes);
+    let value: CborValue = ciborium::de::from_reader(&mut cursor)
+        .map_err(|error| invalid_duplicate(format!("invalid RPC CBOR: {error}")))?;
+    if cursor.position() != bytes.len() as u64 {
+        return Err(invalid_duplicate("trailing values after RPC instance"));
+    }
+    if !matches!(value, CborValue::Map(_)) {
+        return Err(invalid_duplicate("RPC payload root must be a map"));
+    }
+    let mut canonical = Vec::new();
+    ciborium::ser::into_writer(&value, &mut canonical)
+        .map_err(|error| invalid_duplicate(format!("RPC canonical encoding failed: {error}")))?;
+    if canonical != bytes {
+        return Err(invalid_duplicate("noncanonical RPC CBOR"));
+    }
+    Ok(value)
+}
+
+fn reject_duplicate_cbor_keys(value: &CborValue) -> Result<(), InspectionError> {
+    match value {
+        CborValue::Array(values) => values.iter().try_for_each(reject_duplicate_cbor_keys),
+        CborValue::Map(entries) => {
+            for (index, (key, value)) in entries.iter().enumerate() {
+                if entries[..index].iter().any(|(previous, _)| previous == key) {
+                    return Err(invalid_duplicate("duplicate CBOR map key"));
+                }
+                reject_duplicate_cbor_keys(key)?;
+                reject_duplicate_cbor_keys(value)?;
+            }
+            Ok(())
+        }
+        CborValue::Tag(_, value) => reject_duplicate_cbor_keys(value),
+        _ => Ok(()),
     }
 }
 
