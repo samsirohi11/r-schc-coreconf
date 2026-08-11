@@ -1,7 +1,7 @@
 //! Regression coverage for the deterministic demonstration contexts.
 
 use coreconf_model::CoreconfModel;
-use schc_core::{RuleContext, RuleId, RuleNature, SidRegistry};
+use schc_core::{RuleContext, RuleId, RuleNature, SidRegistry, TargetValue};
 use schc_coreconf::{
     canonical_sor_from_tree, canonicalize_sor, protected_management_rule_ids,
     validate_sid_with_both_models, PreparedContext, ProtectionPolicy,
@@ -15,8 +15,8 @@ const INITIAL_RULES: &str = include_str!("../../../fixtures/demo/initial-rules.j
 const UPDATED_RULES: &str = include_str!("../../../fixtures/demo/updated-rules.json");
 const INITIAL_SOR: &[u8] = include_bytes!("../../../fixtures/demo/initial.sor");
 const UPDATED_SOR: &[u8] = include_bytes!("../../../fixtures/demo/updated.sor");
-const INITIAL_SOR_SHA256: &str = "0d38bc044f31f5ad9ce8817bcc3a536ccfbfc9b4bd0cada4cff3e9652a1be384";
-const UPDATED_SOR_SHA256: &str = "2fa672f9a3acb0ed32d7d84eabf589ace9cc5e4ce148821bc0fe3aac9f4855c0";
+const INITIAL_SOR_SHA256: &str = "22825e10e006255e8683b524a42b94e03e37613714f3db71a6ad9a0a7bba05c7";
+const UPDATED_SOR_SHA256: &str = "d739ae0aaf1b5c184bae5c061d91d058f7f3cea1f65522383619a3826bfae61e";
 
 fn source(document: &str) -> Value {
     serde_json::from_str(document).expect("OpenSCHC rule source")
@@ -107,8 +107,85 @@ fn checked_in_sors_have_stable_bytes_and_load_through_both_models() {
     let model = CoreconfModel::from_sid_str(SID).expect("rustconf model");
     assert_eq!(model.sid_file.module_name, initial_sid.module_name);
     assert_eq!(model.sid_file.sids, initial_sid.sids);
-    assert_eq!(rule_context(INITIAL_SOR).rules().rules().len(), 9);
-    assert_eq!(rule_context(UPDATED_SOR).rules().rules().len(), 9);
+    let initial_context = rule_context(INITIAL_SOR);
+    let updated_context = rule_context(UPDATED_SOR);
+    assert_eq!(initial_context.rules().rules().len(), 9);
+    assert_eq!(updated_context.rules().rules().len(), 9);
+
+    // The ignore/value-sent and ignore/compute entries have no target-value
+    // list in the encoded tree, while the equal-zero target remains present.
+    for tree in [&initial_tree, &updated_tree] {
+        for rule_id in [20, 21] {
+            let rule = tree["ietf-schc:schc"]["rule"]
+                .as_array()
+                .expect("rules")
+                .iter()
+                .find(|rule| rule["rule-id-value"] == rule_id)
+                .expect("rule");
+            for entry_index in [3, 12, 13, 15, 16, 18, 19] {
+                let entry = rule["entry"]
+                    .as_array()
+                    .expect("entries")
+                    .iter()
+                    .find(|entry| entry["entry-index"] == entry_index)
+                    .expect("entry");
+                assert!(entry.get("target-value").is_none());
+            }
+        }
+        let rule25 = tree["ietf-schc:schc"]["rule"]
+            .as_array()
+            .expect("rules")
+            .iter()
+            .find(|rule| rule["rule-id-value"] == 25)
+            .expect("rule");
+        let rule25_length = rule25["entry"]
+            .as_array()
+            .expect("entries")
+            .iter()
+            .find(|entry| entry["entry-index"] == 3)
+            .expect("entry");
+        assert!(rule25_length.get("target-value").is_none());
+
+        let zero_entry = tree["ietf-schc:schc"]["rule"]
+            .as_array()
+            .expect("rules")
+            .iter()
+            .find(|rule| rule["rule-id-value"] == 16)
+            .expect("rule")["entry"][1]
+            .clone();
+        assert!(zero_entry.get("target-value").is_some());
+    }
+    for context in [&initial_context, &updated_context] {
+        for rule_id in [20, 21] {
+            let rule = context.find_rule(RuleId::new(rule_id, 8)).expect("rule");
+            for entry_index in [3, 12, 13, 15, 16, 18, 19] {
+                assert_eq!(
+                    rule.fields()
+                        .iter()
+                        .find(|field| field.entry_index == entry_index)
+                        .expect("entry")
+                        .target,
+                    TargetValue::None
+                );
+            }
+        }
+        assert_eq!(
+            context
+                .find_rule(RuleId::new(25, 8))
+                .expect("rule")
+                .fields()[3]
+                .target,
+            TargetValue::None
+        );
+        assert_eq!(
+            context
+                .find_rule(RuleId::new(16, 8))
+                .expect("rule")
+                .fields()[1]
+                .target,
+            TargetValue::Bytes(vec![0])
+        );
+    }
 }
 
 #[test]
@@ -166,6 +243,22 @@ fn rule_sources_have_only_the_minimal_inventory_and_expected_natures() {
             response_formats,
             vec![(serde_json::json!(1), serde_json::json!(142))]
         );
+        for rule_id in [20, 21] {
+            for fid in [
+                "IPV6.LEN",
+                "UDP.LEN",
+                "UDP.CKSUM",
+                "COAP.TYPE",
+                "COAP.TKL",
+                "COAP.MID",
+                "COAP.TOKEN",
+            ] {
+                assert!(source_field(source_rule(document, rule_id), fid)["TV"].is_null());
+            }
+        }
+        assert!(source_field(source_rule(document, 25), "IPV6.LEN")["TV"].is_null());
+        assert_eq!(source_field(source_rule(document, 16), "IPV6.TC")["TV"], 0);
+        assert_eq!(source_field(source_rule(document, 16), "COAP.MID")["TV"], 0);
     }
 
     let initial_context = rule_context(INITIAL_SOR);
