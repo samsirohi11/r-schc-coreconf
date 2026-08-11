@@ -106,34 +106,37 @@ When `DEMO_BUILD=0`, `DEMO_BIN_DIR` may point to a directory containing the thre
 
 ## Interactive CLI use
 
-Run the core and data client from a terminal, not through a pipe, to get startup help and a visible prompt.
+Run the core and data client from a terminal, not through a pipe, to get a visible prompt.
 The core prompt is `core>` and the data client prompt is `data>`.
-Both processes also accept `help` at any time.
-The device is a background service and prints `WAITING role=device` while it waits for frames.
+Both processes print one `READY` line and accept `help` at any time.
+The device is a background service and includes its peer address on its `READY` line while it waits for frames.
 
-Traffic reports are concise by default and use one deterministic line such as `TX APP   69/8  69 B -> 11 B`.
+Traffic reports are concise by default and use one deterministic line such as `RX APP   20/8  63 B -> 11 B`.
 The line contains direction, traffic class, RuleID, original packet bytes, and padded transmitted bytes.
 Pass `--debug` to `schc-coreconf-core` or `schc-coreconf-device` for the same line followed by a structured IPv6, UDP, CoAP, RPC, and SCHC accounting block.
 Debug output is plain ASCII and intentionally omits raw packet and frame hexadecimal.
 The final demonstration script enables this mode automatically for its visible proof checks.
+
+Successful management actions use concise results such as `OK duplicate 20/8 -> 22/8  local=installed  remote=unacknowledged` and `OK update 20/8 entry=9  device=changed  local=changed`.
+Context status is reported as `CONTEXT generation=2  rules=9` in regular mode.
 
 The core command list is:
 
 ```text
 context status
 context check
-rule list core|device
-rule get core|device <value>/<bits>
+rule list <core|device>
+rule get <core|device> <value>/<bits>
 rule duplicate <source>/<bits> <destination>/<bits> [entry=<index> tv=<value> mo=<identity> cda=<identity> ...]
-
-Each `entry=<index>` starts one override group, followed by one or more of `tv=<value>`, `mo=<identity>`, and `cda=<identity>`.
-Duplicate target replacements accept unsigned decimal values only when replacing an existing fixed-width binary target, preserving that target's width.
-The `mo=` and `cda=` arguments accept only the currently supported identity names.
 rule update <value>/<bits> entry=<index> tv=<value> [--if-match]
 rule update <value>/<bits> fid=<field> [fp=<position>] [di=<direction>] tv=<value> [--if-match]
 help
 quit
 ```
+
+Each `entry=<index>` starts one override group, followed by one or more of `tv=<value>`, `mo=<identity>`, and `cda=<identity>`.
+Duplicate target replacements accept unsigned decimal values only when replacing an existing fixed-width binary target, preserving that target's width.
+The `mo=` and `cda=` arguments accept only the currently supported identity names.
 
 The data client command list is:
 
@@ -235,7 +238,7 @@ The application CORECONF server and datastore are still embedded in the SCHC dev
 It does not implement Linux TUN integration, kernel-routed IPv6, SCHC fragmentation, OSCORE, QUIC, TCP, or remote administration.
 It does not provide automatic RuleID allocation, context epochs, retries, rollback, replay journals, or concurrent multi-device routing.
 The core sends duplicate-rule once as a NON POST and does not wait for or require a response.
-It then applies the exact same operation locally and reports `remote=not-acknowledged`.
+It then applies the exact same operation locally and reports `remote=unacknowledged`.
 A local failure after sending reports possible divergence and requires an operator to run `context check`.
 An identical installed duplicate is idempotent with no new publication; a conflicting destination is rejected without mutation.
 The management rule inventory is intentionally small and uses exact protected RuleID policy rather than generalized M-Rule creation.

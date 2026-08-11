@@ -39,7 +39,7 @@ fn next_management_message_id(next: &mut u16) -> u16 {
 
 fn main() {
     if let Err(error) = run() {
-        eprintln!("schc-coreconf-core: error: {error}");
+        eprintln!("schc-coreconf-core: ERROR {error}");
         std::process::exit(1);
     }
 }
@@ -67,11 +67,10 @@ fn run() -> Result<(), String> {
     let app_local = app_socket
         .local_addr()
         .map_err(|error| format!("query application socket: {error}"))?;
-    println!("READY role=core app={app_local} link={link_local}");
+    println!("READY core  app={app_local}  link={link_local}");
     let interactive = io::stdin().is_terminal() && io::stdout().is_terminal();
     if interactive {
-        println!();
-        print_console_help();
+        println!("Type 'help' for commands");
         print_prompt()?;
     } else {
         io::stdout()
@@ -189,7 +188,6 @@ fn run() -> Result<(), String> {
                 response_datagram.len()
             ));
         }
-        println!("CORE DONE response_bytes={sent} peer={application_peer}");
         io::stdout()
             .flush()
             .map_err(|error| format!("flush operation output: {error}"))?;
@@ -211,7 +209,7 @@ enum CommandResult {
 }
 
 fn print_console_help() {
-    println!("Core console commands:");
+    println!("Core commands:");
     println!("  context status");
     println!("  context check");
     println!("  rule list <core|device>");
@@ -273,6 +271,7 @@ fn handle_command(
             inspection,
             active,
             next_message_id,
+            debug,
             |datagram| {
                 let request = Ipv6UdpCoapPacket::new(
                     CORE_LOGICAL_ADDRESS,
@@ -310,6 +309,7 @@ fn handle_command(
             inspection,
             active,
             next_message_id,
+            debug,
             |datagram| {
                 let (code, exchange) = exchange_management_update(link, raw_link, datagram)
                     .map_err(|error| error.to_string())?;
@@ -342,12 +342,12 @@ fn handle_command(
         let snapshot = active.snapshot();
         let status = ContextStatus::from_snapshot(&snapshot);
         println!(
-            "CONTEXT generation={} tag={} digest={} rules={}",
-            status.generation,
-            status.tag,
-            hex_digest(status.digest),
-            status.rule_count
+            "CONTEXT generation={}  rules={}",
+            status.generation, status.rule_count
         );
+        if debug {
+            println!("  tag={}  digest={}", status.tag, hex_digest(status.digest));
+        }
         return Ok(CommandResult::Successful);
     }
     if command == "context check" {
@@ -368,12 +368,17 @@ fn handle_command(
         )?;
         let result = decode_context_check_payload(&exchange.payload, tag)
             .map_err(|error| format!("context check response failed: {error}"))?;
-        println!(
-            "CONTEXT CHECK {} core_tag={} device_tag={}",
-            if result.equal { "equal" } else { "mismatch" },
-            result.core_tag,
-            result.device_tag
-        );
+        if result.equal {
+            println!("OK context check  equal");
+        } else {
+            println!("ERROR context check  mismatch");
+        }
+        if debug {
+            println!(
+                "  core tag={}  device tag={}",
+                result.core_tag, result.device_tag
+            );
+        }
         return Ok(CommandResult::Successful);
     }
     if command == "rule list core" {
@@ -471,6 +476,7 @@ fn execute_rule_duplicate<SendDevice, ApplyLocal>(
     inspection: &mut InspectionService,
     active: &std::sync::Arc<schc_coreconf::ActiveContext>,
     next_message_id: &mut u16,
+    debug: bool,
     send_device: SendDevice,
     apply_local: ApplyLocal,
 ) -> Result<CommandResult, String>
@@ -479,21 +485,31 @@ where
     ApplyLocal: FnOnce(&mut InspectionService, &[u8]) -> Result<Option<Vec<u8>>, String>,
 {
     let request = parse_rule_duplicate_command(command).map_err(|error| {
-        format!("rule duplicate rejected: {error}; device=not-sent; local=unchanged")
+        format!("duplicate rejected: {error}; device=not-sent; local=unchanged")
     })?;
+    let selector = format!(
+        "{}/{} -> {}/{}",
+        request.source.value,
+        request.source.bits,
+        request.destination.value,
+        request.destination.bits
+    );
     let datagram = inspection
         .duplicate_rule_datagram(&request, next_management_message_id(next_message_id))
         .map_err(|error| {
-            format!("rule duplicate rejected: {error}; device=not-sent; local=unchanged")
+            format!("duplicate {selector} rejected: {error}; device=not-sent; local=unchanged")
         })?;
-    send_device(&datagram)
-        .map_err(|error| format!("rule duplicate sent=no; local=unchanged: {error}"))?;
+    send_device(&datagram).map_err(|error| {
+        format!("duplicate {selector}  remote=not-sent  local=unchanged: {error}")
+    })?;
     let before_generation = active.generation();
     let response = apply_local(inspection, &datagram).map_err(|error| {
-        format!("rule duplicate sent=yes remote=not-acknowledged local=failed: {error}; possible divergence - run context check")
+        format!("duplicate {selector}  remote=unacknowledged  local=failed: {error}; possible divergence - run context check")
     })?;
     if response.is_some() {
-        return Err("rule duplicate local handler unexpectedly produced a response; possible divergence - run context check".into());
+        return Err(format!(
+            "duplicate {selector}  remote=unacknowledged  local=failed: local handler unexpectedly produced a response; possible divergence - run context check"
+        ));
     }
     let after_generation = active.generation();
     let tag = inspection.status().tag;
@@ -509,16 +525,18 @@ where
         }
     };
     match result {
-        DuplicateRuleResult::Applied { generation, tag } => println!(
-            "RULE DUPLICATE {}/{} -> {}/{} overrides={} sent=yes remote=not-acknowledged local=installed generation={} tag={}",
-            request.source.value, request.source.bits, request.destination.value, request.destination.bits,
-            request.overrides.len(), generation, tag
-        ),
-        DuplicateRuleResult::Idempotent { generation, tag } => println!(
-            "RULE DUPLICATE {}/{} -> {}/{} overrides={} sent=yes remote=not-acknowledged local=idempotent generation={} tag={}",
-            request.source.value, request.source.bits, request.destination.value, request.destination.bits,
-            request.overrides.len(), generation, tag
-        ),
+        DuplicateRuleResult::Applied { generation, tag } => {
+            println!("OK duplicate {selector}  local=installed  remote=unacknowledged");
+            if debug {
+                println!("  generation={generation}  tag={tag}");
+            }
+        }
+        DuplicateRuleResult::Idempotent { generation, tag } => {
+            println!("OK duplicate {selector}  local=idempotent  remote=unacknowledged");
+            if debug {
+                println!("  generation={generation}  tag={tag}");
+            }
+        }
     }
     Ok(CommandResult::Successful)
 }
@@ -528,6 +546,7 @@ fn execute_rule_update<SendDevice, ApplyLocal>(
     inspection: &mut InspectionService,
     active: &std::sync::Arc<ActiveContext>,
     next_message_id: &mut u16,
+    debug: bool,
     send_device: SendDevice,
     apply_local: ApplyLocal,
 ) -> Result<CommandResult, String>
@@ -617,13 +636,16 @@ where
         ));
     }
     println!(
-        "RULE UPDATE {}/{} entry={} device=2.04 local=2.04 generation={} tag={}",
-        request.rule.value,
-        request.rule.bits,
-        update.entry_index,
-        after.generation(),
-        after.tag()
+        "OK update {}/{} entry={}  device=changed  local=changed",
+        request.rule.value, request.rule.bits, update.entry_index
     );
+    if debug {
+        println!(
+            "  response=2.04  generation={}  tag={}",
+            after.generation(),
+            after.tag()
+        );
+    }
     Ok(CommandResult::Successful)
 }
 
@@ -712,6 +734,7 @@ mod tests {
             &mut inspection,
             &core,
             &mut 1,
+            false,
             |_datagram| {
                 device_sent = true;
                 Ok(128)
@@ -747,6 +770,7 @@ mod tests {
             &mut core_inspection,
             &core,
             &mut next_message_id,
+            false,
             |datagram| {
                 sequence.borrow_mut().push("device".to_owned());
                 let response = device_inspection
@@ -791,6 +815,7 @@ mod tests {
             &mut inspection,
             &core,
             &mut 1,
+            false,
             |_datagram| {
                 device_sent = true;
                 Ok(68)
@@ -848,6 +873,7 @@ mod tests {
             &mut inspection,
             &core,
             &mut 1,
+            false,
             |_datagram| {
                 device_sent = true;
                 Ok(68)

@@ -102,22 +102,17 @@ fn process_reports(stdout: &str, prefix: &str) -> Vec<ProcessReport> {
         .collect()
 }
 
-fn report_field(line: &str, field: &str) -> String {
-    line.split_whitespace()
-        .find_map(|word| word.strip_prefix(&format!("{field}=")))
-        .unwrap_or_else(|| panic!("missing {field} in process report: {line}"))
-        .to_owned()
-}
-
 fn equal_context_tags(stdout: &str) -> Vec<(String, String)> {
     stdout
         .lines()
-        .filter(|line| line.starts_with("CONTEXT CHECK equal "))
-        .map(|line| {
-            (
-                report_field(line, "core_tag"),
-                report_field(line, "device_tag"),
-            )
+        .filter_map(|line| {
+            let fields = line.split_whitespace().collect::<Vec<_>>();
+            (fields.len() == 4 && fields[0] == "core" && fields[2] == "device").then(|| {
+                (
+                    fields[1].trim_start_matches("tag=").to_owned(),
+                    fields[3].trim_start_matches("tag=").to_owned(),
+                )
+            })
         })
         .collect()
 }
@@ -205,7 +200,8 @@ fn final_real_process_demo_reuses_logical_request_and_shrinks_raw_frame() {
         core_app,
         b"discover d=0\nschema demo-data\nfetch /demo-data:config/count\nquit\n",
     );
-    assert!(before_client.contains("READY role=data-client"));
+    assert!(before_client.contains("READY client  server="));
+    assert!(!before_client.contains("Data client commands:"));
     assert!(before_client.contains("core.c.ds"));
     assert!(before_client.contains("/demo-data:config/count (sid 60002)"));
     assert!(
@@ -215,9 +211,15 @@ fn final_real_process_demo_reuses_logical_request_and_shrinks_raw_frame() {
 
     core.write_stdin(b"rule update 20/8 fid=ipv6.app-iid tv=2 --if-match\n");
     core.wait_for_stdout(
-        "RULE UPDATE 20/8 entry=9 device=2.04 local=2.04",
+        "OK update 20/8 entry=9  device=changed  local=changed",
         Duration::from_secs(15),
     );
+    assert!(core
+        .wait_for_stdout(
+            "  response=2.04  generation=2  tag=",
+            Duration::from_secs(15)
+        )
+        .contains("  response=2.04  generation=2  tag="));
     core.write_stdin(b"context check\nrule get core 20/8\nrule get device 20/8\n");
     core.wait_for_stdout("tv=0x0000000000000002", Duration::from_secs(15));
     let after_client = run_data_fetch(
@@ -225,7 +227,7 @@ fn final_real_process_demo_reuses_logical_request_and_shrinks_raw_frame() {
         core_app,
         b"discover d=0\nschema demo-data\nfetch /demo-data:config/count\nquit\n",
     );
-    assert!(after_client.contains("READY role=data-client"));
+    assert!(after_client.contains("READY client  server="));
     assert!(after_client.contains("core.c.ds"));
     assert!(after_client.contains("/demo-data:config/count (sid 60002)"));
     assert!(
@@ -276,6 +278,14 @@ fn final_real_process_demo_reuses_logical_request_and_shrinks_raw_frame() {
     let device_rx = [&device_request_reports[1], &device_request_reports[3]];
     let device_tx = [&device_response_reports[1], &device_response_reports[3]];
 
+    assert!(core_stdout.starts_with("READY core  app="));
+    assert!(!core_stdout.contains("Core commands:"));
+    assert!(!core_stdout.contains("CORE DONE"));
+    assert!(device_stdout.starts_with("READY device  link="));
+    assert!(!device_stdout.contains("Device mode:"));
+    assert!(!device_stdout.contains("WAITING role="));
+    assert!(!device_stdout.contains("DEVICE DONE"));
+    assert!(!device_stdout.contains("DEVICE PROTECTED"));
     assert!(core_stdout.contains("TX APP   25/8  63 B -> 16 B"));
     assert!(core_stdout.contains("TX APP   20/8  63 B -> 11 B"));
     assert!(device_stdout.contains("RX APP   25/8  63 B -> 16 B"));
@@ -313,6 +323,7 @@ fn final_real_process_demo_reuses_logical_request_and_shrinks_raw_frame() {
 
     let tags = equal_context_tags(&core_stdout);
     assert_eq!(tags.len(), 2, "context checks: {core_stdout}");
+    assert!(core_stdout.contains("OK context check  equal"));
     assert_eq!(tags[0].0, tags[0].1);
     assert_eq!(tags[1].0, tags[1].1);
     assert_ne!(tags[0].0, tags[1].0, "the update should publish a new tag");
@@ -370,7 +381,10 @@ fn final_real_process_duplicate_rule_selects_new_rule_without_ack() {
         "before output: {before}"
     );
     core.write_stdin(b"rule duplicate 20/8 22/8 entry=9 tv=2\n");
-    core.wait_for_stdout("RULE DUPLICATE 20/8 -> 22/8", Duration::from_secs(15));
+    core.wait_for_stdout(
+        "OK duplicate 20/8 -> 22/8  local=installed  remote=unacknowledged",
+        Duration::from_secs(15),
+    );
     let after = run_data_fetch(&app_sid, core_app, b"fetch /demo-data:config/count\nquit\n");
     assert!(
         after.lines().any(|line| line == "7"),
@@ -381,14 +395,22 @@ fn final_real_process_duplicate_rule_selects_new_rule_without_ack() {
     assert!(status.success(), "core status: {status}");
     let (core_stdout, core_stderr) = core.output();
     assert!(core_stderr.is_empty(), "core stderr: {core_stderr}");
+    assert!(!core_stdout.contains("RULE DUPLICATE"));
     assert!(
-        core_stdout.contains("local=installed"),
+        core_stdout
+            .lines()
+            .any(|line| line == "OK duplicate 20/8 -> 22/8  local=installed  remote=unacknowledged"),
         "core output: {core_stdout}"
     );
     assert!(
-        core_stdout.contains("local=idempotent"),
+        core_stdout.lines().any(
+            |line| line == "OK duplicate 20/8 -> 22/8  local=idempotent  remote=unacknowledged"
+        ),
         "core output: {core_stdout}"
     );
+    assert!(core_stdout
+        .lines()
+        .any(|line| line.starts_with("  generation=")));
     assert!(
         core_stdout.contains("tv=0x0000000000000005"),
         "source rule output: {core_stdout}"
@@ -400,7 +422,12 @@ fn final_real_process_duplicate_rule_selects_new_rule_without_ack() {
     let (device_stdout, device_stderr) = device.output();
     assert!(device_stderr.is_empty(), "device stderr: {device_stderr}");
     assert!(
-        device_stdout.contains("action=duplicate") && device_stdout.contains("no_response=yes"),
+        device_stdout
+            .lines()
+            .any(|line| line == "OK duplicate  local=installed  response=none")
+            && device_stdout
+                .lines()
+                .any(|line| line == "OK duplicate  local=idempotent  response=none"),
         "device output: {device_stdout}"
     );
     assert_eq!(
@@ -1226,7 +1253,9 @@ fn real_three_process_data_client_discovers_and_fetches() {
         .expect("spawn data client");
     let mut input = client.stdin.take().expect("client stdin");
     input
-        .write_all(b"discover d=0\nschema demo-data\nfetch /demo-data:config/count\nquit\n")
+        .write_all(
+            b"discover d=0\nschema demo-data\nfetch /demo-data:config/count\nset /demo-data:config/count 8\nget /demo-data:config/count\ndelete /demo-data:config/count\nget /demo-data:config/count\nget /missing\nreload\nunknown\nquit\n",
+        )
         .expect("write client commands");
     drop(input);
     let client_output = client.wait_with_output().expect("wait data client");
@@ -1234,9 +1263,21 @@ fn real_three_process_data_client_discovers_and_fetches() {
     let client_stdout = String::from_utf8_lossy(&client_output.stdout);
     let client_stderr = String::from_utf8_lossy(&client_output.stderr);
     assert!(client_stderr.is_empty(), "client stderr: {client_stderr}");
+    assert!(client_stdout.contains("READY client  server="));
     assert!(client_stdout.contains("core.c.ds"));
     assert!(client_stdout.contains("/demo-data:config/count (sid 60002)"));
-    assert!(client_stdout.contains('7'));
+    assert!(client_stdout.lines().any(|line| line == "7"));
+    assert!(client_stdout.lines().any(|line| line == "8"));
+    assert!(client_stdout.lines().any(|line| line == "OK set"));
+    assert!(client_stdout.lines().any(|line| line == "OK delete"));
+    assert!(client_stdout.lines().any(|line| line == "not found"));
+    assert!(client_stdout
+        .lines()
+        .any(|line| line.starts_with("ERROR application model operation failed:")));
+    assert!(client_stdout.lines().any(|line| line == "OK reload"));
+    assert!(client_stdout
+        .lines()
+        .any(|line| line == "ERROR unknown command 'unknown'; use help"));
 
     core.kill();
     device.kill();
@@ -1257,11 +1298,11 @@ fn process_help_explains_interactive_commands_and_debug_reports() {
     for (program, expected) in [
         (
             env!("CARGO_BIN_EXE_schc-coreconf-core"),
-            ["--debug", "Interactive commands", "context check"].as_slice(),
+            ["--debug", "Core commands:", "context check"].as_slice(),
         ),
         (
             env!("CARGO_BIN_EXE_schc-coreconf-device"),
-            ["--debug", "waits for SCHC frames"].as_slice(),
+            ["--debug", "Device mode:", "waits for SCHC frames"].as_slice(),
         ),
         (
             env!("CARGO_BIN_EXE_schc-data-client"),
@@ -1312,7 +1353,7 @@ fn idle_device_stays_alive_between_frames() {
     assert!(device.is_running(), "idle device exited unexpectedly");
     let (stdout, stderr) = device.output();
     assert!(
-        stdout.contains("WAITING role=device"),
+        stdout.contains("READY device  link=") && stdout.contains("peer="),
         "device stdout: {stdout}"
     );
     assert!(stderr.is_empty(), "device stderr: {stderr}");

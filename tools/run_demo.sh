@@ -136,7 +136,7 @@ exec 3<>"$CORE_FIFO"
 	--app-data "$APP_DATA" \
 	>"$DEVICE_LOG" 2>&1 </dev/null &
 DEVICE_PID=$!
-wait_for_line "$DEVICE_LOG" "READY role=device" "$DEVICE_PID"
+wait_for_line "$DEVICE_LOG" "READY device  " "$DEVICE_PID"
 
 "$CORE" \
 	--debug \
@@ -145,14 +145,14 @@ wait_for_line "$DEVICE_LOG" "READY role=device" "$DEVICE_PID"
 	--app-bind "127.0.0.1:$CORE_APP_PORT" \
 	>"$CORE_LOG" 2>&1 <"$CORE_FIFO" &
 CORE_PID=$!
-wait_for_line "$CORE_LOG" "READY role=core" "$CORE_PID"
+wait_for_line "$CORE_LOG" "READY core  " "$CORE_PID"
 
 run_client "$BEFORE_LOG" "discover d=0
 schema demo-data
 fetch /demo-data:config/count
 quit"
 grep -Fxq '7' "$BEFORE_LOG" || fail "before-update FETCH did not return an exact output line 7"
-wait_for_count "$CORE_LOG" "CORE DONE" 2 "$CORE_PID"
+wait_for_count "$CORE_LOG" "TX APP" 2 "$CORE_PID"
 
 printf '%s\n' \
 	'context check' \
@@ -164,7 +164,7 @@ grep -Fq 'RULE 20/8 nature=compression' "$CORE_LOG" || fail "initial Rule20 insp
 
 printf '%s\n' \
 	'rule update 20/8 fid=ipv6.app-iid tv=2 --if-match' >&3
-wait_for_line "$CORE_LOG" "RULE UPDATE 20/8 entry=9 device=2.04 local=2.04" "$CORE_PID"
+wait_for_line "$CORE_LOG" "OK update 20/8 entry=9  device=changed  local=changed" "$CORE_PID"
 
 printf '%s\n' \
 	'context check' \
@@ -177,7 +177,7 @@ schema demo-data
 fetch /demo-data:config/count
 quit"
 grep -Fxq '7' "$AFTER_LOG" || fail "after-update FETCH did not return an exact output line 7"
-wait_for_count "$CORE_LOG" "CORE DONE" 4 "$CORE_PID"
+wait_for_count "$CORE_LOG" "TX APP" 4 "$CORE_PID"
 
 printf '%s\n' quit >&3
 exec 3>&-
@@ -243,7 +243,7 @@ for sender, receiver, label in (
 ):
     require(sender == receiver, f"visible packet report mismatch for {label}")
 
-matches = re.findall(r"CONTEXT CHECK equal core_tag=(\S+) device_tag=(\S+)", core)
+matches = re.findall(r"^  core tag=(\S+)  device tag=(\S+)$", core, re.MULTILINE)
 require(len(matches) == 2, "expected pre-update and post-update equal context checks")
 require(all(core_tag == device_tag for core_tag, device_tag in matches), "context tags differ")
 require(matches[0][0] != matches[1][0], "context update did not publish a new tag")

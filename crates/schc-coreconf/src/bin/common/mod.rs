@@ -190,13 +190,22 @@ fn print_usage(process_name: &str, requires_app_bind: bool) {
     println!(
         "Usage: {process_name} --link-bind ADDR --link-peer ADDR{app} [--debug] [--once] [--sid PATH] [--sor PATH] [--device-id ID]"
     );
+    println!("Options:");
     println!("  --debug  Include structured packet and SCHC accounting in traffic reports");
+    println!("  --once   Exit after the first completed operation");
     if requires_app_bind {
-        println!("Interactive commands: context status, context check, rule list, rule get, rule update, help, quit");
+        println!("Core commands:");
+        println!("  context status");
+        println!("  context check");
+        println!("  rule list <core|device>");
+        println!("  rule get <core|device> <value>/<bits>");
+        println!("  rule duplicate <source>/<bits> <destination>/<bits> [entry=<index> tv=<value> mo=<identity> cda=<identity> ...]");
+        println!("  rule update <value>/<bits> entry=<index> tv=<value> [--if-match]");
+        println!("  rule update <value>/<bits> fid=<field> [fp=<position>] [di=<direction>] tv=<value> [--if-match]");
+        println!("  help");
+        println!("  quit");
     } else {
-        println!(
-            "The device is a service process and waits for SCHC frames from its configured peer."
-        );
+        println!("Device mode: waits for SCHC frames from its configured peer");
     }
 }
 

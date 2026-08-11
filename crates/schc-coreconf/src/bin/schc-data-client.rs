@@ -11,7 +11,7 @@ use serde_json::Value;
 
 fn main() {
     if let Err(error) = run() {
-        eprintln!("schc-data-client: error: {error}");
+        eprintln!("schc-data-client: ERROR {error}");
         std::process::exit(1);
     }
 }
@@ -35,11 +35,10 @@ fn run() -> Result<(), String> {
         .map_err(|error| format!("load application SID model: {error}"))?;
     let mut client = DataClient::connect(model, options.server, options.resource_path)
         .map_err(|error| format!("connect application endpoint: {error}"))?;
-    println!("READY role=data-client server={}", client.endpoint());
+    println!("READY client  server={}", client.endpoint());
     let interactive = io::stdin().is_terminal() && io::stdout().is_terminal();
     if interactive {
-        println!();
-        print_command_help();
+        println!("Type 'help' for commands");
         print_prompt()?;
     } else {
         io::stdout()
@@ -56,7 +55,14 @@ fn run() -> Result<(), String> {
             }
             continue;
         }
-        if execute_command(&mut client, &line)? {
+        let quit = match execute_command(&mut client, &line) {
+            Ok(quit) => quit,
+            Err(error) => {
+                println!("ERROR {error}");
+                false
+            }
+        };
+        if quit {
             break;
         }
         if interactive {
@@ -105,16 +111,16 @@ fn execute_command(client: &mut DataClient, line: &str) -> Result<bool, String> 
             )?;
             let value: Value = serde_json::from_str(json)
                 .map_err(|error| format!("invalid JSON value: {error}"))?;
-            print_mutation(client.set(path, value));
+            print_mutation("set", client.set(path, value));
         }
         "delete" => {
             let path = required_argument(rest, "delete <path>")?;
-            print_mutation(client.delete(path));
+            print_delete(client.delete(path));
         }
-        "reload" => print_json_value(client.reload()),
+        "reload" => print_reload(client.reload()),
         "help" => print_command_help(),
         "quit" => return Ok(true),
-        other => println!("error: unknown command '{other}' (use help)"),
+        other => println!("ERROR unknown command '{other}'; use help"),
     }
     Ok(false)
 }
@@ -122,14 +128,31 @@ fn execute_command(client: &mut DataClient, line: &str) -> Result<bool, String> 
 fn print_result(result: Result<String, schc_coreconf::ApplicationError>) {
     match result {
         Ok(value) => println!("{value}"),
-        Err(error) => println!("error: {error}"),
+        Err(error) => println!("ERROR {error}"),
     }
 }
 
-fn print_mutation(result: Result<(), schc_coreconf::ApplicationError>) {
+fn print_mutation(action: &str, result: Result<(), schc_coreconf::ApplicationError>) {
     match result {
-        Ok(()) => println!("changed"),
-        Err(error) => println!("error: {error}"),
+        Ok(()) => println!("OK {action}"),
+        Err(error) => println!("ERROR {error}"),
+    }
+}
+
+fn print_delete(result: Result<(), schc_coreconf::ApplicationError>) {
+    match result {
+        Ok(()) => println!("OK delete"),
+        Err(schc_coreconf::ApplicationError::Remote { code, .. }) if code == "4.04" => {
+            println!("OK delete  not-found");
+        }
+        Err(error) => println!("ERROR {error}"),
+    }
+}
+
+fn print_reload(result: Result<Value, schc_coreconf::ApplicationError>) {
+    match result {
+        Ok(_) => println!("OK reload"),
+        Err(error) => println!("ERROR {error}"),
     }
 }
 
@@ -137,21 +160,14 @@ fn print_json_result(result: Result<Option<Value>, schc_coreconf::ApplicationErr
     match result {
         Ok(Some(value)) => print_json(&value),
         Ok(None) => println!("not found"),
-        Err(error) => println!("error: {error}"),
-    }
-}
-
-fn print_json_value(result: Result<Value, schc_coreconf::ApplicationError>) {
-    match result {
-        Ok(value) => print_json(&value),
-        Err(error) => println!("error: {error}"),
+        Err(error) => println!("ERROR {error}"),
     }
 }
 
 fn print_json(value: &Value) {
     match serde_json::to_string_pretty(&value) {
         Ok(value) => println!("{value}"),
-        Err(error) => println!("error: render JSON value: {error}"),
+        Err(error) => println!("ERROR render JSON value: {error}"),
     }
 }
 

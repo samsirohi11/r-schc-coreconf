@@ -89,19 +89,16 @@ fn assert_no_stderr(process_name: &str, stderr: &str) {
     assert!(stderr.is_empty(), "{process_name} stderr: {stderr}");
 }
 
-fn context_checks(stdout: &str, result: &str) -> Vec<(String, String)> {
+fn context_checks(stdout: &str, result: &str) -> Vec<String> {
+    let expected = if result == "equal" {
+        format!("OK context check  {result}")
+    } else {
+        format!("ERROR context check  {result}")
+    };
     stdout
         .lines()
-        .filter_map(|line| {
-            let words = line.split_whitespace().collect::<Vec<_>>();
-            (words.len() >= 5 && words[0] == "CONTEXT" && words[1] == "CHECK" && words[2] == result)
-                .then(|| {
-                    (
-                        words[3].trim_start_matches("core_tag=").to_owned(),
-                        words[4].trim_start_matches("device_tag=").to_owned(),
-                    )
-                })
-        })
+        .filter(|line| *line == expected)
+        .map(str::to_owned)
         .collect()
 }
 
@@ -185,7 +182,7 @@ fn real_console_inspection_reports_remote_mismatch_and_detail() {
     assert!(core_status.success(), "core status: {core_status}");
     let (core_stdout, core_stderr) = core.output();
     assert!(core_stderr.is_empty(), "core stderr: {core_stderr}");
-    assert!(core_stdout.contains("CONTEXT CHECK mismatch core_tag="));
+    assert!(core_stdout.contains("ERROR context check  mismatch"));
     assert!(
         core_stdout.contains("TX MGMT  16/8"),
         "core stdout: {core_stdout}"
@@ -205,16 +202,7 @@ fn real_console_inspection_reports_remote_mismatch_and_detail() {
             "missing remote detail line: {line}"
         );
     }
-    let check_line = core_stdout
-        .lines()
-        .find(|line| line.starts_with("CONTEXT CHECK mismatch "))
-        .expect("mismatch line");
-    let tags = check_line.split_whitespace().collect::<Vec<_>>();
-    assert_ne!(
-        tags[3].strip_prefix("core_tag="),
-        tags[4].strip_prefix("device_tag="),
-        "context tags should differ"
-    );
+    assert!(!core_stdout.contains("core tag="));
 
     device.kill();
     let (_, device_stderr) = device.output();
@@ -235,9 +223,8 @@ fn real_console_rule_update_synchronizes_contexts_over_protected_link() {
     assert_no_stderr("core", &core_stderr);
     let equal_checks = context_checks(&core_stdout, "equal");
     assert_eq!(equal_checks.len(), 2, "core stdout: {core_stdout}");
-    assert_eq!(equal_checks[0].0, equal_checks[0].1);
-    assert_eq!(equal_checks[1].0, equal_checks[1].1);
-    assert_ne!(equal_checks[0], equal_checks[1]);
+    assert_eq!(equal_checks[0], "OK context check  equal");
+    assert_eq!(equal_checks[1], "OK context check  equal");
     assert!(
         core_stdout.contains("TX MGMT  16/8"),
         "core stdout: {core_stdout}"
@@ -247,7 +234,7 @@ fn real_console_rule_update_synchronizes_contexts_over_protected_link() {
         "core stdout: {core_stdout}"
     );
     assert!(
-        core_stdout.contains("RULE UPDATE 20/8 entry=9 device=2.04 local=2.04"),
+        core_stdout.contains("OK update 20/8 entry=9  device=changed  local=changed"),
         "core stdout: {core_stdout}"
     );
     assert!(core_stdout.contains("ENTRY 9 fid=fid-ipv6-appiid"));
@@ -272,24 +259,18 @@ fn real_console_rule_update_synchronizes_contexts_over_protected_link() {
 fn real_console_duplicate_rule_is_atomic_idempotent_and_no_response() {
     let (mut device, mut core) = start_processes(None, None);
     core.write_stdin(
-        b"context status\nrule duplicate 20/8 22/8 entry=9 tv=2\nrule duplicate 20/8 22/8 entry=9 tv=2\nrule get core 20/8\nrule get core 22/8\ncontext status\nquit\n",
+        b"context status\nrule duplicate 20/8 22/8 entry=9 tv=2\nrule duplicate 20/8 22/8 entry=9 tv=2\nrule duplicate 20/8 22/8 entry=9 tv=3\nrule get core 20/8\nrule get core 22/8\ncontext status\nquit\n",
     );
     let core_status = core.wait_timeout(Duration::from_secs(20));
     assert!(core_status.success(), "core status: {core_status}");
     let (core_stdout, core_stderr) = core.output();
     assert_no_stderr("core", &core_stderr);
-    assert!(
-        core_stdout.contains("TX MGMT  29/8"),
-        "core stdout: {core_stdout}"
-    );
-    assert!(
-        core_stdout.contains("local=installed"),
-        "core stdout: {core_stdout}"
-    );
-    assert!(
-        core_stdout.contains("local=idempotent"),
-        "core stdout: {core_stdout}"
-    );
+    assert!(core_stdout.lines().any(|line| {
+        line == "OK duplicate 20/8 -> 22/8  local=installed  remote=unacknowledged"
+    }));
+    assert!(core_stdout.lines().any(|line| {
+        line == "OK duplicate 20/8 -> 22/8  local=idempotent  remote=unacknowledged"
+    }));
     assert!(
         core_stdout.contains("RULE 22/8 nature=compression"),
         "core stdout: {core_stdout}"
@@ -306,8 +287,13 @@ fn real_console_duplicate_rule_is_atomic_idempotent_and_no_response() {
         .lines()
         .filter(|line| line.starts_with("CONTEXT generation="))
         .collect::<Vec<_>>();
-    assert_eq!(statuses.len(), 2, "core stdout: {core_stdout}");
-    assert!(statuses[1].contains("generation=2"));
+    assert_eq!(
+        statuses,
+        [
+            "CONTEXT generation=1  rules=9",
+            "CONTEXT generation=2  rules=10"
+        ]
+    );
 
     device.kill();
     let (device_stdout, device_stderr) = device.output();
@@ -317,7 +303,15 @@ fn real_console_duplicate_rule_is_atomic_idempotent_and_no_response() {
         "device stdout: {device_stdout}"
     );
     assert!(
-        device_stdout.contains("action=duplicate") && device_stdout.contains("no_response=yes"),
+        device_stdout
+            .lines()
+            .any(|line| line == "OK duplicate  local=installed  response=none")
+            && device_stdout
+                .lines()
+                .any(|line| line == "OK duplicate  local=idempotent  response=none")
+            && device_stdout
+                .lines()
+                .any(|line| line.starts_with("ERROR duplicate  local=failed")),
         "device stdout: {device_stdout}"
     );
     assert!(
@@ -343,7 +337,7 @@ fn real_console_default_rule_update_uses_dedicated_compressed_rule() {
         core_stdout.contains("RX MGMT  17/8"),
         "core stdout: {core_stdout}"
     );
-    assert!(core_stdout.contains("RULE UPDATE 20/8 entry=9 device=2.04 local=2.04"));
+    assert!(core_stdout.contains("OK update 20/8 entry=9  device=changed  local=changed"));
 
     device.kill();
     let (device_stdout, device_stderr) = device.output();
@@ -372,8 +366,8 @@ fn real_console_rule_update_rejects_stale_if_match_without_local_publication() {
     assert_no_stderr("core", &core_stderr);
     let mismatch_checks = context_checks(&core_stdout, "mismatch");
     assert_eq!(mismatch_checks.len(), 2, "core stdout: {core_stdout}");
-    assert_ne!(mismatch_checks[0].0, mismatch_checks[0].1);
-    assert_eq!(mismatch_checks[0], mismatch_checks[1]);
+    assert_eq!(mismatch_checks[0], "ERROR context check  mismatch");
+    assert_eq!(mismatch_checks[1], "ERROR context check  mismatch");
     assert!(
         core_stdout.contains("TX MGMT  16/8"),
         "core stdout: {core_stdout}"
@@ -383,31 +377,20 @@ fn real_console_rule_update_rejects_stale_if_match_without_local_publication() {
         "core stdout: {core_stdout}"
     );
     assert!(
-        core_stdout.contains("device=4.12 rejected; local=not-attempted; local=unchanged"),
+        core_stdout.contains("ERROR rule update 20/8 entry=9 device=4.12 rejected; local=not-attempted; local=unchanged"),
         "core stdout: {core_stdout}"
     );
     assert!(!core_stdout.contains("RULE UPDATE 20/8 entry=9 device=2.04"));
+    assert!(!core_stdout.contains("tag="));
     let statuses = core_stdout
         .lines()
         .filter(|line| line.starts_with("CONTEXT generation="))
         .collect::<Vec<_>>();
     assert_eq!(statuses.len(), 2, "core stdout: {core_stdout}");
-    assert!(statuses.iter().all(|line| line.contains("generation=1")));
-    assert!(statuses[0].contains("tag=") && statuses[1].contains("tag="));
-    assert_eq!(
-        statuses[0]
-            .split("tag=")
-            .nth(1)
-            .unwrap()
-            .split_whitespace()
-            .next(),
-        statuses[1]
-            .split("tag=")
-            .nth(1)
-            .unwrap()
-            .split_whitespace()
-            .next()
-    );
+    assert!(statuses
+        .iter()
+        .all(|line| *line == "CONTEXT generation=1  rules=9"));
+    assert!(statuses.iter().all(|line| !line.contains("tag=")));
 
     device.kill();
     let (device_stdout, device_stderr) = device.output();

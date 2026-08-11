@@ -14,7 +14,7 @@ use schc_coreconf::{
 
 fn main() {
     if let Err(error) = run() {
-        eprintln!("schc-coreconf-device: error: {error}");
+        eprintln!("schc-coreconf-device: ERROR {error}");
         std::process::exit(1);
     }
 }
@@ -39,8 +39,7 @@ fn run() -> Result<(), String> {
     let mut application = GenericDataService::from_files(app_sid, app_data, "c")
         .map_err(|error| format!("load application datastore: {error}"))?;
     let (raw_link, link_local) = bind_raw_link(&args, Some(DEVICE_POLL))?;
-    println!("READY role=device link={link_local}");
-    println!("WAITING role=device peer={}", args.link_peer);
+    println!("READY device  link={link_local}  peer={}", args.link_peer);
     io::stdout()
         .flush()
         .map_err(|error| format!("flush readiness: {error}"))?;
@@ -92,29 +91,19 @@ fn run() -> Result<(), String> {
                             } else {
                                 "idempotent"
                             };
-                            println!(
-                                "DEVICE PROTECTED rule={}/{} action=duplicate result={} no_response=yes generation={}",
-                                decoded.rule_id().value(),
-                                decoded.rule_id().bit_len(),
-                                result,
-                                after_generation
-                            );
+                            println!("OK duplicate  local={result}  response=none");
+                            if args.debug {
+                                println!("  generation={after_generation}");
+                            }
                         }
                         Ok(Some(_)) => {
-                            println!(
-                                "DEVICE PROTECTED rule={}/{} action=duplicate result=error error=unexpected-response no_response=yes",
-                                decoded.rule_id().value(),
-                                decoded.rule_id().bit_len()
-                            );
+                            println!("ERROR duplicate  local=failed  response=unexpected");
                         }
                         Err(error) => {
-                            println!(
-                                "DEVICE PROTECTED rule={}/{} action=duplicate result=error error={} no_response=yes generation={}",
-                                decoded.rule_id().value(),
-                                decoded.rule_id().bit_len(),
-                                error,
-                                before_generation
-                            );
+                            println!("ERROR duplicate  local=failed  response=none  cause={error}");
+                            if args.debug {
+                                println!("  generation={before_generation}");
+                            }
                         }
                     }
                     io::stdout()
@@ -150,11 +139,6 @@ fn run() -> Result<(), String> {
                 raw_link
                     .send_frame(encoded.frame())
                     .map_err(|error| format!("send management response SCHC frame: {error}"))?;
-                println!(
-                    "DEVICE PROTECTED rule={}/{} action=inspect",
-                    decoded.rule_id().value(),
-                    decoded.rule_id().bit_len()
-                );
                 io::stdout()
                     .flush()
                     .map_err(|error| format!("flush protected report: {error}"))?;
@@ -196,7 +180,6 @@ fn run() -> Result<(), String> {
                 raw_link
                     .send_frame(encoded.frame())
                     .map_err(|error| format!("send response SCHC frame: {error}"))?;
-                println!("DEVICE DONE logical_device={DEVICE_LOGICAL_ADDRESS}");
                 io::stdout()
                     .flush()
                     .map_err(|error| format!("flush operation output: {error}"))?;
