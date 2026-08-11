@@ -5,7 +5,7 @@
 //! Context checks use a compact marker and eight-byte tag because the fixed
 //! management rules do not describe an `ETag` option.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::io::Cursor;
 use std::sync::Arc;
@@ -368,6 +368,38 @@ pub struct RuleDuplicateRequest {
     pub destination: RuleSelector,
     /// Zero or more entry-index overrides.
     pub overrides: Vec<RuleDuplicateOverride>,
+}
+
+/// One decoded override shown by a duplicate-rule packet report.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct DuplicateRpcOverride {
+    /// Stable source entry index.
+    pub entry_index: usize,
+    /// Decoded target value, when the override carries one.
+    pub target_value: Option<String>,
+    /// Decoded matching-operator identity, when present.
+    pub matching_operator: Option<String>,
+    /// Decoded CDA identity, when present.
+    pub cda: Option<String>,
+}
+
+/// Read-only exact byte accounting for a modeled duplicate-rule RPC.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct DuplicateRpcCost {
+    /// Source selector.
+    pub source: RuleSelector,
+    /// Destination selector.
+    pub destination: RuleSelector,
+    /// Complete RPC payload bytes.
+    pub payload_bytes: usize,
+    /// Fixed selector and operation bytes with no overrides.
+    pub fixed_bytes: usize,
+    /// Override framing and identity bytes, excluding target contents.
+    pub variable_framing_bytes: usize,
+    /// Raw target-value contents, excluding CBOR byte-string headers.
+    pub target_value_bytes: usize,
+    /// Decoded override groups.
+    pub overrides: Vec<DuplicateRpcOverride>,
 }
 
 /// Result of processing a duplicate-rule operation.
@@ -1781,6 +1813,7 @@ enum DuplicateLeaf {
 struct DecodedDuplicateOperation {
     request: RuleDuplicateRequest,
     instances: Vec<Instance>,
+    inner_payload: Vec<u8>,
 }
 
 fn invalid_duplicate(message: impl Into<String>) -> InspectionError {
@@ -2477,7 +2510,119 @@ fn decode_duplicate_operation(
             overrides,
         },
         instances: inner_instances,
+        inner_payload: inner,
     })
+}
+
+/// Decodes the modeled duplicate RPC for read-only packet reporting.
+///
+/// This deliberately reuses the canonical duplicate decoder and never exposes
+/// mutation or publication operations.
+pub(crate) fn duplicate_rpc_cost(
+    sid_json: &str,
+    payload: &[u8],
+) -> Result<DuplicateRpcCost, InspectionError> {
+    let model = CoreconfModel::from_sid_str(sid_json)
+        .map_err(|error| InspectionError::Datastore(error.to_string()))?;
+    let operation = decode_duplicate_operation(&model, payload)?;
+    let fixed_request = RuleDuplicateRequest {
+        source: operation.request.source,
+        destination: operation.request.destination,
+        overrides: Vec::new(),
+    };
+    let fixed_payload = encode_duplicate_rpc_payload(&model, &fixed_request, &[])?;
+    let mut target_value_bytes = 0usize;
+    let mut descriptions = BTreeMap::<usize, DuplicateRpcOverride>::new();
+    let mut cursor = Cursor::new(operation.inner_payload.as_slice());
+    let mut instance_index = 0usize;
+    while usize::try_from(cursor.position())
+        .is_ok_and(|position| position < operation.inner_payload.len())
+    {
+        let value: CborValue = ciborium::de::from_reader(&mut cursor)
+            .map_err(|error| invalid_duplicate(format!("invalid override framing: {error}")))?;
+        let CborValue::Map(entries) = value else {
+            return Err(invalid_duplicate("override framing member is not a map"));
+        };
+        for (_, raw_value) in entries {
+            let instance = operation.instances.get(instance_index).ok_or_else(|| {
+                invalid_duplicate("override framing and decoded instances disagree")
+            })?;
+            instance_index += 1;
+            let (entry_index, leaf) =
+                duplicate_leaf_from_path(&instance.path, operation.request.destination)?;
+            let description =
+                descriptions
+                    .entry(entry_index)
+                    .or_insert_with(|| DuplicateRpcOverride {
+                        entry_index,
+                        target_value: None,
+                        matching_operator: None,
+                        cda: None,
+                    });
+            match leaf {
+                DuplicateLeaf::Target => {
+                    let CborValue::Bytes(bytes) = raw_value else {
+                        return Err(invalid_duplicate(
+                            "target override is not a CBOR byte string",
+                        ));
+                    };
+                    target_value_bytes = target_value_bytes
+                        .checked_add(bytes.len())
+                        .ok_or_else(|| invalid_duplicate("target-value byte cost overflow"))?;
+                    description.target_value = Some(target_bytes_label(&bytes));
+                }
+                DuplicateLeaf::MatchingOperator => {
+                    description.matching_operator = instance.value.as_ref().map(json_value_label);
+                }
+                DuplicateLeaf::Cda => {
+                    description.cda = instance.value.as_ref().map(json_value_label);
+                }
+            }
+        }
+    }
+    if instance_index != operation.instances.len() {
+        return Err(invalid_duplicate(
+            "decoded override instances were not fully accounted",
+        ));
+    }
+    let fixed_and_targets = fixed_payload
+        .len()
+        .checked_add(target_value_bytes)
+        .ok_or_else(|| invalid_duplicate("duplicate RPC byte cost overflow"))?;
+    let variable_framing_bytes = payload
+        .len()
+        .checked_sub(fixed_and_targets)
+        .ok_or_else(|| {
+            invalid_duplicate("duplicate RPC payload is smaller than fixed and target costs")
+        })?;
+    Ok(DuplicateRpcCost {
+        source: operation.request.source,
+        destination: operation.request.destination,
+        payload_bytes: payload.len(),
+        fixed_bytes: fixed_payload.len(),
+        variable_framing_bytes,
+        target_value_bytes,
+        overrides: descriptions.into_values().collect(),
+    })
+}
+
+fn json_value_label(value: &Value) -> String {
+    match value {
+        Value::String(value) => value.clone(),
+        _ => value.to_string(),
+    }
+}
+
+fn target_bytes_label(bytes: &[u8]) -> String {
+    if bytes.len() <= 8 {
+        let mut value = 0_u64;
+        for byte in bytes {
+            value = value.saturating_mul(256).saturating_add(u64::from(*byte));
+        }
+        value.to_string()
+    } else {
+        format!("{} B", bytes.len())
+    }
 }
 
 fn decode_duplicate_inner(

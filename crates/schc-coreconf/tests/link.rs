@@ -79,26 +79,25 @@ fn packet(
 #[derive(Debug)]
 struct ProcessReport {
     rule: String,
-    frame_bits: usize,
+    packet_bytes: usize,
     frame_bytes: usize,
-    packet_hex: String,
-    frame_hex: String,
 }
 
 fn process_reports(stdout: &str, prefix: &str) -> Vec<ProcessReport> {
     stdout
         .lines()
         .filter(|line| line.starts_with(prefix))
-        .map(|line| ProcessReport {
-            rule: report_field(line, "rule"),
-            frame_bits: report_field(line, "frame_bits")
-                .parse()
-                .expect("frame bits in process report"),
-            frame_bytes: report_field(line, "frame_bytes")
-                .parse()
-                .expect("frame bytes in process report"),
-            packet_hex: report_field(line, "packet_hex"),
-            frame_hex: report_field(line, "frame_hex"),
+        .map(|line| {
+            let fields = line.split_whitespace().collect::<Vec<_>>();
+            assert!(
+                fields.len() >= 8,
+                "malformed concise process report: {line}"
+            );
+            ProcessReport {
+                rule: fields[2].to_owned(),
+                packet_bytes: fields[3].parse().expect("packet bytes in process report"),
+                frame_bytes: fields[6].parse().expect("frame bytes in process report"),
+            }
         })
         .collect()
 }
@@ -242,15 +241,15 @@ fn final_real_process_demo_reuses_logical_request_and_shrinks_raw_frame() {
     let (device_stdout, device_stderr) = device.output();
     assert!(core_stderr.is_empty(), "core stderr: {core_stderr}");
     assert!(device_stderr.is_empty(), "device stderr: {device_stderr}");
-    assert!(core_stdout.contains("packet_hex="));
-    assert!(core_stdout.contains("frame_hex="));
-    assert!(device_stdout.contains("packet_hex="));
-    assert!(device_stdout.contains("frame_hex="));
+    assert!(!core_stdout.contains("packet_hex="));
+    assert!(!core_stdout.contains("frame_hex="));
+    assert!(!device_stdout.contains("packet_hex="));
+    assert!(!device_stdout.contains("frame_hex="));
 
-    let core_request_reports = process_reports(&core_stdout, "CORE TX class=Ordinary ");
-    let core_response_reports = process_reports(&core_stdout, "CORE RX class=Ordinary ");
-    let device_request_reports = process_reports(&device_stdout, "DEVICE RX class=Ordinary ");
-    let device_response_reports = process_reports(&device_stdout, "DEVICE TX class=Ordinary ");
+    let core_request_reports = process_reports(&core_stdout, "TX APP");
+    let core_response_reports = process_reports(&core_stdout, "RX APP");
+    let device_request_reports = process_reports(&device_stdout, "RX APP");
+    let device_response_reports = process_reports(&device_stdout, "TX APP");
     assert_eq!(
         core_request_reports.len(),
         4,
@@ -277,6 +276,10 @@ fn final_real_process_demo_reuses_logical_request_and_shrinks_raw_frame() {
     let device_rx = [&device_request_reports[1], &device_request_reports[3]];
     let device_tx = [&device_response_reports[1], &device_response_reports[3]];
 
+    assert!(core_stdout.contains("TX APP   25/8  63 B -> 16 B"));
+    assert!(core_stdout.contains("TX APP   20/8  63 B -> 11 B"));
+    assert!(device_stdout.contains("RX APP   25/8  63 B -> 16 B"));
+    assert!(device_stdout.contains("RX APP   20/8  63 B -> 11 B"));
     assert_eq!(core_tx[0].rule, "25/8");
     assert_eq!(
         core_tx[1].rule, "20/8",
@@ -286,7 +289,7 @@ fn final_real_process_demo_reuses_logical_request_and_shrinks_raw_frame() {
     assert_eq!(core_rx[1].rule, "21/8");
     assert_eq!(device_tx[0].rule, "21/8");
     assert_eq!(device_tx[1].rule, "21/8");
-    assert!(core_tx[1].frame_bits < core_tx[0].frame_bits);
+    assert!(core_tx[1].frame_bytes < core_tx[0].frame_bytes);
     assert_eq!(
         device_rx[0].rule, core_tx[0].rule,
         "device before reports: {device_stdout}"
@@ -295,32 +298,18 @@ fn final_real_process_demo_reuses_logical_request_and_shrinks_raw_frame() {
         device_rx[1].rule, core_tx[1].rule,
         "device after reports: {device_stdout}"
     );
-    assert_eq!(device_rx[0].frame_bits, core_tx[0].frame_bits);
-    assert_eq!(device_rx[1].frame_bits, core_tx[1].frame_bits);
+    assert_eq!(device_rx[0].packet_bytes, core_tx[0].packet_bytes);
+    assert_eq!(device_rx[1].packet_bytes, core_tx[1].packet_bytes);
+    assert_eq!(device_rx[0].frame_bytes, core_tx[0].frame_bytes);
+    assert_eq!(device_rx[1].frame_bytes, core_tx[1].frame_bytes);
+    assert_eq!(core_tx[0].packet_bytes, core_tx[1].packet_bytes);
 
     for index in 0..2 {
-        assert_eq!(core_tx[index].packet_hex, device_rx[index].packet_hex);
-        assert_eq!(core_tx[index].frame_hex, device_rx[index].frame_hex);
-        assert_eq!(
-            core_tx[index].frame_hex.len() / 2,
-            core_tx[index].frame_bytes
-        );
-        assert!(core_tx[index].frame_bits <= core_tx[index].frame_bytes * 8);
+        assert_eq!(device_tx[index].packet_bytes, core_rx[index].packet_bytes);
+        assert_eq!(device_tx[index].frame_bytes, core_rx[index].frame_bytes);
     }
-    assert_eq!(core_tx[0].packet_hex, core_tx[1].packet_hex);
-    assert_ne!(core_tx[0].frame_hex, core_tx[0].packet_hex);
-
-    for index in 0..2 {
-        assert_eq!(device_tx[index].packet_hex, core_rx[index].packet_hex);
-        assert_eq!(device_tx[index].frame_hex, core_rx[index].frame_hex);
-        assert_eq!(
-            device_tx[index].frame_hex.len() / 2,
-            device_tx[index].frame_bytes
-        );
-        assert!(device_tx[index].frame_bits <= device_tx[index].frame_bytes * 8);
-    }
-    assert_eq!(device_tx[0].packet_hex, device_tx[1].packet_hex);
-    assert_eq!(device_tx[0].packet_hex, core_rx[0].packet_hex);
+    assert_eq!(device_tx[0].packet_bytes, device_tx[1].packet_bytes);
+    assert_eq!(device_tx[0].packet_bytes, core_rx[0].packet_bytes);
 
     let tags = equal_context_tags(&core_stdout);
     assert_eq!(tags.len(), 2, "context checks: {core_stdout}");
@@ -415,31 +404,30 @@ fn final_real_process_duplicate_rule_selects_new_rule_without_ack() {
         "device output: {device_stdout}"
     );
     assert_eq!(
-        device_stdout.matches("DEVICE MGMT TX").count(),
+        device_stdout.matches("TX MGMT").count(),
         2,
         "device management query responses: {device_stdout}"
     );
-    let core_tx = process_reports(&core_stdout, "CORE TX class=Ordinary ");
-    let core_rx = process_reports(&core_stdout, "CORE RX class=Ordinary ");
-    let device_rx = process_reports(&device_stdout, "DEVICE RX class=Ordinary ");
-    let device_tx = process_reports(&device_stdout, "DEVICE TX class=Ordinary ");
+    let core_tx = process_reports(&core_stdout, "TX APP");
+    let core_rx = process_reports(&core_stdout, "RX APP");
+    let device_rx = process_reports(&device_stdout, "RX APP");
+    let device_tx = process_reports(&device_stdout, "TX APP");
     assert_eq!(core_tx.len(), 2, "core output: {core_stdout}");
     assert_eq!(core_rx.len(), 2, "core output: {core_stdout}");
     assert_eq!(device_rx.len(), 2, "device output: {device_stdout}");
     assert_eq!(device_tx.len(), 2, "device output: {device_stdout}");
-    println!("DUP_APP_BEFORE_BITS={} BYTES={} AFTER_BITS={} BYTES={} PACKET_HEX={} FRAME_BEFORE={} FRAME_AFTER={}", core_tx[0].frame_bits, core_tx[0].frame_bytes, core_tx[1].frame_bits, core_tx[1].frame_bytes, core_tx[0].packet_hex, core_tx[0].frame_hex, core_tx[1].frame_hex);
     assert_eq!(core_tx[0].rule, "25/8");
     assert_eq!(core_tx[1].rule, "22/8");
-    assert!(core_tx[1].frame_bits < core_tx[0].frame_bits);
-    assert_eq!(core_tx[0].packet_hex, core_tx[1].packet_hex);
-    assert_eq!(core_tx[0].frame_hex, device_rx[0].frame_hex);
-    assert_eq!(core_tx[1].frame_hex, device_rx[1].frame_hex);
-    assert_eq!(core_tx[0].packet_hex, device_rx[0].packet_hex);
-    assert_eq!(core_tx[1].packet_hex, device_rx[1].packet_hex);
-    assert_eq!(device_tx[0].frame_hex, core_rx[0].frame_hex);
-    assert_eq!(device_tx[1].frame_hex, core_rx[1].frame_hex);
-    assert_eq!(device_tx[0].packet_hex, core_rx[0].packet_hex);
-    assert_eq!(device_tx[1].packet_hex, core_rx[1].packet_hex);
+    assert!(core_tx[1].frame_bytes < core_tx[0].frame_bytes);
+    assert_eq!(core_tx[0].packet_bytes, core_tx[1].packet_bytes);
+    assert_eq!(core_tx[0].packet_bytes, device_rx[0].packet_bytes);
+    assert_eq!(core_tx[1].packet_bytes, device_rx[1].packet_bytes);
+    assert_eq!(core_tx[0].frame_bytes, device_rx[0].frame_bytes);
+    assert_eq!(core_tx[1].frame_bytes, device_rx[1].frame_bytes);
+    assert_eq!(device_tx[0].frame_bytes, core_rx[0].frame_bytes);
+    assert_eq!(device_tx[1].frame_bytes, core_rx[1].frame_bytes);
+    assert_eq!(device_tx[0].packet_bytes, core_rx[0].packet_bytes);
+    assert_eq!(device_tx[1].packet_bytes, core_rx[1].packet_bytes);
     assert_eq!(core_rx[0].rule, "21/8");
     assert_eq!(core_rx[1].rule, "21/8");
 }
@@ -1172,13 +1160,13 @@ fn real_core_and_device_processes_complete_one_ordinary_operation() {
     let (device_stdout, device_stderr) = device.output();
     assert!(core_stderr.is_empty(), "core stderr: {core_stderr}");
     assert!(device_stderr.is_empty(), "device stderr: {device_stderr}");
-    assert!(core_stdout.contains("CORE TX class=Ordinary rule=25/8 packet_bytes="));
+    assert!(core_stdout.contains("TX APP   25/8"));
     assert!(
-        core_stdout.contains("CORE RX class=Ordinary rule=25/8 packet_bytes="),
+        core_stdout.contains("RX APP   25/8"),
         "core stdout: {core_stdout}"
     );
-    assert!(device_stdout.contains("DEVICE RX class=Ordinary rule=25/8 packet_bytes="));
-    assert!(device_stdout.contains("DEVICE TX class=Ordinary rule=25/8 packet_bytes="));
+    assert!(device_stdout.contains("RX APP   25/8"));
+    assert!(device_stdout.contains("TX APP   25/8"));
 }
 
 #[test]
@@ -1256,8 +1244,8 @@ fn real_three_process_data_client_discovers_and_fetches() {
     let (device_stdout, device_stderr) = device.output();
     assert!(core_stderr.is_empty(), "core stderr: {core_stderr}");
     assert!(device_stderr.is_empty(), "device stderr: {device_stderr}");
-    assert!(core_stdout.contains("CORE TX class=Ordinary"));
-    assert!(device_stdout.contains("DEVICE RX class=Ordinary"));
+    assert!(core_stdout.contains("TX APP"));
+    assert!(device_stdout.contains("RX APP"));
     assert!(!core_stdout.contains("packet_hex="));
     assert!(!core_stdout.contains("frame_hex="));
     assert!(!device_stdout.contains("packet_hex="));

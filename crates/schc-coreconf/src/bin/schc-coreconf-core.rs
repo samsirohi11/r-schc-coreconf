@@ -139,7 +139,11 @@ fn run() -> Result<(), String> {
         let encoded = link
             .encode(TrafficOrigin::Application, &request)
             .map_err(|error| format!("encode ordinary request: {error}"))?;
-        print_report("CORE TX", encoded.report(), args.debug);
+        print_report(
+            schc_coreconf::ReportDirection::Tx,
+            encoded.report(),
+            args.debug,
+        )?;
         raw_link
             .send_frame(encoded.frame())
             .map_err(|error| format!("send request SCHC frame: {error}"))?;
@@ -150,7 +154,11 @@ fn run() -> Result<(), String> {
         let decoded = link
             .decode(received.bytes())
             .map_err(|error| format!("decode response SCHC frame: {error}"))?;
-        print_report("CORE RX", decoded.report(), args.debug);
+        print_report(
+            schc_coreconf::ReportDirection::Rx,
+            decoded.report(),
+            args.debug,
+        )?;
         if decoded.route() != TrafficRoute::Application {
             return Err("protected response reached the ordinary core path".to_owned());
         }
@@ -284,7 +292,7 @@ fn handle_command(
                         encoded.report().rule_id.bit_len()
                     ));
                 }
-                print_report("CORE MGMT TX", encoded.report(), debug);
+                print_report(schc_coreconf::ReportDirection::Tx, encoded.report(), debug)?;
                 raw_link
                     .send_frame(encoded.frame())
                     .map_err(|error| error.to_string())
@@ -305,8 +313,16 @@ fn handle_command(
             |datagram| {
                 let (code, exchange) = exchange_management_update(link, raw_link, datagram)
                     .map_err(|error| error.to_string())?;
-                print_report("CORE MGMT TX", &exchange.request_report, debug);
-                print_report("CORE MGMT RX", &exchange.response_report, debug);
+                print_report(
+                    schc_coreconf::ReportDirection::Tx,
+                    &exchange.request_report,
+                    debug,
+                )?;
+                print_report(
+                    schc_coreconf::ReportDirection::Rx,
+                    &exchange.response_report,
+                    debug,
+                )?;
                 Ok(code)
             },
             |service, datagram| {
@@ -340,8 +356,16 @@ fn handle_command(
         let coap = context_check_request(tag, message_id, &[]);
         let exchange = exchange_management(link, raw_link, &coap)
             .map_err(|error| format!("context check failed: {error}"))?;
-        print_report("CORE MGMT TX", &exchange.request_report, debug);
-        print_report("CORE MGMT RX", &exchange.response_report, debug);
+        print_report(
+            schc_coreconf::ReportDirection::Tx,
+            &exchange.request_report,
+            debug,
+        )?;
+        print_report(
+            schc_coreconf::ReportDirection::Rx,
+            &exchange.response_report,
+            debug,
+        )?;
         let result = decode_context_check_payload(&exchange.payload, tag)
             .map_err(|error| format!("context check response failed: {error}"))?;
         println!(
@@ -375,8 +399,16 @@ fn handle_command(
             .map_err(|error| format!("device rule list failed: {error}"))?;
         let summaries = decode_rule_list_payload(&exchange.payload, inspection.model())
             .map_err(|error| format!("device rule list response failed: {error}"))?;
-        print_report("CORE MGMT TX", &exchange.request_report, debug);
-        print_report("CORE MGMT RX", &exchange.response_report, debug);
+        print_report(
+            schc_coreconf::ReportDirection::Tx,
+            &exchange.request_report,
+            debug,
+        )?;
+        print_report(
+            schc_coreconf::ReportDirection::Rx,
+            &exchange.response_report,
+            debug,
+        )?;
         for line in format_rule_list(&summaries) {
             println!("{line}");
         }
@@ -404,8 +436,16 @@ fn handle_command(
                 selector,
             )
             .map_err(|error| format!("device rule get response failed: {error}"))?;
-            print_report("CORE MGMT TX", &exchange.request_report, debug);
-            print_report("CORE MGMT RX", &exchange.response_report, debug);
+            print_report(
+                schc_coreconf::ReportDirection::Tx,
+                &exchange.request_report,
+                debug,
+            )?;
+            print_report(
+                schc_coreconf::ReportDirection::Rx,
+                &exchange.response_report,
+                debug,
+            )?;
             for line in format_rule_detail(&detail) {
                 println!("{line}");
             }

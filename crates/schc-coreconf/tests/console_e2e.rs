@@ -187,10 +187,10 @@ fn real_console_inspection_reports_remote_mismatch_and_detail() {
     assert!(core_stderr.is_empty(), "core stderr: {core_stderr}");
     assert!(core_stdout.contains("CONTEXT CHECK mismatch core_tag="));
     assert!(
-        core_stdout.contains("CORE MGMT TX class=ProtectedManagement rule=16/8"),
+        core_stdout.contains("TX MGMT  16/8"),
         "core stdout: {core_stdout}"
     );
-    assert!(core_stdout.contains("CORE MGMT RX class=ProtectedManagement rule=17/8"));
+    assert!(core_stdout.contains("RX MGMT  17/8"));
     assert!(core_stdout.contains("RULE 16/8 nature=compression"));
     assert!(core_stdout.contains("RULE 20/8 nature=compression"));
     for line in initial_lines {
@@ -239,11 +239,11 @@ fn real_console_rule_update_synchronizes_contexts_over_protected_link() {
     assert_eq!(equal_checks[1].0, equal_checks[1].1);
     assert_ne!(equal_checks[0], equal_checks[1]);
     assert!(
-        core_stdout.contains("CORE MGMT TX class=ProtectedManagement rule=16/8"),
+        core_stdout.contains("TX MGMT  16/8"),
         "core stdout: {core_stdout}"
     );
     assert!(
-        core_stdout.contains("CORE MGMT RX class=ProtectedManagement rule=17/8"),
+        core_stdout.contains("RX MGMT  17/8"),
         "core stdout: {core_stdout}"
     );
     assert!(
@@ -258,11 +258,11 @@ fn real_console_rule_update_synchronizes_contexts_over_protected_link() {
     let (device_stdout, device_stderr) = device.output();
     assert_no_stderr("device", &device_stderr);
     assert!(
-        device_stdout.contains("DEVICE RX class=ProtectedManagement rule=16/8"),
+        device_stdout.contains("RX MGMT  16/8"),
         "device stdout: {device_stdout}"
     );
     assert!(
-        device_stdout.contains("DEVICE MGMT TX class=ProtectedManagement rule=17/8"),
+        device_stdout.contains("TX MGMT  17/8"),
         "device stdout: {device_stdout}"
     );
 }
@@ -279,7 +279,7 @@ fn real_console_duplicate_rule_is_atomic_idempotent_and_no_response() {
     let (core_stdout, core_stderr) = core.output();
     assert_no_stderr("core", &core_stderr);
     assert!(
-        core_stdout.contains("CORE MGMT TX class=ProtectedManagement rule=29/8"),
+        core_stdout.contains("TX MGMT  29/8"),
         "core stdout: {core_stdout}"
     );
     assert!(
@@ -313,7 +313,7 @@ fn real_console_duplicate_rule_is_atomic_idempotent_and_no_response() {
     let (device_stdout, device_stderr) = device.output();
     assert_no_stderr("device", &device_stderr);
     assert!(
-        device_stdout.contains("DEVICE RX class=ProtectedManagement rule=29/8"),
+        device_stdout.contains("RX MGMT  29/8"),
         "device stdout: {device_stdout}"
     );
     assert!(
@@ -321,7 +321,7 @@ fn real_console_duplicate_rule_is_atomic_idempotent_and_no_response() {
         "device stdout: {device_stdout}"
     );
     assert!(
-        !device_stdout.contains("DEVICE MGMT TX"),
+        !device_stdout.contains("TX MGMT"),
         "device unexpectedly sent a response: {device_stdout}"
     );
 }
@@ -336,11 +336,11 @@ fn real_console_default_rule_update_uses_dedicated_compressed_rule() {
     let (core_stdout, core_stderr) = core.output();
     assert_no_stderr("core", &core_stderr);
     assert!(
-        core_stdout.contains("CORE MGMT TX class=ProtectedManagement rule=27/8"),
+        core_stdout.contains("TX MGMT  27/8"),
         "core stdout: {core_stdout}"
     );
     assert!(
-        core_stdout.contains("CORE MGMT RX class=ProtectedManagement rule=17/8"),
+        core_stdout.contains("RX MGMT  17/8"),
         "core stdout: {core_stdout}"
     );
     assert!(core_stdout.contains("RULE UPDATE 20/8 entry=9 device=2.04 local=2.04"));
@@ -349,11 +349,11 @@ fn real_console_default_rule_update_uses_dedicated_compressed_rule() {
     let (device_stdout, device_stderr) = device.output();
     assert_no_stderr("device", &device_stderr);
     assert!(
-        device_stdout.contains("DEVICE RX class=ProtectedManagement rule=27/8"),
+        device_stdout.contains("RX MGMT  27/8"),
         "device stdout: {device_stdout}"
     );
     assert!(
-        device_stdout.contains("DEVICE MGMT TX class=ProtectedManagement rule=17/8"),
+        device_stdout.contains("TX MGMT  17/8"),
         "device stdout: {device_stdout}"
     );
 }
@@ -375,11 +375,11 @@ fn real_console_rule_update_rejects_stale_if_match_without_local_publication() {
     assert_ne!(mismatch_checks[0].0, mismatch_checks[0].1);
     assert_eq!(mismatch_checks[0], mismatch_checks[1]);
     assert!(
-        core_stdout.contains("CORE MGMT TX class=ProtectedManagement rule=16/8"),
+        core_stdout.contains("TX MGMT  16/8"),
         "core stdout: {core_stdout}"
     );
     assert!(
-        core_stdout.contains("CORE MGMT RX class=ProtectedManagement rule=17/8"),
+        core_stdout.contains("RX MGMT  17/8"),
         "core stdout: {core_stdout}"
     );
     assert!(
@@ -413,11 +413,11 @@ fn real_console_rule_update_rejects_stale_if_match_without_local_publication() {
     let (device_stdout, device_stderr) = device.output();
     assert_no_stderr("device", &device_stderr);
     assert!(
-        device_stdout.contains("DEVICE RX class=ProtectedManagement rule=16/8"),
+        device_stdout.contains("RX MGMT  16/8"),
         "device stdout: {device_stdout}"
     );
     assert!(
-        device_stdout.contains("DEVICE MGMT TX class=ProtectedManagement rule=17/8"),
+        device_stdout.contains("TX MGMT  17/8"),
         "device stdout: {device_stdout}"
     );
 }

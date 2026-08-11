@@ -61,7 +61,11 @@ fn run() -> Result<(), String> {
         let decoded = link
             .decode(received.bytes())
             .map_err(|error| format!("decode request SCHC frame: {error}"))?;
-        print_report("DEVICE RX", decoded.report(), args.debug);
+        print_report(
+            schc_coreconf::ReportDirection::Rx,
+            decoded.report(),
+            args.debug,
+        )?;
         match decoded.route() {
             TrafficRoute::ProtectedManagement => {
                 let request = decoded.packet();
@@ -138,7 +142,11 @@ fn run() -> Result<(), String> {
                 if encoded.report().rule_id != schc_core::RuleId::new(17, 8) {
                     return Err("management response did not select RuleID 17/8".to_owned());
                 }
-                print_report("DEVICE MGMT TX", encoded.report(), args.debug);
+                print_report(
+                    schc_coreconf::ReportDirection::Tx,
+                    encoded.report(),
+                    args.debug,
+                )?;
                 raw_link
                     .send_frame(encoded.frame())
                     .map_err(|error| format!("send management response SCHC frame: {error}"))?;
@@ -180,7 +188,11 @@ fn run() -> Result<(), String> {
                 let encoded = link
                     .encode(TrafficOrigin::Application, &response)
                     .map_err(|error| format!("encode ordinary response: {error}"))?;
-                print_report("DEVICE TX", encoded.report(), args.debug);
+                print_report(
+                    schc_coreconf::ReportDirection::Tx,
+                    encoded.report(),
+                    args.debug,
+                )?;
                 raw_link
                     .send_frame(encoded.frame())
                     .map_err(|error| format!("send response SCHC frame: {error}"))?;

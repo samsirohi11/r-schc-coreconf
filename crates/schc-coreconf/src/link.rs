@@ -102,6 +102,8 @@ pub struct LinkReport {
     /// This is retained in reports rather than inferred from a `RuleID` so the
     /// diagnostic breakdown cannot silently become stale when a rule changes.
     pub(crate) management_rule: Option<Rule>,
+    /// SID model source used lazily for debug-only duplicate-RPC reporting.
+    pub(crate) management_rpc_sid: Option<Arc<str>>,
 }
 
 impl LinkReport {
@@ -123,6 +125,7 @@ impl LinkReport {
         packet: &[u8],
         frame: &SchcFrame,
         management_rule: Option<Rule>,
+        management_rpc_sid: Option<Arc<str>>,
     ) -> Self {
         Self {
             operation: LinkOperation::Encode,
@@ -135,9 +138,11 @@ impl LinkReport {
             schc_bit_len: Some(frame.bit_len()),
             padded_byte_len: frame.bytes().len(),
             management_rule,
+            management_rpc_sid,
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn decoded(
         generation: u64,
         rule_id: RuleId,
@@ -146,6 +151,7 @@ impl LinkReport {
         frame: &[u8],
         bit_len: usize,
         management_rule: Option<Rule>,
+        management_rpc_sid: Option<Arc<str>>,
     ) -> Self {
         Self {
             operation: LinkOperation::Decode,
@@ -161,6 +167,7 @@ impl LinkReport {
             schc_bit_len: Some(bit_len),
             padded_byte_len: frame.len(),
             management_rule,
+            management_rpc_sid,
         }
     }
 }
@@ -360,6 +367,8 @@ impl SchcLink {
                     .cloned()
             })
             .flatten();
+        let management_rpc_sid = (encoded.rule_id() == RuleId::new(29, 8))
+            .then(|| Arc::clone(&self.active.recipe().sid_json));
         let report = LinkReport::encoded(
             snapshot.generation(),
             encoded.rule_id(),
@@ -367,6 +376,7 @@ impl SchcLink {
             packet.as_bytes(),
             encoded.frame(),
             management_rule,
+            management_rpc_sid,
         );
         Ok(LinkEncoding {
             frame: encoded.into_frame(),
@@ -436,6 +446,8 @@ impl SchcLink {
                     .cloned()
             })
             .flatten();
+        let management_rpc_sid = (decoded.rule_id() == RuleId::new(29, 8))
+            .then(|| Arc::clone(&self.active.recipe().sid_json));
         let report = LinkReport::decoded(
             snapshot.generation(),
             decoded.rule_id(),
@@ -444,6 +456,7 @@ impl SchcLink {
             frame,
             canonical.frame().bit_len(),
             management_rule,
+            management_rpc_sid,
         );
         Ok(LinkDecoded {
             packet,

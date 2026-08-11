@@ -80,19 +80,21 @@ The script performs discovery, schema inspection, and a FETCH before the update.
 It inspects the initial context and confirms Rule 20 has `IPV6.APP_IID` value `0x0000000000000005`.
 It applies `rule update 20/8 fid=ipv6.app-iid tv=2 --if-match` through the protected management link.
 It verifies equal compact context tags and repeats the exact same FETCH afterward.
-It compares packet bytes, SCHC bit counts, RuleIDs, and sender-to-receiver raw frame bytes from both directions.
+It compares visible RuleIDs, original and transmitted sizes, application results, context behavior, and completion across both directions.
+Raw packet and frame equality remains covered by Rust tests where the bytes are directly available; the shell demonstration does not claim to observe raw sender-to-receiver equality.
 
 A successful run prints proof lines similar to:
 
 ```text
-DEMO PROOF request_packet_identical=yes
-DEMO PROOF response_packet_identical=yes
+DEMO PROOF request_original_bytes=...
+DEMO PROOF request_transmitted_bytes_before=... request_transmitted_bytes_after=...
 DEMO PROOF request_rule_before=25/8 request_rule_after=20/8
-DEMO PROOF request_schc_bits_before=... request_schc_bits_after=...
-DEMO PROOF response_rule=21/8
+DEMO PROOF response_original_bytes=... response_transmitted_bytes=...
+DEMO PROOF visible_sender_receiver_reports_match=yes
+DEMO PROOF raw_sender_receiver_equality=not-observed
+DEMO PROOF application_result_before=7 application_result_after=7
 DEMO PROOF context_tags_equal=yes tag=...
 DEMO PROOF context_tag_changed=yes
-DEMO PROOF raw_padded_frames_sender_receiver_match=yes
 DEMO COMPLETE localhost_udp=yes root_required=no
 ```
 
@@ -109,10 +111,11 @@ The core prompt is `core>` and the data client prompt is `data>`.
 Both processes also accept `help` at any time.
 The device is a background service and prints `WAITING role=device` while it waits for frames.
 
-Traffic reports are concise by default and include the selected RuleID, packet size, SCHC bit count, padded frame size, and compression ratio.
-Protected management reports also expose RuleID, code-mapping, MID, transport overhead, payload, payload-length, dynamic-option, padding, and unaccounted residue bits.
-Pass `--debug` to `schc-coreconf-core` or `schc-coreconf-device` when full `packet_hex` and `frame_hex` fields are needed for wire-level diagnosis.
-The final demonstration script enables this mode automatically for its proof checks.
+Traffic reports are concise by default and use one deterministic line such as `TX APP   69/8  69 B -> 11 B`.
+The line contains direction, traffic class, RuleID, original packet bytes, and padded transmitted bytes.
+Pass `--debug` to `schc-coreconf-core` or `schc-coreconf-device` for the same line followed by a structured IPv6, UDP, CoAP, RPC, and SCHC accounting block.
+Debug output is plain ASCII and intentionally omits raw packet and frame hexadecimal.
+The final demonstration script enables this mode automatically for its visible proof checks.
 
 The core command list is:
 
@@ -149,14 +152,12 @@ quit
 ## Duplicate-rule measurement
 
 The dedicated duplicate-rule request uses protected M Rule `29/8`.
-For `rule duplicate 20/8 22/8 entry=9 tv=2`, the complete modeled RPC payload is 43 bytes:
-`a1190a78a101a301a2010802140456a189190a0e171608170909000248000000000000000205a201080216`.
+For `rule duplicate 20/8 22/8 entry=9 tv=2`, the complete modeled RPC payload is 43 bytes.
 The fixed payload with only source and destination selectors is 19 bytes.
 The one override's inner CORECONF instance map is 22 bytes, comprising 14 bytes of selector/structure and 8 encoded target-value bytes.
-The complete logical IPv6/UDP/CoAP packet is 103 bytes:
-`60000000003f114020010db800000000000000000000000220010db800000000000000000000000122142214003f3c1850020025b473636863118effa1190a78a101a301a2010802140456a189190a0e171608170909000248000000000000000205a201080216`.
-Its meaningful SCHC frame is 371 bits and its padded link frame is 47 bytes:
-`1d4be57423214f142034603440210042808ad431232141c2e2c102e121200049000000000000000040b440210042c0`.
+The complete logical IPv6/UDP/CoAP packet is 103 bytes.
+Its meaningful SCHC frame is 371 bits and its padded link frame is 47 bytes.
+The decoded RPC cost is 43 bytes: fixed 19 bytes, variable framing 16 bytes, and target-value contents 8 bytes.
 The breakdown is 8 RuleID bits, 7 MID residue bits, zero method/type/path/content-format residue bits, 12 payload-length bits, 344 payload bits, and 5 padding bits.
 The fixed management transport overhead is therefore 15 bits.
 A successful duplicate management measurement must account for all meaningful residue bits; unaccounted residue is an error.
@@ -165,7 +166,7 @@ The application request is 128 meaningful SCHC bits and 16 padded bytes with fal
 After duplication it is 82 meaningful bits and 11 padded bytes with Rule `22/8`.
 The saving is 46 meaningful bits per packet.
 The management break-even count is `ceil(371 / 46) = 9` application packets.
-The process test verifies identical logical packets, sender/receiver frame bytes in both directions, application delivery, source immutability, idempotent replay, and no duplicate-rule response.
+Rust packet/link tests verify exact logical packet and frame bytes where those bytes are directly available, along with application delivery, source immutability, idempotent replay, and no duplicate-rule response.
 
 ## Manual process commands
 

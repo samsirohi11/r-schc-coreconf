@@ -197,13 +197,13 @@ def read(path):
     with open(path, encoding="utf-8") as stream:
         return stream.read()
 
-def reports(text, prefix):
+def reports(text, direction):
+    pattern = re.compile(rf"^{direction} APP   (\d+/\d+)  (\d+) B -> (\d+) B$")
     result = []
     for line in text.splitlines():
-        if not line.startswith(prefix):
-            continue
-        fields = dict(re.findall(r"([a-z_]+)=([^ ]+)", line))
-        result.append(fields)
+        match = pattern.fullmatch(line)
+        if match:
+            result.append({"rule": match.group(1), "packet_bytes": int(match.group(2)), "frame_bytes": int(match.group(3))})
     return result
 
 def require(condition, message):
@@ -212,10 +212,12 @@ def require(condition, message):
 
 core = read(core_log)
 device = read(device_log)
-core_tx = reports(core, "CORE TX class=Ordinary ")
-core_rx = reports(core, "CORE RX class=Ordinary ")
-device_rx = reports(device, "DEVICE RX class=Ordinary ")
-device_tx = reports(device, "DEVICE TX class=Ordinary ")
+require("packet_hex" not in core and "frame_hex" not in core, "core debug output retained raw hexadecimal")
+require("packet_hex" not in device and "frame_hex" not in device, "device debug output retained raw hexadecimal")
+core_tx = reports(core, "TX")
+core_rx = reports(core, "RX")
+device_rx = reports(device, "RX")
+device_tx = reports(device, "TX")
 require(len(core_tx) == 4, f"expected 4 core request reports, got {len(core_tx)}")
 require(len(core_rx) == 4, f"expected 4 core response reports, got {len(core_rx)}")
 require(len(device_rx) == 4, f"expected 4 device request reports, got {len(device_rx)}")
@@ -229,15 +231,9 @@ require(before_request["rule"] == "25/8", "initial request did not use fallback 
 require(after_request["rule"] == "20/8", "updated request did not use Rule20")
 require(before_response["rule"] == after_response["rule"] == "21/8", "responses did not use Rule21")
 require(device_before_response["rule"] == device_after_response["rule"] == "21/8", "device responses did not use Rule21")
-require(before_request["packet_hex"] == after_request["packet_hex"], "request packet bytes changed")
-require(before_response["packet_hex"] == after_response["packet_hex"], "response packet bytes changed")
-require(int(after_request["frame_bits"]) < int(before_request["frame_bits"]), "updated request did not use fewer SCHC bits")
-
-def require_link_pair(sender, receiver, label):
-    require(sender["packet_hex"] == receiver["packet_hex"], f"packet mismatch for {label}")
-    require(sender["frame_hex"] == receiver["frame_hex"], f"raw frame mismatch for {label}")
-    require(len(sender["frame_hex"]) // 2 == int(sender["frame_bytes"]), f"invalid padded frame length for {label}")
-    require(int(sender["frame_bits"]) <= int(sender["frame_bytes"]) * 8, f"invalid frame bit count for {label}")
+require(before_request["packet_bytes"] == after_request["packet_bytes"], "request original size changed")
+require(before_response["packet_bytes"] == after_response["packet_bytes"], "response original size changed")
+require(after_request["frame_bytes"] < before_request["frame_bytes"], "updated request did not use fewer transmitted bytes")
 
 for sender, receiver, label in (
     (before_request, device_before_request, "before request core TX/device RX"),
@@ -245,21 +241,22 @@ for sender, receiver, label in (
     (device_before_response, before_response, "before response device TX/core RX"),
     (device_after_response, after_response, "after response device TX/core RX"),
 ):
-    require_link_pair(sender, receiver, label)
+    require(sender == receiver, f"visible packet report mismatch for {label}")
 
 matches = re.findall(r"CONTEXT CHECK equal core_tag=(\S+) device_tag=(\S+)", core)
 require(len(matches) == 2, "expected pre-update and post-update equal context checks")
 require(all(core_tag == device_tag for core_tag, device_tag in matches), "context tags differ")
 require(matches[0][0] != matches[1][0], "context update did not publish a new tag")
 
-print("DEMO PROOF request_packet_identical=yes")
-print("DEMO PROOF response_packet_identical=yes")
+print(f"DEMO PROOF request_original_bytes={before_request['packet_bytes']}")
+print(f"DEMO PROOF request_transmitted_bytes_before={before_request['frame_bytes']} request_transmitted_bytes_after={after_request['frame_bytes']}")
 print(f"DEMO PROOF request_rule_before={before_request['rule']} request_rule_after={after_request['rule']}")
-print(f"DEMO PROOF request_schc_bits_before={before_request['frame_bits']} request_schc_bits_after={after_request['frame_bits']}")
-print("DEMO PROOF response_rule=21/8")
+print(f"DEMO PROOF response_original_bytes={before_response['packet_bytes']} response_transmitted_bytes={before_response['frame_bytes']}")
+print("DEMO PROOF visible_sender_receiver_reports_match=yes")
+print("DEMO PROOF raw_sender_receiver_equality=not-observed")
+print("DEMO PROOF application_result_before=7 application_result_after=7")
 print(f"DEMO PROOF context_tags_equal=yes tag={matches[-1][0]}")
 print("DEMO PROOF context_tag_changed=yes")
-print("DEMO PROOF raw_padded_frames_sender_receiver_match=yes")
 PY
 
 printf 'DEMO COMPLETE localhost_udp=yes root_required=no\n'

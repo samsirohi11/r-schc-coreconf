@@ -7,8 +7,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use schc_coreconf::{
-    management_bit_breakdown, protected_management_rule_ids, ActiveContext, LinkReport,
-    PreparedContext, ProtectionPolicy, RawUdpLink,
+    format_report, protected_management_rule_ids, ActiveContext, LinkReport, PreparedContext,
+    ProtectionPolicy, RawUdpLink, ReportDirection,
 };
 use schc_runtime::{DeviceId, DeviceProfile};
 
@@ -152,56 +152,16 @@ pub(crate) fn bind_raw_link(
     Ok((raw_link, local))
 }
 
-pub(crate) fn print_report(prefix: &str, report: &LinkReport, debug: bool) {
-    let bit_len = report
-        .schc_bit_len
-        .map_or_else(|| "unknown".to_owned(), |bits| bits.to_string());
-    let ratio = report
-        .compression_ratio()
-        .map_or_else(|| "unknown".to_owned(), |value| format!("{value:.3}"));
+pub(crate) fn print_report(
+    direction: ReportDirection,
+    report: &LinkReport,
+    debug: bool,
+) -> Result<(), String> {
     print!(
-        "{prefix} class={:?} rule={}/{} packet_bytes={} frame_bits={} frame_bytes={} ratio={ratio}",
-        report.traffic_class,
-        report.rule_id.value(),
-        report.rule_id.bit_len(),
-        report.packet_size,
-        bit_len,
-        report.padded_byte_len,
+        "{}",
+        format_report(direction, report, debug).map_err(|error| error.to_string())?
     );
-    if debug {
-        print!(
-            " packet_hex={} frame_hex={}",
-            hex_bytes(&report.packet_bytes),
-            hex_bytes(&report.frame_bytes)
-        );
-    }
-    if report.traffic_class == schc_coreconf::TrafficClass::ProtectedManagement {
-        if let Ok(breakdown) = management_bit_breakdown(report) {
-            print!(
-                " rule_id_bits={} code_mapping_bits={} mid_residue_bits={} transport_overhead_bits={} payload_bits={} payload_length_bits={} option_residue_bits={} byte_padding_bits={} unaccounted_residue_bits={}",
-                breakdown.rule_id_bits,
-                breakdown.method_or_response_mapping_bits,
-                breakdown.mid_residue_bits,
-                breakdown.transport_residue_bits(),
-                breakdown.payload_bits,
-                breakdown.payload_length_bits,
-                breakdown.option_residue_bits,
-                breakdown.byte_padding_bits,
-                breakdown.unaccounted_residue_bits,
-            );
-        }
-    }
-    println!();
-}
-
-fn hex_bytes(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut output = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        output.push(HEX[usize::from(byte >> 4)] as char);
-        output.push(HEX[usize::from(byte & 0x0f)] as char);
-    }
-    output
+    Ok(())
 }
 
 fn load_text(path: Option<&Path>, default: &str) -> Result<String, String> {
@@ -230,7 +190,7 @@ fn print_usage(process_name: &str, requires_app_bind: bool) {
     println!(
         "Usage: {process_name} --link-bind ADDR --link-peer ADDR{app} [--debug] [--once] [--sid PATH] [--sor PATH] [--device-id ID]"
     );
-    println!("  --debug  Include complete logical-packet and raw-frame hex in traffic reports");
+    println!("  --debug  Include structured packet and SCHC accounting in traffic reports");
     if requires_app_bind {
         println!("Interactive commands: context status, context check, rule list, rule get, rule update, help, quit");
     } else {

@@ -15,6 +15,7 @@ mod link;
 mod management;
 mod packet;
 mod policy;
+mod report;
 
 pub use application::{schema_lines, ApplicationError, DataClient, GenericDataService};
 pub use context::{
@@ -32,10 +33,10 @@ pub use management::{
     exchange_management_update, format_rule_detail, format_rule_list, is_duplicate_rule_request,
     management_bit_breakdown, parse_rule_duplicate_command, parse_rule_selector,
     parse_rule_update_command, rule_get_request, rule_list_request, ContextCheckResult,
-    ContextStatus, DuplicateRuleResult, InspectionError, InspectionService, ManagementBitBreakdown,
-    ManagementExchange, ResolvedRuleUpdate, RuleDetail, RuleDuplicateOverride,
-    RuleDuplicateRequest, RuleEntry, RuleEntrySelector, RuleSelector, RuleSummary,
-    RuleUpdateRequest, CONTEXT_CHECK_MARKER,
+    ContextStatus, DuplicateRpcCost, DuplicateRpcOverride, DuplicateRuleResult, InspectionError,
+    InspectionService, ManagementBitBreakdown, ManagementExchange, ResolvedRuleUpdate, RuleDetail,
+    RuleDuplicateOverride, RuleDuplicateRequest, RuleEntry, RuleEntrySelector, RuleSelector,
+    RuleSummary, RuleUpdateRequest, CONTEXT_CHECK_MARKER,
 };
 pub use packet::{
     CoapMessage, CoapOption, Ipv6UdpCoapPacket, PacketError, PacketMetadata, PacketResult,
@@ -43,6 +44,10 @@ pub use packet::{
     MAX_COAP_DATAGRAM_LEN, UDP_HEADER_LEN, UDP_NEXT_HEADER,
 };
 pub use policy::{ProtectedRule, ProtectedRules, ProtectionPolicy};
+pub use report::{
+    format_report, inspect_report, CoapCost, CoapOptionCost, CoapOptionDescription, CoapReport,
+    Ipv6Report, PacketLayerCost, PacketReport, ReportDirection, ReportError, SchcCost, UdpReport,
+};
 
 /// Returns the immutable protected management rule identities used by the prototype.
 #[must_use]
