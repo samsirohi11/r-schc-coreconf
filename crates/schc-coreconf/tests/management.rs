@@ -12,11 +12,13 @@ use schc_core::{RuleId, SidRegistry};
 use schc_coreconf::{
     context_check_request, context_check_response, decode_rule_detail_payload,
     decode_rule_list_payload, format_rule_detail, format_rule_list, is_duplicate_rule_request,
-    parse_rule_selector, parse_rule_update_command, protected_management_rule_ids,
-    rule_get_request, rule_list_request, ActiveContext, ContextTag, InspectionError,
-    InspectionService, Ipv6UdpCoapPacket, LinkRole, PreparedContext, ProtectionPolicy, RuleDetail,
-    RuleEntry, SchcLink, TrafficOrigin, CONTEXT_TAG_LEN, CORE_LOGICAL_ADDRESS,
-    DEVICE_LOGICAL_ADDRESS, MANAGEMENT_PORT,
+    parse_rule_duplicate_command, parse_rule_selector, parse_rule_update_command,
+    prepare_management_request, protected_management_rule_ids, rule_get_request, rule_list_request,
+    temporary_ordinary_response, validate_management_response, ActiveContext, ContextTag,
+    InspectionError, InspectionService, Ipv6UdpCoapPacket, LinkDecoded, LinkRole, PreparedContext,
+    PreparedManagementRequest, ProtectionPolicy, RuleDetail, RuleEntry, SchcLink, TrafficOrigin,
+    APPLICATION_PORT, CONTEXT_TAG_LEN, CORE_LOGICAL_ADDRESS, DEVICE_LOGICAL_ADDRESS,
+    MANAGEMENT_PORT,
 };
 use schc_runtime::{DeviceId, DeviceProfile};
 use serde_json::Value;
@@ -74,6 +76,49 @@ fn update_for(active: &Arc<ActiveContext>, command: &str) -> schc_coreconf::Reso
         .expect("resolved update")
 }
 
+fn prepared_response_fixture() -> (
+    PreparedManagementRequest,
+    LinkDecoded,
+    SchcLink,
+    SchcLink,
+    Vec<u8>,
+) {
+    let core = active();
+    let device = active();
+    let core_link = SchcLink::new(Arc::clone(&core), LinkRole::Core);
+    let device_link = SchcLink::new(Arc::clone(&device), LinkRole::Device);
+    let mut service = InspectionService::new(device).expect("service");
+    let request_datagram = rule_list_request(21, &[]).expect("request");
+    let prepared = prepare_management_request(&core_link, &request_datagram).expect("prepare");
+    let decoded_request = device_link
+        .decode(prepared.frame().bytes())
+        .expect("decode request");
+    let response_datagram = service
+        .handle_datagram(decoded_request.packet().coap_datagram())
+        .expect("management response");
+    let response_packet = Ipv6UdpCoapPacket::new(
+        DEVICE_LOGICAL_ADDRESS,
+        CORE_LOGICAL_ADDRESS,
+        MANAGEMENT_PORT,
+        MANAGEMENT_PORT,
+        &response_datagram,
+    )
+    .expect("response packet");
+    let encoded_response = device_link
+        .encode(TrafficOrigin::Management, &response_packet)
+        .expect("encode response");
+    let decoded_response = core_link
+        .decode(encoded_response.frame().bytes())
+        .expect("decode response");
+    (
+        prepared,
+        decoded_response,
+        core_link,
+        device_link,
+        response_datagram,
+    )
+}
+
 fn repeated_fid_detail() -> RuleDetail {
     let entry = |entry_index: usize, field_position: usize, direction: &str| RuleEntry {
         entry_index,
@@ -90,6 +135,293 @@ fn repeated_fid_detail() -> RuleDetail {
         nature: "compression".into(),
         entries: vec![entry(4, 1, "bi"), entry(9, 2, "up")],
     }
+}
+
+#[test]
+fn prepared_management_request_validates_a_transport_neutral_exchange() {
+    let core = active();
+    let device = active();
+    let core_link = SchcLink::new(Arc::clone(&core), LinkRole::Core);
+    let device_link = SchcLink::new(Arc::clone(&device), LinkRole::Device);
+    let mut service = InspectionService::new(Arc::clone(&device)).expect("service");
+    let request_datagram = rule_list_request(21, &[]).expect("request");
+
+    let prepared = prepare_management_request(&core_link, &request_datagram).expect("prepare");
+    assert!(matches!(
+        prepared.report().rule_id.value(),
+        16 | 26 | 27 | 28
+    ));
+    assert_eq!(prepared.report().frame_bytes, prepared.frame().bytes());
+    let decoded_request = device_link
+        .decode(prepared.frame().bytes())
+        .expect("decode request");
+    let response_datagram = service
+        .handle_datagram(decoded_request.packet().coap_datagram())
+        .expect("management response");
+    let response_packet = Ipv6UdpCoapPacket::new(
+        DEVICE_LOGICAL_ADDRESS,
+        CORE_LOGICAL_ADDRESS,
+        MANAGEMENT_PORT,
+        MANAGEMENT_PORT,
+        &response_datagram,
+    )
+    .expect("response packet");
+    let encoded_response = device_link
+        .encode(TrafficOrigin::Management, &response_packet)
+        .expect("encode response");
+    assert_eq!(encoded_response.report().rule_id.value(), 17);
+    assert_eq!(encoded_response.report().rule_id.bit_len(), 8);
+    let decoded_response = core_link
+        .decode(encoded_response.frame().bytes())
+        .expect("decode response");
+    let (response_code, exchange) =
+        validate_management_response(&prepared, &decoded_response).expect("validate response");
+
+    assert_eq!(response_code, 69);
+    assert_eq!(
+        exchange.payload,
+        Packet::from_bytes(&response_datagram)
+            .expect("CoAP")
+            .payload
+    );
+    assert_eq!(exchange.request_report, *prepared.report());
+    assert_eq!(exchange.response_report, *decoded_response.report());
+    assert_eq!(exchange.request_report.rule_id, prepared.report().rule_id);
+    assert_eq!(
+        exchange.response_report.rule_id,
+        schc_core::RuleId::new(17, 8)
+    );
+    assert_eq!(
+        exchange.request_report.packet_bytes,
+        decoded_request.report().packet_bytes
+    );
+    assert_eq!(
+        exchange.response_report.frame_bytes,
+        encoded_response.frame().bytes()
+    );
+}
+
+#[test]
+fn validator_rejects_a_decoded_ordinary_application_response() {
+    let (prepared, _, core, device, _) = prepared_response_fixture();
+    let mut request = Packet::new();
+    request.header.message_id = 0x1001;
+    request.header.code = MessageClass::Request(RequestType::Get);
+    request.header.set_type(MessageType::Confirmable);
+    request.set_token(vec![0xaa]);
+    request.add_option(CoapOption::UriPath, b"demo".to_vec());
+    request.payload = b"demo".to_vec();
+    let request = Ipv6UdpCoapPacket::new(
+        CORE_LOGICAL_ADDRESS,
+        DEVICE_LOGICAL_ADDRESS,
+        APPLICATION_PORT,
+        APPLICATION_PORT,
+        &request.to_bytes().expect("application request"),
+    )
+    .expect("application packet");
+    let request_frame = core
+        .encode(TrafficOrigin::Application, &request)
+        .expect("encode application request");
+    let decoded_request = device
+        .decode(request_frame.frame().bytes())
+        .expect("decode application request");
+    let response =
+        temporary_ordinary_response(decoded_request.packet()).expect("application response");
+    let response_frame = device
+        .encode(TrafficOrigin::Application, &response)
+        .expect("encode application response");
+    let decoded_response = core
+        .decode(response_frame.frame().bytes())
+        .expect("decode application response");
+    assert_eq!(
+        decoded_response.route(),
+        schc_coreconf::TrafficRoute::Application
+    );
+    assert_eq!(decoded_response.rule_id(), RuleId::new(21, 8));
+
+    let error = validate_management_response(&prepared, &decoded_response)
+        .expect_err("ordinary response must be rejected");
+    let expected = format!(
+        "management response selected {:?} instead of protected 17/8",
+        RuleId::new(21, 8)
+    );
+    assert!(matches!(error, InspectionError::UnexpectedResponse(message) if message == expected));
+}
+
+#[test]
+fn validator_rejects_a_decoded_protected_request_rule() {
+    let (prepared, _, core, device, _) = prepared_response_fixture();
+    let request_datagram = context_check_request(active().tag(), 22, &[]);
+    let request = prepare_management_request(&core, &request_datagram).expect("prepare request");
+    assert_eq!(request.report().rule_id, RuleId::new(16, 8));
+    let decoded_request = device
+        .decode(request.frame().bytes())
+        .expect("decode protected request");
+    assert_eq!(decoded_request.rule_id(), RuleId::new(16, 8));
+
+    let error = validate_management_response(&prepared, &decoded_request)
+        .expect_err("request rule must be rejected");
+    let expected = format!(
+        "management response selected {:?} instead of protected 17/8",
+        RuleId::new(16, 8)
+    );
+    assert!(matches!(error, InspectionError::UnexpectedResponse(message) if message == expected));
+}
+
+#[test]
+fn validator_rejects_a_production_decoded_response_with_wrong_mid() {
+    let (prepared, _, core, device, mut response_datagram) = prepared_response_fixture();
+    response_datagram[2..4].copy_from_slice(&22_u16.to_be_bytes());
+    let response = Ipv6UdpCoapPacket::new(
+        DEVICE_LOGICAL_ADDRESS,
+        CORE_LOGICAL_ADDRESS,
+        MANAGEMENT_PORT,
+        MANAGEMENT_PORT,
+        &response_datagram,
+    )
+    .expect("wrong MID packet");
+    let encoded = device
+        .encode(TrafficOrigin::Management, &response)
+        .expect("encode wrong MID response");
+    assert_eq!(encoded.report().rule_id, RuleId::new(17, 8));
+    let decoded = core
+        .decode(encoded.frame().bytes())
+        .expect("decode wrong MID response");
+    let error =
+        validate_management_response(&prepared, &decoded).expect_err("wrong MID must be rejected");
+    assert!(matches!(
+        error,
+        InspectionError::Correlation(message) if message == "CoAP message ID or token mismatch"
+    ));
+}
+
+#[test]
+fn validator_rejects_a_production_decoded_response_with_wrong_token() {
+    let (prepared, _, core, device, mut response_datagram) = prepared_response_fixture();
+    // The production response has a zero-length token. Add one directly to
+    // the serialized CoAP header so this test does not rely on reserializing
+    // the large modeled response through coap_lite.
+    response_datagram[0] = (response_datagram[0] & 0xf0) | 1;
+    response_datagram.insert(4, 0x7f);
+    let response = Ipv6UdpCoapPacket::new(
+        DEVICE_LOGICAL_ADDRESS,
+        CORE_LOGICAL_ADDRESS,
+        MANAGEMENT_PORT,
+        MANAGEMENT_PORT,
+        &response_datagram,
+    )
+    .expect("wrong token packet");
+    let encoded = device.encode(TrafficOrigin::Management, &response);
+    match encoded {
+        Ok(encoded) => {
+            // The fixture permits this token as residue; validate the real
+            // RuleID 17/8 decode rather than fabricating LinkDecoded internals.
+            assert_eq!(encoded.report().rule_id, RuleId::new(17, 8));
+            let decoded = core
+                .decode(encoded.frame().bytes())
+                .expect("decode wrong token response");
+            let error = validate_management_response(&prepared, &decoded)
+                .expect_err("wrong token must be rejected");
+            assert!(matches!(
+                error,
+                InspectionError::Correlation(message) if message == "CoAP message ID or token mismatch"
+            ));
+        }
+        Err(error) => {
+            // Rule 17/8 fixes the token to zero length, so production codec
+            // rejection is the strongest evidence this token cannot pass.
+            assert!(matches!(error, schc_coreconf::LinkError::Runtime(_)));
+        }
+    }
+}
+
+#[test]
+fn protected_response_rule_cannot_encode_wrong_orientation_or_management_ports() {
+    // Rule 17/8 fixes these fields, so production decoding cannot yield a
+    // malformed 17/8 packet; validator checks remain defense in depth.
+    let (_, _, _, device, datagram) = prepared_response_fixture();
+    for (source, destination, source_port, destination_port, description) in [
+        (
+            CORE_LOGICAL_ADDRESS,
+            DEVICE_LOGICAL_ADDRESS,
+            MANAGEMENT_PORT,
+            MANAGEMENT_PORT,
+            "orientation",
+        ),
+        (
+            DEVICE_LOGICAL_ADDRESS,
+            CORE_LOGICAL_ADDRESS,
+            APPLICATION_PORT,
+            MANAGEMENT_PORT,
+            "source port",
+        ),
+        (
+            DEVICE_LOGICAL_ADDRESS,
+            CORE_LOGICAL_ADDRESS,
+            MANAGEMENT_PORT,
+            APPLICATION_PORT,
+            "destination port",
+        ),
+    ] {
+        let response = Ipv6UdpCoapPacket::new(
+            source,
+            destination,
+            source_port,
+            destination_port,
+            &datagram,
+        )
+        .expect("invalid protected response packet");
+        let encoded = device.encode(TrafficOrigin::Management, &response);
+        assert!(
+            encoded.is_err(),
+            "wrong {description} must not produce an accepted protected response"
+        );
+    }
+}
+
+#[test]
+fn prepared_management_request_excludes_compact_duplicate_rule() {
+    let active = active();
+    let service = InspectionService::new(Arc::clone(&active)).expect("service");
+    let default_update = update_for(&active, "rule update 20/8 entry=9 tv=2");
+    let conditional_update = update_for(&active, "rule update 20/8 entry=9 tv=2 --if-match");
+    let requests = [
+        (context_check_request(active.tag(), 1, &[]), 16),
+        (rule_list_request(2, &[]).expect("inspection request"), 26),
+        (
+            default_update
+                .ipatch_datagram(3, &[], None)
+                .expect("default update"),
+            27,
+        ),
+        (
+            conditional_update
+                .ipatch_datagram(4, &[], Some(active.tag()))
+                .expect("conditional update"),
+            28,
+        ),
+    ];
+    let link = SchcLink::new(Arc::clone(&active), LinkRole::Core);
+    for (datagram, expected_rule) in requests {
+        let prepared = prepare_management_request(&link, &datagram).expect("prepare request");
+        assert_eq!(
+            prepared.report().rule_id,
+            schc_core::RuleId::new(expected_rule, 8)
+        );
+    }
+
+    let request = parse_rule_duplicate_command("rule duplicate 20/8 22/8 entry=9 tv=2")
+        .expect("duplicate request");
+    let datagram = service
+        .duplicate_rule_datagram(&request, 37)
+        .expect("duplicate datagram");
+    let link = SchcLink::new(active, LinkRole::Core);
+    let error = prepare_management_request(&link, &datagram).expect_err("duplicate rejected");
+    assert!(matches!(
+        error,
+        InspectionError::UnexpectedResponse(message)
+            if message == "management request selected unsupported protected RuleID 29/8"
+    ));
 }
 
 #[test]

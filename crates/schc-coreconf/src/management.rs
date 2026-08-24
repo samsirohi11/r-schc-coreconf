@@ -26,6 +26,7 @@ use schc_core::{
     Cda, DirectionSelector, FieldLength, FieldRef, MatchingOperator, Rule, RuleContext, RuleId,
     RuleNature, SidRegistry, TargetValue,
 };
+use schc_runtime::SchcFrame;
 use serde_json::{json, Value};
 use thiserror::Error;
 
@@ -3405,17 +3406,53 @@ fn base_request(method: RequestType, message_id: u16, _token: &[u8]) -> Packet {
     packet
 }
 
-/// Performs the protected management transport and returns the response code.
+/// An encoded protected management request awaiting transport and response
+/// validation.
+///
+/// The value owns the exact SCHC frame and the request correlation packet, but
+/// does not own any transport.  It can therefore be sent by a caller that
+/// also reads and routes unrelated raw link frames.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct PreparedManagementRequest {
+    frame: SchcFrame,
+    report: LinkReport,
+    request: Ipv6UdpCoapPacket,
+}
+
+impl PreparedManagementRequest {
+    /// Returns the exact padded SCHC frame selected during preparation.
+    #[must_use]
+    pub const fn frame(&self) -> &SchcFrame {
+        &self.frame
+    }
+
+    /// Returns the compression report for the prepared request.
+    #[must_use]
+    pub const fn report(&self) -> &LinkReport {
+        &self.report
+    }
+}
+
+/// Builds and SCHC-encodes one protected management request.
+///
+/// The logical packet is always oriented from the core management endpoint
+/// (`2001:db8::2:8724`) to the device management endpoint
+/// (`2001:db8::1:8724`).  `RuleID` 29/8, the compact duplicate one-way path, is
+/// deliberately not accepted here.
+///
+/// This function performs no transport operations.  The returned value owns
+/// the exact frame and retains the request correlation information for
+/// [`validate_management_response`].
 ///
 /// # Errors
 ///
-/// Returns an error when SCHC rejects the packet, logical routing is invalid,
-/// or the response does not correlate.
-fn exchange_management_response(
+/// Returns an error when the datagram cannot form a logical packet, SCHC
+/// encoding fails, or the selected rule is not one of 16/8, 26/8, 27/8, or
+/// 28/8.
+pub fn prepare_management_request(
     link: &SchcLink,
-    raw_link: &RawUdpLink,
     coap_datagram: &[u8],
-) -> Result<(u8, ManagementExchange), InspectionError> {
+) -> Result<PreparedManagementRequest, InspectionError> {
     let request = Ipv6UdpCoapPacket::new(
         CORE_LOGICAL_ADDRESS,
         DEVICE_LOGICAL_ADDRESS,
@@ -3435,9 +3472,30 @@ fn exchange_management_response(
             encoded.report().rule_id.bit_len()
         )));
     }
-    raw_link.send_frame(encoded.frame())?;
-    let datagram = raw_link.recv()?;
-    let decoded = link.decode(datagram.bytes())?;
+    let report = encoded.report().clone();
+    let frame = encoded.into_frame();
+    Ok(PreparedManagementRequest {
+        frame,
+        report,
+        request,
+    })
+}
+
+/// Validates one already decoded response against a prepared request.
+///
+/// Validation requires protected-management route and `RuleID` 17/8, the exact
+/// device-to-core logical orientation and management ports, and matching CoAP
+/// MID and token.  No transport operation is performed.
+///
+/// # Errors
+///
+/// Returns an error when the decoded traffic is not a protected management
+/// response for this request, when its logical orientation is invalid, or when
+/// its CoAP MID or token does not correlate with the request.
+pub fn validate_management_response(
+    prepared: &PreparedManagementRequest,
+    decoded: &crate::LinkDecoded,
+) -> Result<(u8, ManagementExchange), InspectionError> {
     if decoded.route() != TrafficRoute::ProtectedManagement
         || decoded.rule_id() != RuleId::new(17, 8)
     {
@@ -3456,7 +3514,7 @@ fn exchange_management_response(
             "management response logical orientation is invalid".into(),
         ));
     }
-    let request_message = request.coap_message();
+    let request_message = prepared.request.coap_message();
     let response_message = response.coap_message();
     if request_message.message_id() != response_message.message_id()
         || request_message.token() != response_message.token()
@@ -3470,10 +3528,28 @@ fn exchange_management_response(
         code,
         ManagementExchange {
             payload: response.coap_payload().to_vec(),
-            request_report: encoded.report().clone(),
+            request_report: prepared.report.clone(),
             response_report: decoded.report().clone(),
         },
     ))
+}
+
+/// Performs the protected management transport and returns the response code.
+///
+/// # Errors
+///
+/// Returns an error when SCHC rejects the packet, logical routing is invalid,
+/// or the response does not correlate.
+fn exchange_management_response(
+    link: &SchcLink,
+    raw_link: &RawUdpLink,
+    coap_datagram: &[u8],
+) -> Result<(u8, ManagementExchange), InspectionError> {
+    let prepared = prepare_management_request(link, coap_datagram)?;
+    raw_link.send_frame(prepared.frame())?;
+    let datagram = raw_link.recv()?;
+    let decoded = link.decode(datagram.bytes())?;
+    validate_management_response(&prepared, &decoded)
 }
 
 /// Performs one protected management exchange and requires 2.05 Content.

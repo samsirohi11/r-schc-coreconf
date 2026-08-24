@@ -32,11 +32,12 @@ pub use management::{
     decode_rule_detail_payload, decode_rule_list_payload, exchange_management,
     exchange_management_update, format_rule_detail, format_rule_list, is_duplicate_rule_request,
     management_bit_breakdown, parse_rule_duplicate_command, parse_rule_selector,
-    parse_rule_update_command, rule_get_request, rule_list_request, ContextCheckResult,
-    ContextStatus, DuplicateRpcCost, DuplicateRpcOverride, DuplicateRuleResult, InspectionError,
-    InspectionService, ManagementBitBreakdown, ManagementExchange, ResolvedRuleUpdate, RuleDetail,
-    RuleDuplicateOverride, RuleDuplicateRequest, RuleEntry, RuleEntrySelector, RuleSelector,
-    RuleSummary, RuleUpdateRequest, CONTEXT_CHECK_MARKER,
+    parse_rule_update_command, prepare_management_request, rule_get_request, rule_list_request,
+    validate_management_response, ContextCheckResult, ContextStatus, DuplicateRpcCost,
+    DuplicateRpcOverride, DuplicateRuleResult, InspectionError, InspectionService,
+    ManagementBitBreakdown, ManagementExchange, PreparedManagementRequest, ResolvedRuleUpdate,
+    RuleDetail, RuleDuplicateOverride, RuleDuplicateRequest, RuleEntry, RuleEntrySelector,
+    RuleSelector, RuleSummary, RuleUpdateRequest, CONTEXT_CHECK_MARKER,
 };
 pub use packet::{
     CoapMessage, CoapOption, Ipv6UdpCoapPacket, PacketError, PacketMetadata, PacketResult,
