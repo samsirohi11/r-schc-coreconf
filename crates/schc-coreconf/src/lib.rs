@@ -14,6 +14,7 @@ mod context;
 mod link;
 mod management;
 mod packet;
+mod packet_loop;
 mod policy;
 mod report;
 
@@ -44,6 +45,7 @@ pub use packet::{
     DEFAULT_FLOW_LABEL, DEFAULT_HOP_LIMIT, DEFAULT_TRAFFIC_CLASS, IPV6_HEADER_LEN, IPV6_VERSION,
     MAX_COAP_DATAGRAM_LEN, UDP_HEADER_LEN, UDP_NEXT_HEADER,
 };
+pub use packet_loop::{PacketEventLoop, PacketLoopError, PacketPoll};
 pub use policy::{ProtectedRule, ProtectedRules, ProtectionPolicy};
 pub use report::{
     format_report, inspect_report, CoapCost, CoapOptionCost, CoapOptionDescription, CoapReport,

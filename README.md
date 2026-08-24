@@ -60,49 +60,11 @@ Run the complete automated test suite with:
 cargo test --workspace --all-targets --all-features
 ```
 
-## Final demonstration
+## Direct-TUN demonstration
 
-The executable demonstration builds the checked-out source binaries by default on every run, launches all three real processes, and cleans up processes, FIFOs, and temporary logs on every exit.
-Run it with:
-
-```sh
-bash tools/run_demo.sh
-```
-
-The default high localhost ports are `41081` for the device link, `41082` for the core link, and `41083` for the application endpoint.
-Override them when another process owns a port:
-
-```sh
-DEMO_DEVICE_LINK_PORT=42081 DEMO_CORE_LINK_PORT=42082 DEMO_CORE_APP_PORT=42083 bash tools/run_demo.sh
-```
-
-The script performs discovery, schema inspection, and a FETCH before the update.
-It inspects the initial context and confirms Rule 20 has `IPV6.APP_IID` value `0x0000000000000005`.
-It applies `rule update 20/8 fid=ipv6.app-iid tv=2 --if-match` through the protected management link.
-It verifies equal compact context tags and repeats the exact same FETCH afterward.
-It compares visible RuleIDs, original and transmitted sizes, application results, context behavior, and completion across both directions.
-Raw packet and frame equality remains covered by Rust tests where the bytes are directly available; the shell demonstration does not claim to observe raw sender-to-receiver equality.
-
-A successful run prints proof lines similar to:
-
-```text
-DEMO PROOF request_original_bytes=...
-DEMO PROOF request_transmitted_bytes_before=... request_transmitted_bytes_after=...
-DEMO PROOF request_rule_before=25/8 request_rule_after=20/8
-DEMO PROOF response_original_bytes=... response_transmitted_bytes=...
-DEMO PROOF visible_sender_receiver_reports_match=yes
-DEMO PROOF raw_sender_receiver_equality=not-observed
-DEMO PROOF application_result_before=7 application_result_after=7
-DEMO PROOF context_tags_equal=yes tag=...
-DEMO PROOF context_tag_changed=yes
-DEMO COMPLETE localhost_udp=yes root_required=no
-```
-
-The exact bit counts and compact tag depend on the checked-in fixture bytes and implementation version.
-The script exits nonzero if any proof condition fails.
-By default, the script builds from the checked-out source on every run.
-Set `DEMO_BUILD=0` to explicitly skip the build and use existing binaries.
-When `DEMO_BUILD=0`, `DEMO_BIN_DIR` may point to a directory containing the three binaries.
+The direct-TUN endpoint processes require Linux, a usable `/dev/net/tun`, and permission to create the requested interface.
+A privileged namespace end-to-end harness is not included here.
+Use the deterministic Rust tests for packet, SCHC, management, and reporting coverage.
 
 ## Interactive CLI use
 
@@ -115,7 +77,6 @@ Traffic reports are concise by default and use one deterministic line such as `R
 The line contains direction, traffic class, RuleID, original packet bytes, and padded transmitted bytes.
 Pass `--debug` to `schc-coreconf-core` or `schc-coreconf-device` for the same line followed by a structured IPv6, UDP, CoAP, RPC, and SCHC accounting block.
 Debug output is plain ASCII and intentionally omits raw packet and frame hexadecimal.
-The final demonstration script enables this mode automatically for its visible proof checks.
 
 Successful management actions use concise results such as `OK duplicate 20/8 -> 22/8  local=installed  remote=unacknowledged` and `OK update 20/8 entry=9  device=changed  local=changed`.
 Context status is reported as `CONTEXT generation=2  rules=9` in regular mode.
@@ -173,7 +134,8 @@ Rust packet/link tests verify exact logical packet and frame bytes where those b
 
 ## Manual process commands
 
-The automated script is the recommended user-facing command because it reserves no fixed external files and performs all assertions.
+The endpoint processes now require Linux TUN interfaces and are intended for a privileged namespace harness.
+The standalone data client and server remain separate application processes; they are not UDP proxy endpoints of these SCHC processes.
 The equivalent process arguments are shown below for inspection.
 
 Start the device first:
@@ -182,8 +144,8 @@ Start the device first:
 target/debug/schc-coreconf-device \
   --link-bind 127.0.0.1:41081 \
   --link-peer 127.0.0.1:41082 \
-  --app-sid fixtures/demo/demo-data.sid \
-  --app-data fixtures/demo/app-data.json
+  --tun-name schc-device \
+  --tun-mtu 1280
 ```
 
 Start the core in another terminal:
@@ -192,23 +154,11 @@ Start the core in another terminal:
 target/debug/schc-coreconf-core \
   --link-bind 127.0.0.1:41082 \
   --link-peer 127.0.0.1:41081 \
-  --app-bind 127.0.0.1:41083
+  --tun-name schc-core \
+  --tun-mtu 1280
 ```
 
-Run the data client in a third terminal:
-
-```sh
-printf '%s\n' \
-  'discover d=0' \
-  'schema demo-data' \
-  'fetch /demo-data:config/count' \
-  'quit' | target/debug/schc-data-client \
-  --sid fixtures/demo/demo-data.sid \
-  --server 127.0.0.1:41083 \
-  --path c
-```
-
-Send these commands to the core console to inspect and update the context:
+Once the interfaces are connected to IPv6 application processes, send these commands to the core console:
 
 ```text
 context check
@@ -220,22 +170,12 @@ rule get core 20/8
 rule get device 20/8
 ```
 
-Repeat the client FETCH after the update:
-
-```sh
-printf '%s\n' \
-  'fetch /demo-data:config/count' \
-  'quit' | target/debug/schc-data-client \
-  --sid fixtures/demo/demo-data.sid \
-  --server 127.0.0.1:41083 \
-  --path c
-```
 
 ## Limitations
 
-This prototype uses one device, fixed localhost UDP endpoints, and three processes.
-The application CORECONF server and datastore are still embedded in the SCHC device process.
-It does not implement Linux TUN integration, kernel-routed IPv6, SCHC fragmentation, OSCORE, QUIC, TCP, or remote administration.
+This prototype uses one core endpoint and one device endpoint with fixed logical IPv6 application orientations.
+The standalone data client and server remain separate application processes.
+It does not implement SCHC fragmentation, OSCORE, QUIC, TCP, or remote administration.
 It does not provide automatic RuleID allocation, context epochs, retries, rollback, replay journals, or concurrent multi-device routing.
 The core sends duplicate-rule once as a NON POST and does not wait for or require a response.
 It then applies the exact same operation locally and reports `remote=unacknowledged`.
@@ -245,16 +185,9 @@ The management rule inventory is intentionally small and uses exact protected Ru
 
 ## Troubleshooting
 
-If the script reports that a port is busy, select three unused high localhost ports with `DEMO_DEVICE_LINK_PORT`, `DEMO_CORE_LINK_PORT`, and `DEMO_CORE_APP_PORT`.
-If a previous manual run is still alive, stop the three processes before retrying.
-
 If a process fails before printing `READY`, run `cargo build -p schc-coreconf --bins` and verify that the fixture paths exist.
-The script prints captured temporary logs when it fails.
 The device is expected to remain running while idle; its short receive polling interval treats normal `TimedOut` or `WouldBlock` results as no frame rather than a fatal error.
 Unexpected socket errors remain fatal.
-
-If the data client prints an application error, confirm that the core and device use the same initial SoR and the sample application SID and datastore.
-The expected FETCH result is the exact output line `7`.
 
 If the update is rejected with a stale If-Match value, the core and device contexts started from different SoRs.
 Restart both processes with the same initial context before retrying.
@@ -265,7 +198,6 @@ Then run `python3 tools/generate_demo_fixtures.py --check --rule2sor /path/to/ru
 ## Validation
 
 The repository validation contract is formatting, strict Clippy, full workspace tests, rustdoc with warnings denied, deterministic fixture regeneration, and diff checks.
-The final acceptance E2E is also available as `cargo test -p schc-coreconf --test link final_real_process_demo_reuses_logical_request_and_shrinks_raw_frame`.
 
 ## License
 

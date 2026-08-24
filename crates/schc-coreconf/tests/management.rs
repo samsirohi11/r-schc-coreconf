@@ -5,7 +5,9 @@ use std::sync::Arc;
 
 use ciborium::value::Value as CborValue;
 use coap_lite::{CoapOption, MessageClass, MessageType, Packet, RequestType, ResponseType};
-use coreconf_model::instance_id::{decode_instances_with_model, PathComponent};
+use coreconf_model::instance_id::{
+    decode_instances_with_model, encode_identifiers, InstancePath, PathComponent,
+};
 use coreconf_runtime::coap_types::{ContentFormat, Interface, Method};
 use coreconf_runtime::Datastore;
 use schc_core::{RuleId, SidRegistry};
@@ -1185,6 +1187,41 @@ fn duplicate_rule_is_modeled_atomic_and_idempotent_without_response() {
         "DUPLICATE_LOGICAL_IPV6_UDP_COAP_HEX={}",
         hex(logical.as_bytes())
     );
+    let mut fetch_identifier = InstancePath::new();
+    fetch_identifier
+        .push_delta(60002)
+        .expect("application identifier SID");
+    let fetch_payload = encode_identifiers(&[fetch_identifier]).expect("FETCH identifiers");
+    let application_options = vec![
+        schc_coreconf::CoapOption::new(11, b"c".to_vec()).expect("application URI"),
+        schc_coreconf::CoapOption::new(12, vec![141]).expect("application format"),
+    ];
+    let application = Ipv6UdpCoapPacket::new(
+        CORE_LOGICAL_ADDRESS,
+        DEVICE_LOGICAL_ADDRESS,
+        APPLICATION_PORT,
+        APPLICATION_PORT,
+        &schc_coreconf::CoapMessage::from_parts(
+            1,
+            0,
+            5,
+            0x3010,
+            vec![0xc0, 0xc1, 0xc2],
+            application_options,
+            fetch_payload,
+        )
+        .expect("application request")
+        .to_vec(),
+    )
+    .expect("application packet");
+    let application_link = SchcLink::new(Arc::clone(&active), LinkRole::Core);
+    let application_before = application_link
+        .encode(TrafficOrigin::Application, &application)
+        .expect("fallback application frame");
+    assert_eq!(application_before.report().rule_id, RuleId::new(25, 8));
+    assert_eq!(application_before.frame().bit_len(), 128);
+    assert_eq!(application_before.frame().bytes().len(), 16);
+
     let encoded = SchcLink::new(active.clone(), LinkRole::Core)
         .encode(TrafficOrigin::Management, &logical)
         .expect("duplicate SCHC frame");
@@ -1238,6 +1275,19 @@ fn duplicate_rule_is_modeled_atomic_and_idempotent_without_response() {
             .unwrap()
             .target,
         "0x0000000000000002"
+    );
+    let application_after = application_link
+        .encode(TrafficOrigin::Application, &application)
+        .expect("specialized application frame");
+    assert_eq!(application_after.report().rule_id, RuleId::new(22, 8));
+    assert_eq!(application_after.frame().bit_len(), 82);
+    assert_eq!(application_after.frame().bytes().len(), 11);
+    let application_bits_saved =
+        application_before.frame().bit_len() - application_after.frame().bit_len();
+    assert_eq!(application_bits_saved, 46);
+    assert_eq!(
+        encoded.frame().bit_len().div_ceil(application_bits_saved),
+        9
     );
     let generation = active.generation();
     assert!(service
