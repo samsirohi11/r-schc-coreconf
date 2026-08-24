@@ -295,6 +295,7 @@ fn real_console_duplicate_rule_is_atomic_idempotent_and_no_response() {
         ]
     );
 
+    device.wait_for_stdout("ERROR duplicate  local=failed", Duration::from_secs(5));
     device.kill();
     let (device_stdout, device_stderr) = device.output();
     assert_no_stderr("device", &device_stderr);
