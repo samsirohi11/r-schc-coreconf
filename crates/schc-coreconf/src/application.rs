@@ -217,11 +217,41 @@ impl DataClient {
         endpoint: impl ToSocketAddrs,
         resource_path: impl Into<String>,
     ) -> Result<Self, ApplicationError> {
-        let endpoint = endpoint.to_socket_addrs()?.next().ok_or_else(|| {
-            ApplicationError::Coap("endpoint resolved to no addresses".to_owned())
-        })?;
         let resource_path = normalize_resource_path(&resource_path.into());
         let client = CoapLiteClient::connect(model.clone(), endpoint, resource_path)?;
+        Self::from_client(model, client)
+    }
+
+    /// Connects to a core application endpoint using an explicit local address.
+    ///
+    /// The local address controls both the UDP source address and source port.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the endpoint cannot be resolved or the UDP socket
+    /// cannot be bound or configured.
+    pub fn connect_bound(
+        model: CompositeModel,
+        local_addr: SocketAddr,
+        endpoint: impl ToSocketAddrs,
+        resource_path: impl Into<String>,
+    ) -> Result<Self, ApplicationError> {
+        let resource_path = normalize_resource_path(&resource_path.into());
+        let client =
+            CoapLiteClient::connect_bound(model.clone(), local_addr, endpoint, resource_path)?;
+        Self::from_client(model, client)
+    }
+
+    fn from_client(
+        model: CompositeModel,
+        client: CoapLiteClient,
+    ) -> Result<Self, ApplicationError> {
+        let endpoint = client.endpoint().to_owned();
+        let endpoint = endpoint.parse::<SocketAddr>().map_err(|error| {
+            ApplicationError::Coap(format!(
+                "connected endpoint {endpoint:?} is not a socket address: {error}"
+            ))
+        })?;
         Ok(Self {
             client,
             endpoint,
@@ -602,6 +632,132 @@ mod tests {
             response.header.code,
             MessageClass::Response(ResponseType::MethodNotAllowed)
         );
+    }
+
+    #[test]
+    fn public_client_bound_ipv6_uses_exact_source_and_returns_value() {
+        use std::io::ErrorKind;
+        use std::net::{Ipv6Addr, UdpSocket};
+        use std::sync::mpsc;
+        use std::thread;
+
+        let server_socket = match UdpSocket::bind(SocketAddr::new(Ipv6Addr::LOCALHOST.into(), 0)) {
+            Ok(socket) => socket,
+            Err(error) if error.kind() == ErrorKind::AddrNotAvailable => return,
+            Err(error) => panic!("IPv6 loopback server socket: {error}"),
+        };
+        let server_address = server_socket.local_addr().expect("server address");
+        let source_reservation =
+            match UdpSocket::bind(SocketAddr::new(Ipv6Addr::LOCALHOST.into(), 0)) {
+                Ok(socket) => socket,
+                Err(error) if error.kind() == ErrorKind::AddrNotAvailable => return,
+                Err(error) => panic!("IPv6 loopback client socket: {error}"),
+            };
+        let local_address = source_reservation.local_addr().expect("client address");
+        assert_ne!(local_address.port(), 0);
+        drop(source_reservation);
+
+        let (peer_sender, peer_receiver) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let mut service =
+                GenericDataService::from_sid_contents(&[SID], DATA, "c").expect("service");
+            let mut buffer = vec![0_u8; 65_535];
+            let (length, peer) = server_socket.recv_from(&mut buffer).expect("request");
+            peer_sender.send(peer).expect("peer");
+            let response = service
+                .handle_datagram(&buffer[..length])
+                .expect("service response");
+            server_socket.send_to(&response, peer).expect("response");
+        });
+
+        let model = CompositeModel::from_sid_strings(&[SID]).expect("model");
+        let mut client = DataClient::connect_bound(model, local_address, server_address, "c")
+            .expect("bound client");
+        assert_eq!(
+            client.get("/demo-data:config/count").expect("GET"),
+            Some(Value::from(7))
+        );
+        assert_eq!(peer_receiver.recv().expect("peer"), local_address);
+        server.join().expect("server");
+    }
+
+    #[test]
+    fn public_client_uses_later_endpoint_candidate_and_reports_actual_peer() {
+        use std::net::UdpSocket;
+        use std::thread;
+
+        let failing_endpoint: SocketAddr = "255.255.255.255:5683".parse().expect("address");
+        let probe = UdpSocket::bind("127.0.0.1:0").expect("probe socket");
+        assert!(
+            probe.connect(failing_endpoint).is_err(),
+            "broadcast UDP destination unexpectedly accepted"
+        );
+        let server_socket = UdpSocket::bind("127.0.0.1:0").expect("server socket");
+        let server_address = server_socket.local_addr().expect("server address");
+        let endpoints = [failing_endpoint, server_address];
+        let server = thread::spawn(move || {
+            let mut service =
+                GenericDataService::from_sid_contents(&[SID], DATA, "c").expect("service");
+            let mut buffer = vec![0_u8; 65_535];
+            let (length, peer) = server_socket.recv_from(&mut buffer).expect("request");
+            let response = service
+                .handle_datagram(&buffer[..length])
+                .expect("service response");
+            server_socket.send_to(&response, peer).expect("response");
+        });
+
+        let model = CompositeModel::from_sid_strings(&[SID]).expect("model");
+        let mut client = DataClient::connect(model, &endpoints[..], "c").expect("client");
+        assert_eq!(client.endpoint(), server_address);
+        assert_eq!(
+            client.get("/demo-data:config/count").expect("GET"),
+            Some(Value::from(7))
+        );
+        server.join().expect("server");
+    }
+
+    #[test]
+    fn public_bound_client_uses_later_endpoint_and_preserves_source() {
+        use std::net::UdpSocket;
+        use std::sync::mpsc;
+        use std::thread;
+
+        let failing_endpoint: SocketAddr = "255.255.255.255:5683".parse().expect("address");
+        let probe = UdpSocket::bind("127.0.0.1:0").expect("probe socket");
+        assert!(
+            probe.connect(failing_endpoint).is_err(),
+            "broadcast UDP destination unexpectedly accepted"
+        );
+        let server_socket = UdpSocket::bind("127.0.0.1:0").expect("server socket");
+        let server_address = server_socket.local_addr().expect("server address");
+        let reserved = UdpSocket::bind("127.0.0.1:0").expect("client socket");
+        let local_address = reserved.local_addr().expect("client address");
+        assert_ne!(local_address.port(), 0);
+        drop(reserved);
+        let endpoints = [failing_endpoint, server_address];
+        let (peer_sender, peer_receiver) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let mut service =
+                GenericDataService::from_sid_contents(&[SID], DATA, "c").expect("service");
+            let mut buffer = vec![0_u8; 65_535];
+            let (length, peer) = server_socket.recv_from(&mut buffer).expect("request");
+            peer_sender.send(peer).expect("peer");
+            let response = service
+                .handle_datagram(&buffer[..length])
+                .expect("service response");
+            server_socket.send_to(&response, peer).expect("response");
+        });
+
+        let model = CompositeModel::from_sid_strings(&[SID]).expect("model");
+        let mut client =
+            DataClient::connect_bound(model, local_address, &endpoints[..], "c").expect("client");
+        assert_eq!(client.endpoint(), server_address);
+        assert_eq!(
+            client.get("/demo-data:config/count").expect("GET"),
+            Some(Value::from(7))
+        );
+        assert_eq!(peer_receiver.recv().expect("peer"), local_address);
+        server.join().expect("server");
     }
 
     #[test]

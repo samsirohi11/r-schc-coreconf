@@ -200,7 +200,9 @@ fn final_real_process_demo_reuses_logical_request_and_shrinks_raw_frame() {
         core_app,
         b"discover d=0\nschema demo-data\nfetch /demo-data:config/count\nquit\n",
     );
-    assert!(before_client.contains("READY client  server="));
+    assert!(before_client
+        .lines()
+        .any(|line| line == format!("READY client  server={core_app}")));
     assert!(!before_client.contains("Data client commands:"));
     assert!(before_client.contains("core.c.ds"));
     assert!(before_client.contains("/demo-data:config/count (sid 60002)"));
@@ -227,7 +229,9 @@ fn final_real_process_demo_reuses_logical_request_and_shrinks_raw_frame() {
         core_app,
         b"discover d=0\nschema demo-data\nfetch /demo-data:config/count\nquit\n",
     );
-    assert!(after_client.contains("READY client  server="));
+    assert!(after_client
+        .lines()
+        .any(|line| line == format!("READY client  server={core_app}")));
     assert!(after_client.contains("core.c.ds"));
     assert!(after_client.contains("/demo-data:config/count (sid 60002)"));
     assert!(
@@ -1263,7 +1267,9 @@ fn real_three_process_data_client_discovers_and_fetches() {
     let client_stdout = String::from_utf8_lossy(&client_output.stdout);
     let client_stderr = String::from_utf8_lossy(&client_output.stderr);
     assert!(client_stderr.is_empty(), "client stderr: {client_stderr}");
-    assert!(client_stdout.contains("READY client  server="));
+    assert!(client_stdout
+        .lines()
+        .any(|line| line == format!("READY client  server={core_app}")));
     assert!(client_stdout.contains("core.c.ds"));
     assert!(client_stdout.contains("/demo-data:config/count (sid 60002)"));
     assert!(client_stdout.lines().any(|line| line == "7"));

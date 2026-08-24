@@ -33,9 +33,16 @@ fn run() -> Result<(), String> {
     let sid_refs: Vec<&str> = sid_contents.iter().map(String::as_str).collect();
     let model = CompositeModel::from_sid_strings(&sid_refs)
         .map_err(|error| format!("load application SID model: {error}"))?;
-    let mut client = DataClient::connect(model, options.server, options.resource_path)
-        .map_err(|error| format!("connect application endpoint: {error}"))?;
-    println!("READY client  server={}", client.endpoint());
+    let bind = options.bind;
+    let mut client = match bind {
+        Some(bind) => DataClient::connect_bound(model, bind, options.server, options.resource_path),
+        None => DataClient::connect(model, options.server, options.resource_path),
+    }
+    .map_err(|error| format!("connect application endpoint: {error}"))?;
+    match bind {
+        Some(bind) => println!("READY client  server={}  bind={bind}", client.endpoint()),
+        None => println!("READY client  server={}", client.endpoint()),
+    }
     let interactive = io::stdin().is_terminal() && io::stdout().is_terminal();
     if interactive {
         println!("Type 'help' for commands");
@@ -179,20 +186,27 @@ fn required_argument<'a>(value: &'a str, usage: &str) -> Result<&'a str, String>
     }
 }
 
+#[derive(Debug)]
 struct Options {
     sid_paths: Vec<PathBuf>,
     server: SocketAddr,
+    bind: Option<SocketAddr>,
     resource_path: String,
     help: bool,
 }
 
 impl Options {
     fn parse() -> Result<Self, String> {
+        Self::parse_arguments(env::args().skip(1))
+    }
+
+    fn parse_arguments(arguments: impl Iterator<Item = String>) -> Result<Self, String> {
         let mut sid_paths = Vec::new();
         let mut server = None;
+        let mut bind = None;
         let mut resource_path = "c".to_owned();
         let mut help = false;
-        let mut arguments = env::args().skip(1);
+        let mut arguments = arguments;
         while let Some(argument) = arguments.next() {
             match argument.as_str() {
                 "--sid" => sid_paths.push(PathBuf::from(next(&mut arguments, "--sid")?)),
@@ -203,6 +217,14 @@ impl Options {
                             format!("invalid {argument} address {value}: {error}")
                         })?);
                 }
+                "--bind" => {
+                    let value = next(&mut arguments, "--bind")?;
+                    bind = Some(
+                        value
+                            .parse()
+                            .map_err(|error| format!("invalid --bind address {value}: {error}"))?,
+                    );
+                }
                 "--path" => resource_path = next(&mut arguments, "--path")?,
                 "-h" | "--help" => help = true,
                 other => return Err(format!("unknown argument {other}; use --help")),
@@ -212,6 +234,7 @@ impl Options {
             return Ok(Self {
                 sid_paths,
                 server: SocketAddr::from(([127, 0, 0, 1], 0)),
+                bind,
                 resource_path,
                 help,
             });
@@ -222,6 +245,7 @@ impl Options {
         Ok(Self {
             sid_paths,
             server: server.ok_or("missing required --server ADDR")?,
+            bind,
             resource_path,
             help,
         })
@@ -235,8 +259,12 @@ fn next(arguments: &mut impl Iterator<Item = String>, flag: &str) -> Result<Stri
 }
 
 fn print_usage() {
-    println!("Usage: schc-data-client --sid PATH [--sid PATH ...] --server ADDR [--path PATH]");
+    println!("{}", usage());
     print_command_help();
+}
+
+fn usage() -> &'static str {
+    "Usage: schc-data-client --sid PATH [--sid PATH ...] --server ADDR [--bind ADDR] [--path PATH]"
 }
 
 fn print_command_help() {
@@ -257,4 +285,57 @@ fn print_prompt() -> Result<(), String> {
     io::stdout()
         .flush()
         .map_err(|error| format!("flush data prompt: {error}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{usage, Options};
+    use std::net::SocketAddr;
+
+    fn parse(arguments: &[&str]) -> Result<Options, String> {
+        Options::parse_arguments(arguments.iter().map(|argument| (*argument).to_owned()))
+    }
+
+    #[test]
+    fn bind_accepts_bracketed_ipv6_without_binding_it() {
+        let options = parse(&[
+            "--sid",
+            "model.sid",
+            "--server",
+            "[::1]:5683",
+            "--bind",
+            "[2001:db8::2]:5683",
+        ])
+        .expect("options");
+        assert_eq!(
+            options.bind,
+            Some("[2001:db8::2]:5683".parse::<SocketAddr>().expect("address"))
+        );
+    }
+
+    #[test]
+    fn bind_rejects_missing_and_malformed_values() {
+        let missing = parse(&["--sid", "model.sid", "--server", "[::1]:5683", "--bind"])
+            .expect_err("missing bind value");
+        assert_eq!(missing, "missing value for --bind");
+
+        let malformed = parse(&[
+            "--sid",
+            "model.sid",
+            "--server",
+            "[::1]:5683",
+            "--bind",
+            "not-an-address",
+        ])
+        .expect_err("malformed bind value");
+        assert!(malformed.starts_with("invalid --bind address not-an-address:"));
+    }
+
+    #[test]
+    fn no_bind_remains_accepted_and_help_mentions_bind() {
+        let options =
+            parse(&["--sid", "model.sid", "--server", "127.0.0.1:5683"]).expect("options");
+        assert_eq!(options.bind, None);
+        assert!(usage().contains("[--bind ADDR]"));
+    }
 }
