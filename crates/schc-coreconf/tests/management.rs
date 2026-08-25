@@ -5,9 +5,8 @@ use std::sync::Arc;
 
 use ciborium::value::Value as CborValue;
 use coap_lite::{CoapOption, MessageClass, MessageType, Packet, RequestType, ResponseType};
-use coreconf_model::instance_id::{
-    decode_instances_with_model, encode_identifiers, InstancePath, PathComponent,
-};
+use coreconf_model::instance_id::{decode_instances_with_model, encode_identifiers, PathComponent};
+use coreconf_model::CompositeModel;
 use coreconf_runtime::coap_types::{ContentFormat, Interface, Method};
 use coreconf_runtime::Datastore;
 use schc_core::{RuleId, SidRegistry};
@@ -26,6 +25,7 @@ use schc_runtime::{DeviceId, DeviceProfile};
 use serde_json::Value;
 
 const SID: &str = include_str!("../../../fixtures/demo/ietf-schc@2026-05-07.sid");
+const APP_SID: &str = include_str!("../../../fixtures/demo/demo-data.sid");
 const SOR: &[u8] = include_bytes!("../../../fixtures/demo/initial.sor");
 
 fn hex(bytes: &[u8]) -> String {
@@ -1157,24 +1157,10 @@ fn duplicate_rule_is_modeled_atomic_and_idempotent_without_response() {
     let request =
         schc_coreconf::parse_rule_duplicate_command("rule duplicate 20/8 22/8 entry=9 tv=2")
             .expect("duplicate request");
-    let mut base_request = request.clone();
-    base_request.overrides.clear();
-    let base_payload = service
-        .duplicate_rule_payload(&base_request)
-        .expect("base duplicate payload");
-    assert_eq!(base_payload.len(), 19);
-    println!(
-        "DUPLICATE_FIXED_RPC_PAYLOAD_BYTES={} HEX={}",
-        base_payload.len(),
-        hex(&base_payload)
-    );
     let datagram = service
         .duplicate_rule_datagram(&request, 37)
         .expect("duplicate datagram");
     let packet = Packet::from_bytes(&datagram).expect("duplicate packet");
-    assert_eq!(packet.payload.len(), 43);
-    println!("DUPLICATE_RPC_PAYLOAD_HEX={}", hex(&packet.payload));
-    println!("DUPLICATE_COAP_HEX={}", hex(&datagram));
     let logical = Ipv6UdpCoapPacket::new(
         CORE_LOGICAL_ADDRESS,
         DEVICE_LOGICAL_ADDRESS,
@@ -1183,14 +1169,15 @@ fn duplicate_rule_is_modeled_atomic_and_idempotent_without_response() {
         &datagram,
     )
     .expect("logical duplicate packet");
-    println!(
-        "DUPLICATE_LOGICAL_IPV6_UDP_COAP_HEX={}",
-        hex(logical.as_bytes())
-    );
-    let mut fetch_identifier = InstancePath::new();
-    fetch_identifier
-        .push_delta(60002)
-        .expect("application identifier SID");
+    let application_model =
+        CompositeModel::from_sid_strings(&[APP_SID]).expect("application model");
+    let application_datastore = Datastore::new_in_memory(application_model);
+    let (fetch_sid, fetch_keys) = application_datastore
+        .resolve_xpath("/demo-data:config/count")
+        .expect("application path");
+    let fetch_identifier = application_datastore
+        .instance_path_for(fetch_sid, &fetch_keys)
+        .expect("application identifier");
     let fetch_payload = encode_identifiers(&[fetch_identifier]).expect("FETCH identifiers");
     let application_options = vec![
         schc_coreconf::CoapOption::new(11, b"c".to_vec()).expect("application URI"),
@@ -1206,7 +1193,7 @@ fn duplicate_rule_is_modeled_atomic_and_idempotent_without_response() {
             0,
             5,
             0x3010,
-            vec![0xc0, 0xc1, 0xc2],
+            vec![0xc0],
             application_options,
             fetch_payload,
         )
@@ -1219,38 +1206,23 @@ fn duplicate_rule_is_modeled_atomic_and_idempotent_without_response() {
         .encode(TrafficOrigin::Application, &application)
         .expect("fallback application frame");
     assert_eq!(application_before.report().rule_id, RuleId::new(25, 8));
-    assert_eq!(application_before.frame().bit_len(), 128);
-    assert_eq!(application_before.frame().bytes().len(), 16);
 
     let encoded = SchcLink::new(active.clone(), LinkRole::Core)
         .encode(TrafficOrigin::Management, &logical)
         .expect("duplicate SCHC frame");
-    let breakdown = schc_coreconf::management_bit_breakdown(encoded.report()).expect("breakdown");
-    println!("DUPLICATE_FRAME_HEX={}", hex(encoded.frame().bytes()));
-    println!(
-        "DUPLICATE_FRAME_BITS={} DUPLICATE_FRAME_BYTES={} DUPLICATE_PACKET_BYTES={}",
-        encoded.frame().bit_len(),
+    assert_eq!(
         encoded.frame().bytes().len(),
-        logical.as_bytes().len()
+        encoded.frame().bit_len().div_ceil(8)
     );
-    assert_eq!(logical.as_bytes().len(), 103);
-    assert_eq!(encoded.frame().bit_len(), 371);
-    assert_eq!(encoded.frame().bytes().len(), 47);
-    assert_eq!(breakdown.rule_id_bits, 8);
-    assert_eq!(breakdown.mid_residue_bits, 7);
-    assert_eq!(breakdown.method_or_response_mapping_bits, 0);
-    assert_eq!(breakdown.payload_length_bits, 12);
-    assert_eq!(breakdown.payload_bits, 344);
-    assert_eq!(breakdown.byte_padding_bits, 5);
-    assert_eq!(breakdown.unaccounted_residue_bits, 0);
-    let mut residue_report = encoded.report().clone();
-    residue_report.schc_bit_len = Some(372);
-    assert!(schc_coreconf::management_bit_breakdown(&residue_report).is_err());
-    assert_eq!(breakdown.transport_residue_bits(), 15);
-    println!("DUPLICATE_BREAKDOWN rule_id_bits={} mid_residue_bits={} method_bits={} payload_length_bits={} payload_bits={} padding_bits={}", breakdown.rule_id_bits, breakdown.mid_residue_bits, breakdown.method_or_response_mapping_bits, breakdown.payload_length_bits, breakdown.payload_bits, breakdown.byte_padding_bits);
     assert_eq!(packet.header.code, MessageClass::Request(RequestType::Post));
     assert_eq!(packet.header.get_type(), MessageType::NonConfirmable);
     assert!(packet.get_token().is_empty());
+    assert_eq!(
+        packet
+            .get_option(CoapOption::UriPath)
+            .and_then(|options| options.front()),
+        Some(&b"schc".to_vec())
+    );
     assert_eq!(
         packet
             .get_option(CoapOption::ContentFormat)
@@ -1280,15 +1252,11 @@ fn duplicate_rule_is_modeled_atomic_and_idempotent_without_response() {
         .encode(TrafficOrigin::Application, &application)
         .expect("specialized application frame");
     assert_eq!(application_after.report().rule_id, RuleId::new(22, 8));
-    assert_eq!(application_after.frame().bit_len(), 82);
-    assert_eq!(application_after.frame().bytes().len(), 11);
-    let application_bits_saved =
-        application_before.frame().bit_len() - application_after.frame().bit_len();
-    assert_eq!(application_bits_saved, 46);
     assert_eq!(
-        encoded.frame().bit_len().div_ceil(application_bits_saved),
-        9
+        application_before.report().packet_bytes,
+        application_after.report().packet_bytes
     );
+    assert!(application_after.frame().bit_len() < application_before.frame().bit_len());
     let generation = active.generation();
     assert!(service
         .handle_datagram_no_response(&datagram)

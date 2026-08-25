@@ -635,17 +635,27 @@ fn malformed_frames_are_rejected_and_rule_identity_includes_bit_length() {
     assert!(device.decode(&[0xff]).is_err());
     assert!(device.decode(&[]).is_err());
 
-    let request = packet(
+    let request = Ipv6UdpCoapPacket::from_coap_datagram(
         CORE_LOGICAL_ADDRESS,
         DEVICE_LOGICAL_ADDRESS,
         APPLICATION_PORT,
         APPLICATION_PORT,
+        63,
         &coap(0, 1, 3, &[], Some(b"demo")),
-    );
+    )
+    .expect("routed request");
     let frame = core
         .encode(TrafficOrigin::Application, &request)
         .expect("request");
-    assert_eq!(frame.frame().bit_len() % 8, 0);
+    assert_eq!(frame.report().rule_id, RuleId::new(25, 8));
+    assert_eq!(
+        device
+            .decode(frame.frame().bytes())
+            .expect("routed request decodes")
+            .packet()
+            .as_bytes(),
+        request.as_bytes()
+    );
     let management_request = packet(
         CORE_LOGICAL_ADDRESS,
         DEVICE_LOGICAL_ADDRESS,

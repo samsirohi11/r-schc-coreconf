@@ -1,4 +1,4 @@
-//! Real localhost UDP SCHC link operations.
+//! UDP SCHC link operations.
 //!
 //! The link deliberately keeps the logical packet and the SCHC frame as two
 //! different values.  A UDP link datagram is exactly the padded bytes returned
@@ -531,7 +531,7 @@ impl RawDatagram {
     }
 }
 
-/// A connected localhost UDP socket carrying one raw SCHC frame per datagram.
+/// A connected UDP socket carrying one raw SCHC frame per datagram.
 #[derive(Debug)]
 pub struct RawUdpLink {
     socket: UdpSocket,

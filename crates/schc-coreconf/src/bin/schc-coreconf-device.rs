@@ -1,4 +1,4 @@
-//! Device endpoint for the direct-TUN SCHC demonstration.
+//! Device endpoint for the namespace SCHC demonstration.
 
 mod common;
 
@@ -10,8 +10,8 @@ use coap_lite::Packet;
 use common::{bind_raw_link, print_report, Args};
 use schc_coreconf::{
     is_duplicate_rule_request, InspectionService, Ipv6UdpCoapPacket, LinkError, LinkRole,
-    PacketEventLoop, PacketPoll, SchcLink, TrafficOrigin, TrafficRoute, APPLICATION_PORT,
-    CORE_LOGICAL_ADDRESS, DEVICE_LOGICAL_ADDRESS, MANAGEMENT_PORT,
+    PacketError, PacketEventLoop, PacketPoll, SchcLink, TrafficOrigin, TrafficRoute,
+    APPLICATION_PORT, CORE_LOGICAL_ADDRESS, DEVICE_LOGICAL_ADDRESS, MANAGEMENT_PORT,
 };
 
 #[cfg(target_os = "linux")]
@@ -60,6 +60,11 @@ fn run() -> Result<(), String> {
                 Ok(()) if args.once => return Ok(()),
                 Ok(()) => {}
                 Err(DevicePacketError::Drop(error)) => println!("ERROR {error}"),
+                Err(DevicePacketError::ExpectedNonUdp(error)) => {
+                    if args.debug {
+                        println!("DEBUG {error}");
+                    }
+                }
                 Err(DevicePacketError::Fatal(error)) => return Err(error),
             }
         }
@@ -76,6 +81,11 @@ fn run() -> Result<(), String> {
                     Ok(()) if args.once => return Ok(()),
                     Ok(()) => {}
                     Err(DevicePacketError::Drop(error)) => println!("ERROR {error}"),
+                    Err(DevicePacketError::ExpectedNonUdp(error)) => {
+                        if args.debug {
+                            println!("DEBUG {error}");
+                        }
+                    }
                     Err(DevicePacketError::Fatal(error)) => return Err(error),
                 }
                 io::stdout()
@@ -98,7 +108,19 @@ enum DevicePacketError {
     #[error("{0}")]
     Drop(String),
     #[error("{0}")]
+    ExpectedNonUdp(String),
+    #[error("{0}")]
     Fatal(String),
+}
+
+#[cfg(target_os = "linux")]
+fn classify_tun_packet_error(error: PacketError) -> DevicePacketError {
+    match error {
+        PacketError::UnsupportedNextHeader(next_header) => DevicePacketError::ExpectedNonUdp(
+            format!("ignore non-UDP TUN packet: IPv6 next header {next_header}"),
+        ),
+        error => DevicePacketError::Drop(format!("drop malformed TUN packet: {error}")),
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -108,8 +130,7 @@ fn send_device_tun_response(
     bytes: &[u8],
     debug: bool,
 ) -> Result<(), DevicePacketError> {
-    let packet = Ipv6UdpCoapPacket::parse(bytes)
-        .map_err(|error| DevicePacketError::Drop(format!("drop malformed TUN packet: {error}")))?;
+    let packet = Ipv6UdpCoapPacket::parse(bytes).map_err(classify_tun_packet_error)?;
     if packet.source() != DEVICE_LOGICAL_ADDRESS
         || packet.destination() != CORE_LOGICAL_ADDRESS
         || packet.source_port() != APPLICATION_PORT
@@ -242,14 +263,17 @@ mod tests {
     use schc_coreconf::{
         context_check_request, protected_management_rule_ids, temporary_ordinary_response,
         validate_management_response, ActiveContext, InspectionService, Ipv6UdpCoapPacket,
-        LinkOperation, LinkRole, PacketEventLoop, PreparedContext, ProtectionPolicy, RawUdpLink,
-        SchcLink, TrafficOrigin, TrafficRoute, APPLICATION_PORT, CORE_LOGICAL_ADDRESS,
+        LinkOperation, LinkRole, PacketError, PacketEventLoop, PreparedContext, ProtectionPolicy,
+        RawUdpLink, SchcLink, TrafficOrigin, TrafficRoute, APPLICATION_PORT, CORE_LOGICAL_ADDRESS,
         DEVICE_LOGICAL_ADDRESS,
     };
     use schc_runtime::packet::{PacketDevice, PacketDeviceError};
     use schc_runtime::{DeviceId, DeviceProfile};
 
-    use super::{receive_device_frame, send_device_tun_response, DevicePacketError};
+    use super::{
+        classify_tun_packet_error, receive_device_frame, send_device_tun_response,
+        DevicePacketError,
+    };
 
     const SID: &str = include_str!("../../../../fixtures/demo/ietf-schc@2026-05-07.sid");
     const SOR: &[u8] = include_bytes!("../../../../fixtures/demo/initial.sor");
@@ -315,6 +339,18 @@ mod tests {
             .set_read_timeout(Some(Duration::from_millis(100)))
             .expect("second timeout");
         (first, second)
+    }
+
+    #[test]
+    fn non_udp_tun_traffic_is_quiet_but_supported_malformed_packets_are_errors() {
+        assert!(matches!(
+            classify_tun_packet_error(PacketError::UnsupportedNextHeader(0)),
+            DevicePacketError::ExpectedNonUdp(message) if message.contains("non-UDP")
+        ));
+        assert!(matches!(
+            classify_tun_packet_error(PacketError::ZeroUdpChecksum),
+            DevicePacketError::Drop(message) if message.contains("malformed TUN packet")
+        ));
     }
 
     fn application_request(message_id: u16) -> Ipv6UdpCoapPacket {

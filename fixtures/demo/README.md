@@ -15,10 +15,13 @@ They are not YANG datastore JSON.
 - `21/8`: ordinary application FETCH response on UDP port 5683 with CBOR Content-Format option value 142 and a format-142 instance-sequence payload carried as residue.
 - `25/8`: ordinary header-compression fallback that carries the remaining packet bytes.
 
+Application request rules `20/8` and `25/8` map hop limits 63 and 64 with one residue bit.
+This covers packets forwarded once by the core namespace as well as locally constructed packets without fixing the research topology to one kernel forwarding behavior.
+
 `updated-rules.json` is identical except that rule `20/8` changes the `IPV6.APP_IID` target from `::5` to `::2`.
 The fixed data-client request uses `2001:db8::2` as its application/core source address and `2001:db8::1` as its device destination.
 It is handled by rule `25/8` before the update and rule `20/8` after it.
-The optimized rule carries only the request residue, so the demonstration can prove fewer SCHC bits without changing the logical request.
+The optimized rule carries only the request residue, so the demonstration can prove fewer SCHC bits without changing the application operation.
 
 The protected management rules compress the fixed IPv6, UDP, CoAP, URI, and Content-Format fields.
 Rule `29/8` fixes CoAP NON POST and code 0.02, uses the same seven-bit MID residue, and carries only the modeled duplicate-rule payload as the final variable field.

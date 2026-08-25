@@ -34,13 +34,9 @@ A release is valid only when that tuple passes the integration test suite and th
 The integration crate must reuse the public packet and CORECONF client, server, and datastore boundaries from the independent repositories.
 Duplicate packet builders, generic request codecs, and generic datastore clients are migration targets and must not become new public APIs here.
 
-## Current and target process topology
+## Demonstration process topology
 
-The current executable demonstration has three processes.
-The application CORECONF server and datastore are embedded in the SCHC device process.
-This topology remains the acceptance baseline until the reusable boundaries required by the four-process topology are available.
-
-The target demonstration has four independently replaceable roles:
+The executable demonstration has four independently replaceable roles:
 
 | Role | Responsibility |
 | --- | --- |
@@ -51,7 +47,7 @@ The target demonstration has four independently replaceable roles:
 
 The application client and server are demonstration consumers of `rustconf`.
 The SCHC core and device are the reusable managed-endpoint contribution of this repository.
-The target boundaries must permit replacement of the application SID, SCHC SID registry, SoR, datastore backend, and link transport without editing protocol internals.
+The boundaries permit replacement of the application SID, SCHC SID registry, SoR, datastore backend, and link transport without editing protocol internals.
 
 ## Management invariants
 

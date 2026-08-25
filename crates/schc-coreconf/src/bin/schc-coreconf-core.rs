@@ -1,4 +1,4 @@
-//! Core process for the localhost SCHC demonstration.
+//! Core process for the namespace SCHC demonstration.
 
 mod common;
 
@@ -14,8 +14,8 @@ use schc_coreconf::{
     decode_rule_list_payload, format_rule_detail, format_rule_list, parse_rule_duplicate_command,
     parse_rule_selector, parse_rule_update_command, rule_get_request, rule_list_request,
     ActiveContext, ContextStatus, DuplicateRuleResult, InspectionService, Ipv6UdpCoapPacket,
-    LinkRole, PacketEventLoop, PacketPoll, SchcLink, TrafficOrigin, TrafficRoute, APPLICATION_PORT,
-    CORE_LOGICAL_ADDRESS, DEVICE_LOGICAL_ADDRESS,
+    LinkRole, PacketError, PacketEventLoop, PacketPoll, SchcLink, TrafficOrigin, TrafficRoute,
+    APPLICATION_PORT, CORE_LOGICAL_ADDRESS, DEVICE_LOGICAL_ADDRESS,
 };
 #[cfg(target_os = "linux")]
 use schc_runtime::linux_tun::{LinuxTunConfig, LinuxTunDevice};
@@ -123,6 +123,12 @@ fn run() -> Result<(), String> {
                     println!("ERROR {error}");
                     false
                 }
+                Err(CorePacketError::ExpectedNonUdp(error)) => {
+                    if args.debug {
+                        println!("DEBUG {error}");
+                    }
+                    false
+                }
                 Err(CorePacketError::Fatal(error)) => return Err(error),
             };
             if args.once && completed {
@@ -141,6 +147,11 @@ fn run() -> Result<(), String> {
                     Ok(CoreFrameResult::Application) if args.once => return Ok(()),
                     Ok(CoreFrameResult::Application | CoreFrameResult::Management(_)) => {}
                     Err(CorePacketError::Drop(error)) => println!("ERROR {error}"),
+                    Err(CorePacketError::ExpectedNonUdp(error)) => {
+                        if args.debug {
+                            println!("DEBUG {error}");
+                        }
+                    }
                     Err(CorePacketError::Fatal(error)) => return Err(error),
                 }
             }
@@ -160,7 +171,19 @@ enum CorePacketError {
     #[error("{0}")]
     Drop(String),
     #[error("{0}")]
+    ExpectedNonUdp(String),
+    #[error("{0}")]
     Fatal(String),
+}
+
+#[cfg(target_os = "linux")]
+fn classify_tun_packet_error(error: PacketError) -> CorePacketError {
+    match error {
+        PacketError::UnsupportedNextHeader(next_header) => CorePacketError::ExpectedNonUdp(
+            format!("ignore non-UDP TUN packet: IPv6 next header {next_header}"),
+        ),
+        error => CorePacketError::Drop(format!("drop malformed TUN packet: {error}")),
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -170,8 +193,7 @@ fn process_core_tun_packet(
     bytes: &[u8],
     debug: bool,
 ) -> Result<(), CorePacketError> {
-    let packet = Ipv6UdpCoapPacket::parse(bytes)
-        .map_err(|error| CorePacketError::Drop(format!("drop malformed TUN packet: {error}")))?;
+    let packet = Ipv6UdpCoapPacket::parse(bytes).map_err(classify_tun_packet_error)?;
     if packet.source() != CORE_LOGICAL_ADDRESS
         || packet.destination() != DEVICE_LOGICAL_ADDRESS
         || packet.source_port() != APPLICATION_PORT
@@ -268,6 +290,11 @@ fn wait_management_response<D: PacketDevice>(
             match process_core_tun_packet(link, raw_link, &packet, debug) {
                 Ok(()) => {}
                 Err(CorePacketError::Drop(error)) => println!("ERROR {error}"),
+                Err(CorePacketError::ExpectedNonUdp(error)) => {
+                    if debug {
+                        println!("DEBUG {error}");
+                    }
+                }
                 Err(CorePacketError::Fatal(error)) => return Err(error),
             }
         }
@@ -283,6 +310,11 @@ fn wait_management_response<D: PacketDevice>(
                     Ok(CoreFrameResult::Management(exchange)) => return Ok(*exchange),
                     Ok(CoreFrameResult::Application) => {}
                     Err(CorePacketError::Drop(error)) => println!("ERROR {error}"),
+                    Err(CorePacketError::ExpectedNonUdp(error)) => {
+                        if debug {
+                            println!("DEBUG {error}");
+                        }
+                    }
                     Err(CorePacketError::Fatal(error)) => return Err(error),
                 }
             }
@@ -783,7 +815,7 @@ mod tests {
     use schc_core::RuleId;
     use schc_coreconf::{
         context_check_request, protected_management_rule_ids, temporary_ordinary_response,
-        ActiveContext, InspectionService, Ipv6UdpCoapPacket, LinkOperation, LinkRole,
+        ActiveContext, InspectionService, Ipv6UdpCoapPacket, LinkOperation, LinkRole, PacketError,
         PacketEventLoop, PreparedContext, ProtectionPolicy, RawUdpLink, SchcLink, TrafficOrigin,
         TrafficRoute, APPLICATION_PORT, CORE_LOGICAL_ADDRESS, DEVICE_LOGICAL_ADDRESS,
     };
@@ -791,9 +823,9 @@ mod tests {
     use schc_runtime::{DeviceId, DeviceProfile};
 
     use super::{
-        execute_rule_update, process_core_raw_frame, process_core_tun_packet,
-        validate_changed_response, wait_management_response, CommandResult, CoreFrameResult,
-        CorePacketError,
+        classify_tun_packet_error, execute_rule_update, process_core_raw_frame,
+        process_core_tun_packet, validate_changed_response, wait_management_response,
+        CommandResult, CoreFrameResult, CorePacketError,
     };
 
     const SID: &str = include_str!("../../../../fixtures/demo/ietf-schc@2026-05-07.sid");
@@ -1353,6 +1385,18 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    #[test]
+    fn non_udp_tun_traffic_is_quiet_but_supported_malformed_packets_are_errors() {
+        assert!(matches!(
+            classify_tun_packet_error(PacketError::UnsupportedNextHeader(58)),
+            CorePacketError::ExpectedNonUdp(message) if message.contains("non-UDP")
+        ));
+        assert!(matches!(
+            classify_tun_packet_error(PacketError::ZeroUdpChecksum),
+            CorePacketError::Drop(message) if message.contains("malformed TUN packet")
+        ));
+    }
+
     #[test]
     fn core_tun_wrong_orientation_drops_then_valid_packet_recovers() {
         let core = SchcLink::new(active("core-recovery"), LinkRole::Core);

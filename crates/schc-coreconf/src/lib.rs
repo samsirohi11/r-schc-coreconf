@@ -5,7 +5,7 @@
 //!
 //! This crate binds the r-schc rule context, a rustconf model/tree, and a
 //! schc-runtime runtime in one immutable snapshot, then carries validated
-//! logical packets over a raw localhost UDP SCHC link. Management RPC
+//! logical packets over a raw UDP SCHC link. Management RPC
 //! semantics are added by higher-level components.
 
 mod application;

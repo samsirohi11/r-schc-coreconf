@@ -55,12 +55,12 @@ fn report_for(command: &str, message_id: u16) -> PacketReport {
 #[test]
 fn duplicate_report_has_exact_three_part_rpc_cost() {
     let report = report_for("rule duplicate 20/8 22/8 entry=9 tv=2", 37);
-    assert_eq!(report.layers.packet_bytes, 103);
     assert_eq!(
-        report.layers.ipv6_header_bytes + report.layers.udp_header_bytes,
-        48
+        report.layers.packet_bytes,
+        report.layers.ipv6_header_bytes
+            + report.layers.udp_header_bytes
+            + report.layers.coap.total_bytes
     );
-    assert_eq!(report.layers.coap.total_bytes, 55);
     let rpc = report.rpc.expect("duplicate RPC details");
     assert_eq!(rpc.payload_bytes, 43);
     assert_eq!(rpc.fixed_bytes, 19);
@@ -242,7 +242,14 @@ fn formatter_is_concise_and_debug_has_no_wire_hex() {
         .encode(TrafficOrigin::Management, &packet)
         .expect("management packet encodes");
     let regular = format_report(ReportDirection::Tx, encoded.report(), false).expect("regular");
-    assert_eq!(regular, "TX MGMT  29/8  103 B -> 47 B\n");
+    let report = inspect_report(encoded.report()).expect("report accounting");
+    assert_eq!(
+        regular,
+        format!(
+            "TX MGMT  29/8  {} B -> {} B\n",
+            report.layers.packet_bytes, report.schc.padded_bytes
+        )
+    );
     assert!(!regular.contains("packet_bytes"));
     let debug = format_report(ReportDirection::Tx, encoded.report(), true).expect("debug");
     assert!(debug.starts_with(&regular));

@@ -15,8 +15,8 @@ const INITIAL_RULES: &str = include_str!("../../../fixtures/demo/initial-rules.j
 const UPDATED_RULES: &str = include_str!("../../../fixtures/demo/updated-rules.json");
 const INITIAL_SOR: &[u8] = include_bytes!("../../../fixtures/demo/initial.sor");
 const UPDATED_SOR: &[u8] = include_bytes!("../../../fixtures/demo/updated.sor");
-const INITIAL_SOR_SHA256: &str = "22825e10e006255e8683b524a42b94e03e37613714f3db71a6ad9a0a7bba05c7";
-const UPDATED_SOR_SHA256: &str = "d739ae0aaf1b5c184bae5c061d91d058f7f3cea1f65522383619a3826bfae61e";
+const INITIAL_SOR_SHA256: &str = "142993758d6f11191f1089ea54d1f84c5884f5d8da9c3dcbbe49b2ca89c0acc3";
+const UPDATED_SOR_SHA256: &str = "b0cc95cd5c84a838c84f7c9d77d62f58d453655f1792bcd237fa49089e9b1645";
 
 fn source(document: &str) -> Value {
     serde_json::from_str(document).expect("OpenSCHC rule source")
