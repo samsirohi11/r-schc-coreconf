@@ -49,6 +49,118 @@ fn active() -> Arc<ActiveContext> {
     Arc::new(ActiveContext::new(prepared))
 }
 
+const FIRST_FLOW_OVERRIDES: [(usize, &str, &str); 7] = [
+    (2, "0", "AA=="),
+    (6, "2306139568115548160", "IAENuAAAAAA="),
+    (7, "1", "AAAAAAAAAAE="),
+    (8, "2306139568115548160", "IAENuAAAAAA="),
+    (9, "2", "AAAAAAAAAAI="),
+    (10, "5683", "FjM="),
+    (11, "5683", "FjM="),
+];
+
+fn generic_base_active() -> Arc<ActiveContext> {
+    let base = active();
+    let mut tree = base.tree();
+    let entries = tree["ietf-schc:schc"]["rule"][2]["entry"]
+        .as_array_mut()
+        .expect("source entries");
+    for &(entry_index, _, value) in &FIRST_FLOW_OVERRIDES {
+        entries[entry_index]["target-value"][0]["value"] = serde_json::json!(match entry_index {
+            6 | 8 => "IAENuQAAAAA=",
+            7 | 9 => "AAAAAAAAAAk=",
+            10 | 11 => "FjQ=",
+            _ => "AQ==",
+        });
+        assert_ne!(entries[entry_index]["target-value"][0]["value"], value);
+    }
+    let prepared = PreparedContext::from_tree(
+        SID,
+        tree,
+        DeviceId::new("management-test-device").expect("device"),
+        DeviceProfile::default(),
+        ProtectionPolicy::from_rule_ids(protected_management_rule_ids()),
+    )
+    .expect("generic base context");
+    Arc::new(ActiveContext::new(prepared))
+}
+
+fn first_flow_command(destination: usize, count: usize) -> String {
+    let mut command = format!("rule duplicate 20/8 {destination}/8");
+    for &(entry_index, target_value, _) in FIRST_FLOW_OVERRIDES.iter().take(count) {
+        command.push_str(&format!(" entry={entry_index} tv={target_value}"));
+    }
+    command
+}
+
+fn tree_rule(tree: &Value, rule_id: u64) -> &Value {
+    tree["ietf-schc:schc"]["rule"]
+        .as_array()
+        .expect("rule list")
+        .iter()
+        .find(|rule| rule["rule-id-value"] == serde_json::json!(rule_id))
+        .expect("rule")
+}
+
+fn tamper_second_target_value(datagram: &[u8]) -> Vec<u8> {
+    let mut packet = Packet::from_bytes(datagram).expect("duplicate packet");
+    let mut payload: CborValue =
+        ciborium::de::from_reader(Cursor::new(&packet.payload)).expect("RPC payload");
+    let CborValue::Map(root) = &mut payload else {
+        panic!("RPC root is not a map");
+    };
+    let (_, operation) = root
+        .iter_mut()
+        .find(|(key, _)| *key == CborValue::Integer(2680.into()))
+        .expect("duplicate-rule root");
+    let CborValue::Map(operation) = operation else {
+        panic!("duplicate-rule operation is not a map");
+    };
+    let (_, request) = operation
+        .iter_mut()
+        .find(|(key, _)| *key == CborValue::Integer(1.into()))
+        .expect("duplicate-rule request");
+    let CborValue::Map(request) = request else {
+        panic!("duplicate-rule request is not a map");
+    };
+    let (_, inner) = request
+        .iter_mut()
+        .find(|(key, _)| *key == CborValue::Integer(4.into()))
+        .expect("duplicate-rule iPATCH sequence");
+    let CborValue::Bytes(inner) = inner else {
+        panic!("duplicate-rule iPATCH sequence is not bytes");
+    };
+    let mut cursor = Cursor::new(inner.as_slice());
+    let mut instances = Vec::new();
+    while (cursor.position() as usize) < inner.len() {
+        instances.push(ciborium::de::from_reader(&mut cursor).expect("iPATCH instance"));
+    }
+    assert_eq!(instances.len(), 2);
+    fn replace_bytes(value: &mut CborValue) -> bool {
+        match value {
+            CborValue::Bytes(bytes) if bytes.len() == 8 => {
+                let _ = bytes;
+                *value = CborValue::Text("invalid-target".into());
+                true
+            }
+            CborValue::Array(values) => values.iter_mut().any(replace_bytes),
+            CborValue::Map(entries) => entries
+                .iter_mut()
+                .any(|(key, value)| replace_bytes(key) || replace_bytes(value)),
+            CborValue::Tag(_, value) => replace_bytes(value),
+            _ => false,
+        }
+    }
+    assert!(replace_bytes(&mut instances[1]));
+    inner.clear();
+    for instance in instances {
+        ciborium::ser::into_writer(&instance, &mut *inner).expect("tampered iPATCH instance");
+    }
+    packet.payload.clear();
+    ciborium::ser::into_writer(&payload, &mut packet.payload).expect("tampered RPC payload");
+    packet.to_bytes().expect("tampered duplicate packet")
+}
+
 fn target_ipatch_datagram(payload: Vec<u8>, message_id: u16) -> Vec<u8> {
     target_ipatch_datagram_with_format(payload, message_id, 142)
 }
@@ -1273,6 +1385,164 @@ fn duplicate_rule_is_modeled_atomic_and_idempotent_without_response() {
         .unwrap()
         .is_none());
     assert_eq!(active.generation(), generation + 1);
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn duplicate_rule_generic_base_first_flow_creates_all_seven_overrides_and_replay_is_idempotent() {
+    let active = generic_base_active();
+    let before = active.snapshot();
+    let source_before_rule = tree_rule(before.tree(), 20).clone();
+    let mut service = InspectionService::new(active.clone()).expect("service");
+    let command = first_flow_command(22, FIRST_FLOW_OVERRIDES.len());
+    let request = parse_rule_duplicate_command(&command).expect("first-flow request");
+    assert_eq!(
+        request
+            .overrides
+            .iter()
+            .map(|override_| override_.entry_index)
+            .collect::<Vec<_>>(),
+        FIRST_FLOW_OVERRIDES
+            .iter()
+            .map(|(entry_index, _, _)| *entry_index)
+            .collect::<Vec<_>>()
+    );
+    for &(entry_index, _, target_value) in &FIRST_FLOW_OVERRIDES {
+        assert_ne!(
+            source_before_rule["entry"][entry_index]["target-value"][0]["value"],
+            target_value
+        );
+    }
+    let source_before_detail = service
+        .detail(parse_rule_selector("20/8").expect("source selector"))
+        .expect("source detail");
+    let datagram = service
+        .duplicate_rule_datagram(&request, 70)
+        .expect("first-flow datagram");
+
+    assert!(service
+        .handle_datagram_no_response(&datagram)
+        .expect("first-flow request succeeds")
+        .is_none());
+    let after = active.snapshot();
+    assert_eq!(after.generation(), before.generation() + 1);
+    assert_ne!(after.digest(), before.digest());
+    assert_ne!(after.tag(), before.tag());
+    assert_ne!(after.tree(), before.tree());
+    assert_ne!(Arc::as_ptr(&after), Arc::as_ptr(&before));
+    assert_eq!(tree_rule(after.tree(), 20), &source_before_rule);
+    assert_eq!(
+        after.tree()["ietf-schc:schc"]["rule"]
+            .as_array()
+            .expect("rules")
+            .iter()
+            .filter(|rule| rule["rule-id-value"] == serde_json::json!(22))
+            .count(),
+        1
+    );
+    let destination = tree_rule(after.tree(), 22);
+    for &(entry_index, _, target_value) in &FIRST_FLOW_OVERRIDES {
+        assert_eq!(
+            destination["entry"][entry_index]["target-value"][0]["value"], target_value,
+            "entry {entry_index} target value"
+        );
+    }
+    assert_eq!(
+        service
+            .detail(parse_rule_selector("20/8").expect("source selector"))
+            .expect("source detail after publication"),
+        source_before_detail
+    );
+
+    let replay_before = active.snapshot();
+    let replay_generation = replay_before.generation();
+    let replay_tag = replay_before.tag();
+    let replay_digest = replay_before.digest();
+    let replay_tree = replay_before.tree().clone();
+    assert!(service
+        .handle_datagram_no_response(&datagram)
+        .expect("replay succeeds")
+        .is_none());
+    let replay_after = active.snapshot();
+    assert_eq!(replay_after.generation(), replay_generation);
+    assert_eq!(replay_after.tag(), replay_tag);
+    assert_eq!(replay_after.digest(), replay_digest);
+    assert_eq!(replay_after.tree(), &replay_tree);
+    assert!(Arc::ptr_eq(&replay_before, &replay_after));
+}
+
+#[test]
+fn duplicate_rule_override_counts_1_2_3_5_7_each_publish_once_and_keep_source_unchanged() {
+    for (count, destination_id) in [(1, 30), (2, 31), (3, 32), (5, 33), (7, 34)] {
+        let active = generic_base_active();
+        let before = active.snapshot();
+        let source_before_rule = tree_rule(before.tree(), 20).clone();
+        let command = first_flow_command(destination_id, count);
+        let request = parse_rule_duplicate_command(&command).expect("table request");
+        assert_eq!(request.overrides.len(), count);
+        assert_eq!(
+            request
+                .overrides
+                .iter()
+                .map(|override_| override_.entry_index)
+                .collect::<Vec<_>>(),
+            FIRST_FLOW_OVERRIDES[..count]
+                .iter()
+                .map(|(entry_index, _, _)| *entry_index)
+                .collect::<Vec<_>>()
+        );
+        let mut service = InspectionService::new(active.clone()).expect("service");
+        let datagram = service
+            .duplicate_rule_datagram(&request, 80 + count as u16)
+            .expect("table datagram");
+        assert!(service
+            .handle_datagram_no_response(&datagram)
+            .expect("table request succeeds")
+            .is_none());
+        let after = active.snapshot();
+        assert_eq!(after.generation(), before.generation() + 1);
+        assert_eq!(tree_rule(after.tree(), 20), &source_before_rule);
+        let destination = tree_rule(after.tree(), destination_id as u64);
+        for &(entry_index, _, target_value) in FIRST_FLOW_OVERRIDES.iter().take(count) {
+            assert_eq!(
+                destination["entry"][entry_index]["target-value"][0]["value"], target_value,
+                "destination {destination_id}, entry {entry_index}"
+            );
+        }
+    }
+}
+
+#[test]
+fn duplicate_rule_invalid_multi_entry_request_is_atomic_at_device_handler() {
+    let active = generic_base_active();
+    let before = active.snapshot();
+    let before_tree = before.tree().clone();
+    let before_sor = before.sor().to_vec();
+    let before_generation = before.generation();
+    let before_tag = before.tag();
+    let before_digest = before.digest();
+    let before_runtime = before.runtime_arc();
+    let mut service = InspectionService::new(active.clone()).expect("service");
+    let request = parse_rule_duplicate_command(&first_flow_command(35, 2))
+        .expect("valid request before wire tampering");
+    assert_eq!(request.overrides.len(), 2);
+    let datagram = service
+        .duplicate_rule_datagram(&request, 90)
+        .expect("valid duplicate datagram");
+    let tampered = tamper_second_target_value(&datagram);
+
+    assert!(service.handle_datagram_no_response(&tampered).is_err());
+    assert!(service
+        .detail(parse_rule_selector("35/8").expect("destination selector"))
+        .is_err());
+    let after = active.snapshot();
+    assert_eq!(after.tree(), &before_tree);
+    assert_eq!(after.sor(), before_sor.as_slice());
+    assert_eq!(after.generation(), before_generation);
+    assert_eq!(after.tag(), before_tag);
+    assert_eq!(after.digest(), before_digest);
+    assert!(Arc::ptr_eq(&after, &before));
+    assert!(Arc::ptr_eq(&after.runtime_arc(), &before_runtime));
 }
 
 #[test]

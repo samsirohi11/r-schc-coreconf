@@ -52,6 +52,62 @@ fn report_for(command: &str, message_id: u16) -> PacketReport {
     inspect_report(encoded.report()).expect("report accounting")
 }
 
+const FIRST_FLOW_TARGETS: [(usize, &str); 7] = [
+    (2, "0"),
+    (6, "2306139568115548160"),
+    (7, "1"),
+    (8, "2306139568115548160"),
+    (9, "2"),
+    (10, "5683"),
+    (11, "5683"),
+];
+
+fn first_flow_command(destination: usize, count: usize) -> String {
+    let mut command = format!("rule duplicate 20/8 {destination}/8");
+    for &(entry_index, target_value) in FIRST_FLOW_TARGETS.iter().take(count) {
+        command.push_str(&format!(" entry={entry_index} tv={target_value}"));
+    }
+    command
+}
+
+#[test]
+fn duplicate_report_measurements_cover_1_2_3_5_7_overrides() {
+    let cases = [
+        (1, &[2][..], 38, 331, 42),
+        (2, &[2, 6][..], 62, 523, 66),
+        (3, &[2, 6, 7][..], 85, 707, 89),
+        (5, &[2, 6, 7, 8, 9][..], 131, 1075, 135),
+        (7, &[2, 6, 7, 8, 9, 10, 11][..], 165, 1347, 169),
+    ];
+    let mut mismatches = Vec::new();
+    for (count, expected_indices, expected_payload, expected_bits, expected_transmitted) in cases {
+        let report = report_for(&first_flow_command(40 + count, count), 100 + count as u16);
+        let rpc = report.rpc.expect("duplicate RPC details");
+        let indices = rpc
+            .overrides
+            .iter()
+            .map(|override_| override_.entry_index)
+            .collect::<Vec<_>>();
+        assert_eq!(rpc.overrides.len(), count);
+        assert_eq!(indices, expected_indices);
+        let actual = (
+            rpc.payload_bytes,
+            report.schc.meaningful_bits,
+            report.schc.padded_bytes,
+        );
+        if actual != (expected_payload, expected_bits, expected_transmitted) {
+            mismatches.push(format!(
+                "{count} overrides: expected ({expected_payload}, {expected_bits}, {expected_transmitted}), actual {actual:?}"
+            ));
+        }
+    }
+    assert!(
+        mismatches.is_empty(),
+        "measurement mismatches:\n{}",
+        mismatches.join("\n")
+    );
+}
+
 #[test]
 fn duplicate_report_has_exact_three_part_rpc_cost() {
     let report = report_for("rule duplicate 20/8 22/8 entry=9 tv=2", 37);
