@@ -9,8 +9,9 @@ use coreconf_model::instance_id::{encode_identifiers, InstancePath};
 use schc_core::{RuleId, SidRegistry};
 use schc_coreconf::{
     context_check_request, management_bit_breakdown, protected_management_rule_ids,
-    rule_get_request, rule_list_request, temporary_ordinary_response, ActiveContext,
-    GenericDataService, Ipv6UdpCoapPacket, LinkRole, PreparedContext, ProtectionPolicy, RawUdpLink,
+    rule_get_request, rule_list_request, temporary_ordinary_response, ActiveContext, FlowChange,
+    FlowDirection, GenericDataService, InspectionService, Ipv6UdpCoapPacket, Ipv6UdpPacket,
+    LinkRole, PacketMetadata, PreparedContext, ProtectionPolicy, RawUdpLink, RuleAllocationPolicy,
     SchcLink, TrafficClass, TrafficOrigin, TrafficRoute, APPLICATION_PORT, CORE_LOGICAL_ADDRESS,
     DEVICE_LOGICAL_ADDRESS, MANAGEMENT_PORT,
 };
@@ -18,6 +19,9 @@ use schc_runtime::{DeviceId, DeviceProfile};
 
 const SID: &str = include_str!("../../../fixtures/demo/ietf-schc@2026-05-07.sid");
 const SOR: &[u8] = include_bytes!("../../../fixtures/demo/initial.sor");
+const GENERIC_SID: &str =
+    include_str!("../../../fixtures/generic-ipv6-udp/ietf-schc@2026-05-07.sid");
+const GENERIC_SOR: &[u8] = include_bytes!("../../../fixtures/generic-ipv6-udp/initial.sor");
 
 fn active(name: &str) -> Arc<ActiveContext> {
     Arc::new(ActiveContext::new(
@@ -29,6 +33,19 @@ fn active(name: &str) -> Arc<ActiveContext> {
             ProtectionPolicy::from_rule_ids(protected_management_rule_ids()),
         )
         .expect("initial context"),
+    ))
+}
+
+fn generic_ipv6_udp_active(name: &str) -> Arc<ActiveContext> {
+    Arc::new(ActiveContext::new(
+        PreparedContext::from_sor_with_policy(
+            GENERIC_SID,
+            GENERIC_SOR,
+            DeviceId::new(name).expect("device ID"),
+            DeviceProfile::default(),
+            ProtectionPolicy::from_rule_ids(protected_management_rule_ids()),
+        )
+        .expect("generic UDP context"),
     ))
 }
 
@@ -154,6 +171,150 @@ fn ordinary_request_and_response_reconstruct_exactly_with_reports() {
     );
     assert_eq!(reconstructed.packet().coap_message().message_id(), 0x1001);
     assert_eq!(reconstructed.packet().coap_message().token(), &[0xaa]);
+}
+
+#[test]
+fn raw_link_api_round_trips_complete_ipv6_udp_bytes_without_coap_parsing() {
+    let core = SchcLink::new(generic_ipv6_udp_active("core-raw-bytes"), LinkRole::Core);
+    let device = SchcLink::new(
+        generic_ipv6_udp_active("device-raw-bytes"),
+        LinkRole::Device,
+    );
+    let packet = Ipv6UdpPacket::new(
+        PacketMetadata::new(
+            "2001:db9::9".parse().expect("generic application address"),
+            "2001:db9::9".parse().expect("generic device address"),
+            5684,
+            5684,
+            0,
+            1,
+            64,
+        ),
+        &coap(0, 1, 0x1201, &[0xaa], Some(b"raw API")),
+    )
+    .expect("logical IPv6/UDP packet");
+    let encoded = core
+        .encode_bytes(TrafficOrigin::Application, packet.as_bytes())
+        .expect("raw application bytes encode");
+    let decoded = device
+        .decode_bytes(encoded.frame().bytes())
+        .expect("raw application bytes decode");
+    assert_eq!(decoded.packet(), packet.as_bytes());
+    assert_eq!(decoded.rule_id(), encoded.report().rule_id);
+    assert_eq!(decoded.report().frame_bytes, encoded.frame().bytes());
+}
+
+#[test]
+fn raw_link_api_round_trips_arbitrary_udp_payload_with_generic_payload_rule() {
+    let core = SchcLink::new(generic_ipv6_udp_active("core-generic-udp"), LinkRole::Core);
+    let device = SchcLink::new(
+        generic_ipv6_udp_active("device-generic-udp"),
+        LinkRole::Device,
+    );
+    let packet = Ipv6UdpPacket::new(
+        PacketMetadata::new(
+            "2001:db9::9".parse().expect("generic application address"),
+            "2001:db9::9".parse().expect("generic device address"),
+            5684,
+            5684,
+            0,
+            1,
+            64,
+        ),
+        b"arbitrary UDP payload",
+    )
+    .expect("logical IPv6/UDP packet");
+    let encoded = core
+        .encode_bytes(TrafficOrigin::Application, packet.as_bytes())
+        .expect("generic UDP bytes encode");
+    let decoded = device
+        .decode_bytes(encoded.frame().bytes())
+        .expect("generic UDP bytes decode");
+    assert_eq!(decoded.packet(), packet.as_bytes());
+    assert_eq!(decoded.route(), TrafficRoute::Application);
+}
+
+#[test]
+fn flow_change_plans_real_generic_udp_duplicate_without_caller_rule_id() {
+    let active = generic_ipv6_udp_active("flow-change-generic-udp");
+    let service = InspectionService::new(Arc::clone(&active)).expect("inspection service");
+    let packet = Ipv6UdpPacket::new(
+        PacketMetadata::new(
+            CORE_LOGICAL_ADDRESS,
+            DEVICE_LOGICAL_ADDRESS,
+            APPLICATION_PORT,
+            APPLICATION_PORT,
+            0,
+            0,
+            64,
+        ),
+        b"payload",
+    )
+    .expect("logical IPv6/UDP packet");
+    let fallback_frame = SchcLink::new(Arc::clone(&active), LinkRole::Core)
+        .encode_bytes(TrafficOrigin::Application, packet.as_bytes())
+        .expect("generic fallback must encode the new flow");
+    assert_eq!(fallback_frame.report().rule_id, RuleId::new(21, 8));
+    let fallback_decoded = SchcLink::new(
+        generic_ipv6_udp_active("flow-change-generic-udp-fallback-peer"),
+        LinkRole::Device,
+    )
+    .decode_bytes(fallback_frame.frame().bytes())
+    .expect("generic fallback must decode the new flow");
+    assert_eq!(fallback_decoded.packet(), packet.as_bytes());
+    let change = service
+        .flow_change(
+            &packet,
+            FlowDirection::Downlink,
+            RuleAllocationPolicy::default(),
+        )
+        .expect("flow change");
+    let FlowChange::Duplicate { parent, request } = change else {
+        panic!("changed flow must require a duplicate rule");
+    };
+    assert_eq!(parent, request.source);
+    assert_eq!(request.overrides.len(), 7);
+    assert_ne!(request.destination, request.source);
+    assert_eq!(
+        request
+            .overrides
+            .iter()
+            .map(|override_| (override_.entry_index, override_.target_value.as_deref()))
+            .collect::<Vec<_>>(),
+        vec![
+            (2, Some("0")),
+            (6, Some("2306139568115548160")),
+            (7, Some("1")),
+            (8, Some("2306139568115548160")),
+            (9, Some("2")),
+            (10, Some("5683")),
+            (11, Some("5683")),
+        ]
+    );
+
+    let matching = generic_ipv6_udp_active("flow-change-matching-generic-udp");
+    let matching_service = InspectionService::new(matching).expect("matching inspection service");
+    let matching_packet = Ipv6UdpPacket::new(
+        PacketMetadata::new(
+            "2001:db9::9".parse().expect("generic application address"),
+            "2001:db9::9".parse().expect("generic device address"),
+            5684,
+            5684,
+            0,
+            1,
+            64,
+        ),
+        b"arbitrary UDP payload",
+    )
+    .expect("matching logical IPv6/UDP packet");
+    let matching_change = matching_service
+        .flow_change(
+            &matching_packet,
+            FlowDirection::Downlink,
+            RuleAllocationPolicy::default(),
+        )
+        .expect("matching flow change");
+    assert!(matches!(matching_change, FlowChange::AlreadyMatches { .. }));
 }
 
 #[test]

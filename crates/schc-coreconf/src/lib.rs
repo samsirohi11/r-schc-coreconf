@@ -24,9 +24,10 @@ pub use context::{
     PreparedContext, CONTEXT_TAG_LEN,
 };
 pub use link::{
-    temporary_ordinary_response, LinkDecoded, LinkEncoding, LinkError, LinkOperation, LinkReport,
-    LinkRole, RawDatagram, RawUdpLink, SchcLink, TrafficClass, TrafficOrigin, TrafficRoute,
-    APPLICATION_PORT, CORE_LOGICAL_ADDRESS, DEVICE_LOGICAL_ADDRESS, MANAGEMENT_PORT,
+    temporary_ordinary_response, LinkDecoded, LinkDecodedBytes, LinkEncoding, LinkError,
+    LinkOperation, LinkReport, LinkRole, RawDatagram, RawUdpLink, SchcLink, TrafficClass,
+    TrafficOrigin, TrafficRoute, APPLICATION_PORT, CORE_LOGICAL_ADDRESS, DEVICE_LOGICAL_ADDRESS,
+    MANAGEMENT_PORT,
 };
 pub use management::{
     context_check_request, context_check_response, decode_context_check_payload,
@@ -35,15 +36,16 @@ pub use management::{
     management_bit_breakdown, parse_rule_duplicate_command, parse_rule_selector,
     parse_rule_update_command, prepare_management_request, rule_get_request, rule_list_request,
     validate_management_response, ContextCheckResult, ContextStatus, DuplicateRpcCost,
-    DuplicateRpcOverride, DuplicateRuleResult, InspectionError, InspectionService,
-    ManagementBitBreakdown, ManagementExchange, PreparedManagementRequest, ResolvedRuleUpdate,
-    RuleDetail, RuleDuplicateOverride, RuleDuplicateRequest, RuleEntry, RuleEntrySelector,
-    RuleSelector, RuleSummary, RuleUpdateRequest, CONTEXT_CHECK_MARKER,
+    DuplicateRpcOverride, DuplicateRuleResult, FlowChange, FlowDirection, InspectionError,
+    InspectionService, ManagementBitBreakdown, ManagementExchange, PreparedManagementRequest,
+    ResolvedRuleUpdate, RuleAllocationPolicy, RuleDetail, RuleDuplicateOverride,
+    RuleDuplicateRequest, RuleEntry, RuleEntrySelector, RuleSelector, RuleSummary,
+    RuleUpdateRequest, CONTEXT_CHECK_MARKER,
 };
 pub use packet::{
-    CoapMessage, CoapOption, Ipv6UdpCoapPacket, PacketError, PacketMetadata, PacketResult,
-    DEFAULT_FLOW_LABEL, DEFAULT_HOP_LIMIT, DEFAULT_TRAFFIC_CLASS, IPV6_HEADER_LEN, IPV6_VERSION,
-    MAX_COAP_DATAGRAM_LEN, UDP_HEADER_LEN, UDP_NEXT_HEADER,
+    CoapMessage, CoapOption, Ipv6UdpCoapPacket, Ipv6UdpPacket, PacketError, PacketMetadata,
+    PacketResult, DEFAULT_FLOW_LABEL, DEFAULT_HOP_LIMIT, DEFAULT_TRAFFIC_CLASS, IPV6_HEADER_LEN,
+    IPV6_VERSION, MAX_COAP_DATAGRAM_LEN, MAX_UDP_PAYLOAD_LEN, UDP_HEADER_LEN, UDP_NEXT_HEADER,
 };
 pub use packet_loop::{PacketEventLoop, PacketLoopError, PacketPoll};
 pub use policy::{ProtectedRule, ProtectedRules, ProtectionPolicy};

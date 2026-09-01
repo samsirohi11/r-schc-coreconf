@@ -14,7 +14,7 @@ use schc_runtime::{DeviceId, NodeRole, RuntimeError, SchcFrame};
 pub use schc_runtime::NodeRole as LinkRole;
 use thiserror::Error;
 
-use crate::{ActiveContext, Ipv6UdpCoapPacket, PacketError, PacketResult};
+use crate::{ActiveContext, Ipv6UdpCoapPacket, Ipv6UdpPacket, PacketError, PacketResult};
 
 /// The fixed logical address used by the demonstration core.
 pub const CORE_LOGICAL_ADDRESS: std::net::Ipv6Addr =
@@ -74,7 +74,7 @@ pub enum LinkOperation {
 
 /// Complete observability for one SCHC operation.
 ///
-/// `packet_bytes` always contains a complete IPv6/UDP/CoAP packet and
+/// `packet_bytes` always contains a complete IPv6/UDP packet and
 /// `frame_bytes` always contains only the padded SCHC frame.  They are kept
 /// separate so callers cannot accidentally treat a link frame as an IP packet.
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -196,6 +196,57 @@ impl LinkEncoding {
     #[must_use]
     pub fn into_frame(self) -> SchcFrame {
         self.frame
+    }
+}
+
+/// A successful inbound raw SCHC decode and rule-derived route.
+///
+/// The reconstructed packet is validated as IPv6/UDP, but its UDP payload is
+/// intentionally left opaque. CoAP callers can use [`LinkDecoded`] instead.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct LinkDecodedBytes {
+    packet: Vec<u8>,
+    rule_id: RuleId,
+    traffic_class: TrafficClass,
+    route: TrafficRoute,
+    report: LinkReport,
+}
+
+impl LinkDecodedBytes {
+    /// Returns the reconstructed complete IPv6/UDP packet.
+    #[must_use]
+    pub fn packet(&self) -> &[u8] {
+        &self.packet
+    }
+
+    /// Returns the exact matched `RuleID`.
+    #[must_use]
+    pub const fn rule_id(&self) -> RuleId {
+        self.rule_id
+    }
+
+    /// Returns the rule-derived traffic class.
+    #[must_use]
+    pub const fn traffic_class(&self) -> TrafficClass {
+        self.traffic_class
+    }
+
+    /// Returns the route authorized by the matched rule.
+    #[must_use]
+    pub const fn route(&self) -> TrafficRoute {
+        self.route
+    }
+
+    /// Returns the operation report.
+    #[must_use]
+    pub const fn report(&self) -> &LinkReport {
+        &self.report
+    }
+
+    /// Consumes the result and returns the reconstructed packet.
+    #[must_use]
+    pub fn into_packet(self) -> Vec<u8> {
+        self.packet
     }
 }
 
@@ -349,13 +400,33 @@ impl SchcLink {
         origin: TrafficOrigin,
         packet: &Ipv6UdpCoapPacket,
     ) -> Result<LinkEncoding, LinkError> {
+        self.encode_bytes(origin, packet.as_bytes())
+    }
+
+    /// Compresses one complete logical IPv6/UDP packet.
+    ///
+    /// The UDP payload is opaque to this API. The returned frame is the exact
+    /// padded byte sequence produced by r-schc, and its report retains the
+    /// meaningful bit length and selected `RuleID`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LinkError`] when SCHC compression fails, the packet is not a
+    /// complete valid IPv6/UDP packet, or the selected rule does not match the
+    /// declared origin.
+    pub fn encode_bytes(
+        &self,
+        origin: TrafficOrigin,
+        packet: &[u8],
+    ) -> Result<LinkEncoding, LinkError> {
+        Ipv6UdpPacket::parse(packet)?;
         let snapshot = self.active.snapshot();
         let (endpoint, flow) = self.role.outbound();
         let runtime = match origin {
             TrafficOrigin::Application => snapshot.application_runtime(),
             TrafficOrigin::Management => snapshot.runtime(),
         };
-        let encoded = runtime.encode_detailed(&self.device, endpoint, flow, packet.as_bytes())?;
+        let encoded = runtime.encode_detailed(&self.device, endpoint, flow, packet)?;
         let class = classify(&snapshot, encoded.rule_id())?;
         enforce_origin(origin, encoded.rule_id(), class)?;
         let management_rule = (class == TrafficClass::ProtectedManagement)
@@ -373,7 +444,7 @@ impl SchcLink {
             snapshot.generation(),
             encoded.rule_id(),
             class,
-            packet.as_bytes(),
+            packet,
             encoded.frame(),
             management_rule,
             management_rpc_sid,
@@ -392,6 +463,28 @@ impl SchcLink {
     /// Returns [`LinkError`] when decompression fails, the frame is empty, or
     /// the reconstructed logical packet is malformed.
     pub fn decode(&self, frame: &[u8]) -> Result<LinkDecoded, LinkError> {
+        let decoded = self.decode_bytes(frame)?;
+        let packet = Ipv6UdpCoapPacket::parse(decoded.packet())?;
+        Ok(LinkDecoded {
+            packet,
+            rule_id: decoded.rule_id,
+            traffic_class: decoded.traffic_class,
+            route: decoded.route,
+            report: decoded.report,
+        })
+    }
+
+    /// Decompresses one raw padded SCHC frame into complete IPv6/UDP bytes.
+    ///
+    /// The UDP payload is not interpreted as CoAP. The frame is validated by
+    /// the real decompressor, the reconstructed IPv6/UDP packet is checksum
+    /// checked, and canonical re-encoding rejects non-canonical frames.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LinkError`] when the frame is empty, decompression fails, the
+    /// reconstructed packet is malformed, or the frame is non-canonical.
+    pub fn decode_bytes(&self, frame: &[u8]) -> Result<LinkDecodedBytes, LinkError> {
         if frame.is_empty() {
             return Err(LinkError::EmptyFrame);
         }
@@ -414,7 +507,7 @@ impl SchcLink {
                 },
             };
         let class = classify(&snapshot, decoded.rule_id())?;
-        let packet = Ipv6UdpCoapPacket::parse(decoded.packet())?;
+        let packet = Ipv6UdpPacket::parse(decoded.packet())?;
         let peer_role = match self.role {
             LinkRole::Core => NodeRole::Device,
             LinkRole::Device => NodeRole::Core,
@@ -458,8 +551,8 @@ impl SchcLink {
             management_rule,
             management_rpc_sid,
         );
-        Ok(LinkDecoded {
-            packet,
+        Ok(LinkDecodedBytes {
+            packet: packet.to_vec(),
             rule_id: decoded.rule_id(),
             traffic_class: class,
             route: class.route(),

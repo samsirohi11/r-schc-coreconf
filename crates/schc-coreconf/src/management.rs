@@ -23,17 +23,17 @@ use coreconf_runtime::transport::coap_lite::{packet_to_request, response_to_pack
 use coreconf_runtime::PredicatePath;
 use coreconf_runtime::{Datastore, ResponseCode};
 use schc_core::{
-    Cda, DirectionSelector, FieldLength, FieldRef, MatchingOperator, Rule, RuleContext, RuleId,
-    RuleNature, SidRegistry, TargetValue,
+    Cda, Direction, DirectionSelector, FieldLength, FieldRef, MatchingOperator, Rule, RuleContext,
+    RuleId, RuleNature, SidRegistry, TargetValue,
 };
 use schc_runtime::SchcFrame;
 use serde_json::{json, Value};
 use thiserror::Error;
 
 use crate::{
-    ActiveContext, ContextSnapshot, ContextTag, Ipv6UdpCoapPacket, LinkError, LinkReport,
-    PreparedContext, RawUdpLink, SchcLink, TrafficOrigin, TrafficRoute, CORE_LOGICAL_ADDRESS,
-    DEVICE_LOGICAL_ADDRESS, MANAGEMENT_PORT,
+    ActiveContext, ContextSnapshot, ContextTag, Ipv6UdpCoapPacket, Ipv6UdpPacket, LinkError,
+    LinkReport, PreparedContext, RawUdpLink, SchcLink, TrafficOrigin, TrafficRoute,
+    CORE_LOGICAL_ADDRESS, DEVICE_LOGICAL_ADDRESS, MANAGEMENT_PORT,
 };
 
 /// Marker used as the first byte of the compact context-check FETCH payload.
@@ -129,6 +129,18 @@ pub enum InspectionError {
     /// The remote endpoint returned unexpected content.
     #[error("unexpected management response: {0}")]
     UnexpectedResponse(String),
+    /// No unused `RuleID` satisfies the requested allocation policy.
+    #[error("no unused RuleID is available for {bits}-bit allocation starting at {minimum}")]
+    NoAvailableRuleId {
+        /// Requested `RuleID` width.
+        bits: usize,
+        /// Lowest value considered by the allocator.
+        minimum: u64,
+    },
+    /// A flow contains a field that cannot be represented by the duplicate
+    /// target-value operation.
+    #[error("flow cannot be represented by duplicate-rule management: {0}")]
+    UnrepresentableFlow(String),
 }
 
 /// A strict numeric `RuleID` selector containing both value and bit length.
@@ -369,6 +381,61 @@ pub struct RuleDuplicateRequest {
     pub destination: RuleSelector,
     /// Zero or more entry-index overrides.
     pub overrides: Vec<RuleDuplicateOverride>,
+}
+
+/// Direction of a logical IPv6/UDP flow relative to the SCHC device.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum FlowDirection {
+    /// The logical packet travels from the device toward the application.
+    Uplink,
+    /// The logical packet travels from the application toward the device.
+    Downlink,
+}
+
+impl FlowDirection {
+    fn schc_direction(self) -> Direction {
+        match self {
+            Self::Uplink => Direction::Up,
+            Self::Downlink => Direction::Down,
+        }
+    }
+
+    fn link_role(self) -> crate::LinkRole {
+        match self {
+            Self::Uplink => crate::LinkRole::Device,
+            Self::Downlink => crate::LinkRole::Core,
+        }
+    }
+}
+
+/// Policy controlling automatic destination `RuleID` allocation.
+///
+/// The allocator always uses the source rule's width unless
+/// [`Self::rule_id_bits`] is set. It never selects a `RuleID` supplied by a
+/// caller and never reuses an occupied or protected `RuleID`.
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub struct RuleAllocationPolicy {
+    /// Lowest numeric `RuleID` value considered by the allocator.
+    pub minimum_value: u64,
+    /// Optional width for newly allocated `RuleIDs`.
+    pub rule_id_bits: Option<usize>,
+}
+
+/// Result of planning one logical flow change against the active context.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum FlowChange {
+    /// The current application context already contains a matching rule.
+    AlreadyMatches {
+        /// Existing matching rule.
+        rule: RuleSelector,
+    },
+    /// A duplicate operation is required to install a matching rule.
+    Duplicate {
+        /// Existing application parent selected by the planner.
+        parent: RuleSelector,
+        /// Complete operation with an automatically allocated destination.
+        request: RuleDuplicateRequest,
+    },
 }
 
 /// One decoded override shown by a duplicate-rule packet report.
@@ -1432,6 +1499,145 @@ impl InspectionService {
             .map_err(|error| InspectionError::Coap(error.to_string()))
     }
 
+    /// Plans the smallest duplicate-rule operation for one logical flow.
+    ///
+    /// The current authoritative snapshot is inspected once. An existing
+    /// application rule that already encodes the packet is reported as
+    /// [`FlowChange::AlreadyMatches`]. Otherwise, each eligible application
+    /// rule is considered as a parent, with the destination allocated by
+    /// `allocation`. Candidates are ranked by the actual duplicate-rule
+    /// management wire length, then by the number of complete changed entries,
+    /// and finally by stable source `RuleID` order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the packet is malformed, allocation is exhausted,
+    /// or no existing application rule can represent the flow change.
+    pub fn flow_change(
+        &self,
+        packet: &Ipv6UdpPacket,
+        direction: FlowDirection,
+        allocation: RuleAllocationPolicy,
+    ) -> Result<FlowChange, InspectionError> {
+        let snapshot = self.active.snapshot();
+        let mut candidates = Vec::new();
+        for parent in snapshot.rules() {
+            if parent.nature() != RuleNature::Compression
+                || snapshot.protected_rules().contains(parent.id())
+                || !has_application_payload(parent)
+                || !has_complete_flow_fields(parent)
+            {
+                continue;
+            }
+            let Some(overrides) = flow_overrides(parent, packet, direction)? else {
+                continue;
+            };
+            let source = RuleSelector::new(parent.id().value(), parent.id().bit_len())?;
+            if overrides.is_empty() {
+                let link = SchcLink::new(Arc::clone(&self.active), direction.link_role());
+                let Ok(encoded) = link.encode_bytes(TrafficOrigin::Application, packet.as_bytes())
+                else {
+                    continue;
+                };
+                if encoded.report().rule_id == source.rule_id() {
+                    return Ok(FlowChange::AlreadyMatches { rule: source });
+                }
+                continue;
+            }
+            let destination_bits = allocation.rule_id_bits.unwrap_or(source.bits);
+            let destination =
+                allocate_rule_id(&snapshot, destination_bits, allocation.minimum_value)?;
+            let request = RuleDuplicateRequest {
+                source,
+                destination,
+                overrides,
+            };
+            let Ok(management_wire_bytes) = self.duplicate_rule_wire_bytes(&request) else {
+                continue;
+            };
+            let Ok(payload) = self.duplicate_rule_payload(&request) else {
+                continue;
+            };
+            let Ok(operation) = decode_duplicate_operation(&self.model, &payload) else {
+                continue;
+            };
+            let Ok(tree) = expected_duplicate_tree(
+                &self.model,
+                &snapshot,
+                &operation.request,
+                &operation.instances,
+            ) else {
+                continue;
+            };
+            let recipe = self.active.recipe();
+            let Ok(prepared) = PreparedContext::from_tree(
+                recipe.sid_json.as_ref(),
+                tree,
+                recipe.device_id.clone(),
+                recipe.profile.clone(),
+                recipe.policy.clone(),
+            ) else {
+                continue;
+            };
+            let candidate_link = SchcLink::new(
+                Arc::new(ActiveContext::new(prepared)),
+                direction.link_role(),
+            );
+            if candidate_link
+                .encode_bytes(TrafficOrigin::Application, packet.as_bytes())
+                .is_err()
+            {
+                continue;
+            }
+            candidates.push(FlowChangeCandidate {
+                request,
+                management_wire_bytes,
+            });
+        }
+
+        candidates.sort_by(|left, right| {
+            left.management_wire_bytes
+                .cmp(&right.management_wire_bytes)
+                .then_with(|| {
+                    left.request
+                        .overrides
+                        .len()
+                        .cmp(&right.request.overrides.len())
+                })
+                .then_with(|| left.request.source.cmp(&right.request.source))
+        });
+        let Some(candidate) = candidates.into_iter().next() else {
+            return Err(InspectionError::UnrepresentableFlow(
+                "no application parent can represent the IPv6/UDP fields".into(),
+            ));
+        };
+        Ok(FlowChange::Duplicate {
+            parent: candidate.request.source,
+            request: candidate.request,
+        })
+    }
+
+    fn duplicate_rule_wire_bytes(
+        &self,
+        request: &RuleDuplicateRequest,
+    ) -> Result<usize, InspectionError> {
+        let datagram = self.duplicate_rule_datagram(request, 0)?;
+        let packet = Ipv6UdpCoapPacket::new(
+            CORE_LOGICAL_ADDRESS,
+            DEVICE_LOGICAL_ADDRESS,
+            MANAGEMENT_PORT,
+            MANAGEMENT_PORT,
+            &datagram,
+        )
+        .map_err(|error| InspectionError::Coap(error.to_string()))?;
+        let link = SchcLink::new(Arc::clone(&self.active), crate::LinkRole::Core);
+        Ok(link
+            .encode(TrafficOrigin::Management, &packet)?
+            .frame()
+            .bytes()
+            .len())
+    }
+
     /// Handles a duplicate-rule NON POST without creating a response.
     ///
     /// Other management requests are returned to the existing response path.
@@ -1808,6 +2014,206 @@ enum DuplicateLeaf {
     Target,
     MatchingOperator,
     Cda,
+}
+
+#[derive(Debug)]
+struct FlowChangeCandidate {
+    request: RuleDuplicateRequest,
+    management_wire_bytes: usize,
+}
+
+fn allocate_rule_id(
+    snapshot: &ContextSnapshot,
+    bits: usize,
+    minimum: u64,
+) -> Result<RuleSelector, InspectionError> {
+    RuleSelector::new(0, bits)?;
+    let maximum = if bits == 64 {
+        u64::MAX
+    } else {
+        (1_u64 << bits) - 1
+    };
+    if minimum > maximum {
+        return Err(InspectionError::NoAvailableRuleId { bits, minimum });
+    }
+    let mut value = minimum;
+    loop {
+        let candidate = RuleId::new(value, bits);
+        if !snapshot.contains_rule_id(candidate) && !snapshot.protected_rules().contains(candidate)
+        {
+            return RuleSelector::new(value, bits);
+        }
+        if value == maximum {
+            break;
+        }
+        value += 1;
+    }
+    Err(InspectionError::NoAvailableRuleId { bits, minimum })
+}
+
+fn has_application_payload(rule: &Rule) -> bool {
+    rule.fields().iter().any(|field| {
+        matches!(
+            field.field,
+            FieldRef::Payload | FieldRef::Udp("fid-udp-payload")
+        )
+    })
+}
+
+/// Returns whether a rule models the complete seven-field flow identity used
+/// by the generic IPv6/UDP workload.  Header-only fallback rules can still
+/// encode a packet, but they are not suitable parents for a concrete flow
+/// duplicate and must not make an otherwise new flow look already installed.
+fn has_complete_flow_fields(rule: &Rule) -> bool {
+    let mut seen = [false; 7];
+    for field in rule.fields() {
+        if field.matching == MatchingOperator::Ignore
+            || !matches!(field.target, TargetValue::Bytes(_))
+        {
+            continue;
+        }
+        let index = match field.field {
+            FieldRef::Ipv6("fid-ipv6-flowlabel") => 0,
+            FieldRef::Ipv6("fid-ipv6-devprefix") => 1,
+            FieldRef::Ipv6("fid-ipv6-deviid") => 2,
+            FieldRef::Ipv6("fid-ipv6-appprefix") => 3,
+            FieldRef::Ipv6("fid-ipv6-appiid") => 4,
+            FieldRef::Udp("fid-udp-dev-port") => 5,
+            FieldRef::Udp("fid-udp-app-port") => 6,
+            _ => continue,
+        };
+        seen[index] = true;
+    }
+    seen.into_iter().all(|present| present)
+}
+
+fn flow_overrides(
+    parent: &Rule,
+    packet: &Ipv6UdpPacket,
+    direction: FlowDirection,
+) -> Result<Option<Vec<RuleDuplicateOverride>>, InspectionError> {
+    let schc_direction = direction.schc_direction();
+    let mut overrides = Vec::new();
+    for field in parent.fields() {
+        if !field.direction.accepts(schc_direction) || field.matching == MatchingOperator::Ignore {
+            continue;
+        }
+        let Some((actual, bits)) = logical_field_value(packet, direction, &field.field) else {
+            if matches!(field.target, TargetValue::None) {
+                continue;
+            }
+            return Ok(None);
+        };
+        let target_matches = match &field.target {
+            TargetValue::None => false,
+            TargetValue::Bytes(target) => target_matches(&actual, target, bits, field.matching),
+            TargetValue::Mapping(targets) => targets
+                .iter()
+                .any(|target| target_matches(&actual, target, bits, field.matching)),
+        };
+        if target_matches {
+            continue;
+        }
+        if !matches!(field.target, TargetValue::Bytes(_))
+            || !matches!(field.length, FieldLength::FixedBits(_))
+            || bits > 64
+        {
+            return Ok(None);
+        }
+        let value = bytes_to_u64(&actual).ok_or_else(|| {
+            InspectionError::UnrepresentableFlow(format!(
+                "entry {} exceeds 64 bits",
+                field.entry_index
+            ))
+        })?;
+        overrides.push(RuleDuplicateOverride {
+            entry_index: field.entry_index,
+            target_value: Some(value.to_string()),
+            matching_operator: None,
+            cda: None,
+        });
+    }
+    overrides.sort_by_key(|override_| override_.entry_index);
+    Ok(Some(overrides))
+}
+
+fn logical_field_value(
+    packet: &Ipv6UdpPacket,
+    direction: FlowDirection,
+    field: &FieldRef,
+) -> Option<(Vec<u8>, usize)> {
+    let (device, application, device_port, application_port) = match direction {
+        FlowDirection::Uplink => (
+            packet.source(),
+            packet.destination(),
+            packet.source_port(),
+            packet.destination_port(),
+        ),
+        FlowDirection::Downlink => (
+            packet.destination(),
+            packet.source(),
+            packet.destination_port(),
+            packet.source_port(),
+        ),
+    };
+    let integer = |value: u64, bits: usize| Some((integer_bytes(value, bits), bits));
+    match field {
+        FieldRef::Ipv6(name) => match *name {
+            "fid-ipv6-version" => integer(6, 4),
+            "fid-ipv6-trafficclass" => integer(u64::from(packet.traffic_class()), 8),
+            "fid-ipv6-flowlabel" => integer(u64::from(packet.flow_label()), 20),
+            "fid-ipv6-payload-length" => integer(u64::from(packet.ipv6_payload_length()), 16),
+            "fid-ipv6-nextheader" => integer(u64::from(packet.next_header()), 8),
+            "fid-ipv6-hoplimit" => integer(u64::from(packet.hop_limit()), 8),
+            "fid-ipv6-devprefix" => Some((device.octets()[..8].to_vec(), 64)),
+            "fid-ipv6-deviid" => Some((device.octets()[8..].to_vec(), 64)),
+            "fid-ipv6-appprefix" => Some((application.octets()[..8].to_vec(), 64)),
+            "fid-ipv6-appiid" => Some((application.octets()[8..].to_vec(), 64)),
+            _ => None,
+        },
+        FieldRef::Udp(name) => match *name {
+            "fid-udp-dev-port" => integer(u64::from(device_port), 16),
+            "fid-udp-app-port" => integer(u64::from(application_port), 16),
+            "fid-udp-length" => integer(u64::from(packet.udp_length()), 16),
+            "fid-udp-checksum" => integer(u64::from(packet.udp_checksum()), 16),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn integer_bytes(value: u64, bits: usize) -> Vec<u8> {
+    let length = bits.div_ceil(8);
+    let bytes = value.to_be_bytes();
+    bytes[bytes.len() - length..].to_vec()
+}
+
+fn bytes_to_u64(bytes: &[u8]) -> Option<u64> {
+    if bytes.len() > 8 {
+        return None;
+    }
+    let mut value = 0_u64;
+    for byte in bytes {
+        value = value.checked_shl(8)? | u64::from(*byte);
+    }
+    Some(value)
+}
+
+fn target_matches(actual: &[u8], target: &[u8], bits: usize, matching: MatchingOperator) -> bool {
+    if matching == MatchingOperator::Equal {
+        return bytes_to_u64(actual) == bytes_to_u64(target);
+    }
+    let compare_bits = match matching {
+        MatchingOperator::Msb(prefix) => prefix.min(bits),
+        _ => bits,
+    };
+    (0..compare_bits).all(|index| bit_at(actual, index) == bit_at(target, index))
+}
+
+fn bit_at(bytes: &[u8], index: usize) -> bool {
+    bytes
+        .get(index / 8)
+        .is_some_and(|byte| byte & (0x80 >> (index % 8)) != 0)
 }
 
 #[derive(Debug)]

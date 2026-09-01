@@ -1,0 +1,285 @@
+{
+  "context": "context.json",
+  "duplicate_rule": [
+    {
+      "case": "1_changed_entries",
+      "changed_entries": 1,
+      "changed_entry_indices": [
+        2
+      ],
+      "coreconf_datagram_bytes": 48,
+      "coreconf_datagram_hex": "50020065b473636863118effa1190a78a101a301a201080200044fa189190a0e1701081702090002410205a201080201",
+      "destination_rule_id": "1/8",
+      "logical_ipv6_udp": {
+        "destination": "2001:db8::1",
+        "destination_port": 8724,
+        "flow_label": 0,
+        "hop_limit": 64,
+        "source": "2001:db8::2",
+        "source_port": 8724,
+        "traffic_class": 0
+      },
+      "logical_ipv6_udp_hex": "600000000038114020010db800000000000000000000000220010db80000000000000000000000012214221400381e5750020065b473636863118effa1190a78a101a301a201080200044fa189190a0e1701081702090002410205a201080201",
+      "meaningful_bits": 315,
+      "overrides": [
+        {
+          "entry_index": 2,
+          "target_value": "2"
+        }
+      ],
+      "parent_rule_id": "0/8",
+      "payload_bytes": 36,
+      "schc_frame_hex": "1dcbe49423214f1420346034402100400089f431232141c2e02102e0412000482040b44021004020",
+      "transmitted_bytes": 40
+    },
+    {
+      "case": "2_changed_entries",
+      "changed_entries": 2,
+      "changed_entry_indices": [
+        2,
+        6
+      ],
+      "coreconf_datagram_bytes": 71,
+      "coreconf_datagram_hex": "50020066b473636863118effa1190a78a101a301a201080200045825a189190a0e17010817020900024102a189190a0e17010817060900024820010db70000000005a201080201",
+      "destination_rule_id": "1/8",
+      "logical_ipv6_udp": {
+        "destination": "2001:db8::1",
+        "destination_port": 8724,
+        "flow_label": 0,
+        "hop_limit": 64,
+        "source": "2001:db8::2",
+        "source_port": 8724,
+        "traffic_class": 0
+      },
+      "logical_ipv6_udp_hex": "60000000004f114020010db800000000000000000000000220010db800000000000000000000000122142214004fc18350020066b473636863118effa1190a78a101a301a201080200045825a189190a0e17010817020900024102a189190a0e17010817060900024820010db70000000005a201080201",
+      "meaningful_bits": 499,
+      "overrides": [
+        {
+          "entry_index": 2,
+          "target_value": "2"
+        },
+        {
+          "entry_index": 6,
+          "target_value": "2306139563820580864"
+        }
+      ],
+      "parent_rule_id": "0/8",
+      "payload_bytes": 59,
+      "schc_frame_hex": "1dcde77423214f142034603440210040008b04b431232141c2e02102e041200048205431232141c2e02102e0c1200049040021b6e000000000b44021004020",
+      "transmitted_bytes": 63
+    },
+    {
+      "case": "3_changed_entries",
+      "changed_entries": 3,
+      "changed_entry_indices": [
+        2,
+        6,
+        7
+      ],
+      "coreconf_datagram_bytes": 93,
+      "coreconf_datagram_hex": "50020067b473636863118effa1190a78a101a301a20108020004583ba189190a0e17010817020900024102a189190a0e17010817060900024820010db700000000a189190a0e170108170709000248000000000000000705a201080201",
+      "destination_rule_id": "1/8",
+      "logical_ipv6_udp": {
+        "destination": "2001:db8::1",
+        "destination_port": 8724,
+        "flow_label": 0,
+        "hop_limit": 64,
+        "source": "2001:db8::2",
+        "source_port": 8724,
+        "traffic_class": 0
+      },
+      "logical_ipv6_udp_hex": "600000000065114020010db800000000000000000000000220010db8000000000000000000000001221422140065b85450020067b473636863118effa1190a78a101a301a20108020004583ba189190a0e17010817020900024102a189190a0e17010817060900024820010db700000000a189190a0e170108170709000248000000000000000705a201080201",
+      "meaningful_bits": 675,
+      "overrides": [
+        {
+          "entry_index": 2,
+          "target_value": "2"
+        },
+        {
+          "entry_index": 6,
+          "target_value": "2306139563820580864"
+        },
+        {
+          "entry_index": 7,
+          "target_value": "7"
+        }
+      ],
+      "parent_rule_id": "0/8",
+      "payload_bytes": 81,
+      "schc_frame_hex": "1dcfea3423214f142034603440210040008b077431232141c2e02102e041200048205431232141c2e02102e0c1200049040021b6e00000001431232141c2e02102e0e12000490000000000000000e0b44021004020",
+      "transmitted_bytes": 85
+    },
+    {
+      "case": "5_changed_entries",
+      "changed_entries": 5,
+      "changed_entry_indices": [
+        2,
+        6,
+        7,
+        8,
+        9
+      ],
+      "coreconf_datagram_bytes": 137,
+      "coreconf_datagram_hex": "50020069b473636863118effa1190a78a101a301a201080200045867a189190a0e17010817020900024102a189190a0e17010817060900024820010db700000000a189190a0e1701081707090002480000000000000007a189190a0e17010817080900024820010db700000000a189190a0e170108170909000248000000000000000705a201080201",
+      "destination_rule_id": "1/8",
+      "logical_ipv6_udp": {
+        "destination": "2001:db8::1",
+        "destination_port": 8724,
+        "flow_label": 0,
+        "hop_limit": 64,
+        "source": "2001:db8::2",
+        "source_port": 8724,
+        "traffic_class": 0
+      },
+      "logical_ipv6_udp_hex": "600000000091114020010db800000000000000000000000220010db8000000000000000000000001221422140091f1c850020069b473636863118effa1190a78a101a301a201080200045867a189190a0e17010817020900024102a189190a0e17010817060900024820010db700000000a189190a0e1701081707090002480000000000000007a189190a0e17010817080900024820010db700000000a189190a0e170108170909000248000000000000000705a201080201",
+      "meaningful_bits": 1027,
+      "overrides": [
+        {
+          "entry_index": 2,
+          "target_value": "2"
+        },
+        {
+          "entry_index": 6,
+          "target_value": "2306139563820580864"
+        },
+        {
+          "entry_index": 7,
+          "target_value": "7"
+        },
+        {
+          "entry_index": 8,
+          "target_value": "2306139563820580864"
+        },
+        {
+          "entry_index": 9,
+          "target_value": "7"
+        }
+      ],
+      "parent_rule_id": "0/8",
+      "payload_bytes": 125,
+      "schc_frame_hex": "1dd3efb423214f142034603440210040008b0cf431232141c2e02102e041200048205431232141c2e02102e0c1200049040021b6e00000001431232141c2e02102e0e12000490000000000000000f431232141c2e02102e101200049040021b6e00000001431232141c2e02102e1212000490000000000000000e0b44021004020",
+      "transmitted_bytes": 129
+    },
+    {
+      "case": "7_changed_entries",
+      "changed_entries": 7,
+      "changed_entry_indices": [
+        2,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11
+      ],
+      "coreconf_datagram_bytes": 169,
+      "coreconf_datagram_hex": "5002006bb473636863118effa1190a78a101a301a201080214045887a189190a0e17000817020900024100a189190a0e17000817060900024820010db800000000a189190a0e1700081707090002480000000000000001a189190a0e17000817080900024820010db800000000a189190a0e1700081709090002480000000000000002a189190a0e170008170a090002421633a189190a0e170008170b09000242163305a201080200",
+      "destination_rule_id": "0/8",
+      "logical_ipv6_udp": {
+        "destination": "2001:db8::1",
+        "destination_port": 8724,
+        "flow_label": 0,
+        "hop_limit": 64,
+        "source": "2001:db8::2",
+        "source_port": 8724,
+        "traffic_class": 0
+      },
+      "logical_ipv6_udp_hex": "6000000000b1114020010db800000000000000000000000220010db80000000000000000000000012214221400b185685002006bb473636863118effa1190a78a101a301a201080214045887a189190a0e17000817020900024100a189190a0e17000817060900024820010db800000000a189190a0e1700081707090002480000000000000001a189190a0e17000817080900024820010db800000000a189190a0e1700081709090002480000000000000002a189190a0e170008170a090002421633a189190a0e170008170b09000242163305a201080200",
+      "meaningful_bits": 1283,
+      "overrides": [
+        {
+          "entry_index": 2,
+          "target_value": "0"
+        },
+        {
+          "entry_index": 6,
+          "target_value": "2306139568115548160"
+        },
+        {
+          "entry_index": 7,
+          "target_value": "1"
+        },
+        {
+          "entry_index": 8,
+          "target_value": "2306139568115548160"
+        },
+        {
+          "entry_index": 9,
+          "target_value": "2"
+        },
+        {
+          "entry_index": 10,
+          "target_value": "5683"
+        },
+        {
+          "entry_index": 11,
+          "target_value": "5683"
+        }
+      ],
+      "parent_rule_id": "20/8",
+      "payload_bytes": 157,
+      "schc_frame_hex": "1dd7f3b423214f142034603440210042808b10f431232141c2e00102e041200048201431232141c2e00102e0c1200049040021b7000000001431232141c2e00102e0e120004900000000000000003431232141c2e00102e101200049040021b7000000001431232141c2e00102e12120004900000000000000005431232141c2e00102e14120004842c67431232141c2e00102e16120004842c660b44021004000",
+      "transmitted_bytes": 161
+    }
+  ],
+  "schema_version": 1,
+  "steady_data": [
+    {
+      "case": "first_after_install",
+      "logical_ipv6_udp": {
+        "destination": "2001:db8::1",
+        "destination_port": 5683,
+        "flow_label": 0,
+        "hop_limit": 64,
+        "source": "2001:db8::2",
+        "source_port": 5683,
+        "traffic_class": 0
+      },
+      "logical_ipv6_udp_hex": "60000000000f114020010db800000000000000000000000220010db800000000000000000000000116331633000fbac57061796c6f6164",
+      "matched_rule_id": "0/8",
+      "meaningful_bits": 69,
+      "payload_hex": "7061796c6f6164",
+      "payload_length": 7,
+      "schc_frame_hex": "00bb830bcb637b0b20",
+      "transmitted_bytes": 9
+    },
+    {
+      "case": "repeated",
+      "logical_ipv6_udp": {
+        "destination": "2001:db8::1",
+        "destination_port": 5683,
+        "flow_label": 0,
+        "hop_limit": 64,
+        "source": "2001:db8::2",
+        "source_port": 5683,
+        "traffic_class": 0
+      },
+      "logical_ipv6_udp_hex": "60000000000f114020010db800000000000000000000000220010db800000000000000000000000116331633000fbac57061796c6f6164",
+      "matched_rule_id": "0/8",
+      "meaningful_bits": 69,
+      "payload_hex": "7061796c6f6164",
+      "payload_length": 7,
+      "schc_frame_hex": "00bb830bcb637b0b20",
+      "transmitted_bytes": 9
+    },
+    {
+      "case": "field_change",
+      "logical_ipv6_udp": {
+        "destination": "2001:db8::1",
+        "destination_port": 5683,
+        "flow_label": 2,
+        "hop_limit": 64,
+        "source": "2001:db8::2",
+        "source_port": 5683,
+        "traffic_class": 0
+      },
+      "logical_ipv6_udp_hex": "60000002000f114020010db800000000000000000000000220010db800000000000000000000000116331633000fbac57061796c6f6164",
+      "matched_rule_id": "1/8",
+      "meaningful_bits": 69,
+      "payload_hex": "7061796c6f6164",
+      "payload_length": 7,
+      "schc_frame_hex": "01bb830bcb637b0b20",
+      "transmitted_bytes": 9
+    }
+  ]
+}

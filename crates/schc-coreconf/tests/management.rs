@@ -86,9 +86,12 @@ fn generic_base_active() -> Arc<ActiveContext> {
 }
 
 fn first_flow_command(destination: usize, count: usize) -> String {
+    use std::fmt::Write as _;
+
     let mut command = format!("rule duplicate 20/8 {destination}/8");
     for &(entry_index, target_value, _) in FIRST_FLOW_OVERRIDES.iter().take(count) {
-        command.push_str(&format!(" entry={entry_index} tv={target_value}"));
+        write!(command, " entry={entry_index} tv={target_value}")
+            .expect("String writes cannot fail");
     }
     command
 }
@@ -100,6 +103,22 @@ fn tree_rule(tree: &Value, rule_id: u64) -> &Value {
         .iter()
         .find(|rule| rule["rule-id-value"] == serde_json::json!(rule_id))
         .expect("rule")
+}
+
+fn replace_bytes(value: &mut CborValue) -> bool {
+    match value {
+        CborValue::Bytes(bytes) if bytes.len() == 8 => {
+            let _ = bytes;
+            *value = CborValue::Text("invalid-target".into());
+            true
+        }
+        CborValue::Array(values) => values.iter_mut().any(replace_bytes),
+        CborValue::Map(entries) => entries
+            .iter_mut()
+            .any(|(key, value)| replace_bytes(key) || replace_bytes(value)),
+        CborValue::Tag(_, value) => replace_bytes(value),
+        _ => false,
+    }
 }
 
 fn tamper_second_target_value(datagram: &[u8]) -> Vec<u8> {
@@ -132,25 +151,10 @@ fn tamper_second_target_value(datagram: &[u8]) -> Vec<u8> {
     };
     let mut cursor = Cursor::new(inner.as_slice());
     let mut instances = Vec::new();
-    while (cursor.position() as usize) < inner.len() {
+    while usize::try_from(cursor.position()).expect("cursor position fits usize") < inner.len() {
         instances.push(ciborium::de::from_reader(&mut cursor).expect("iPATCH instance"));
     }
     assert_eq!(instances.len(), 2);
-    fn replace_bytes(value: &mut CborValue) -> bool {
-        match value {
-            CborValue::Bytes(bytes) if bytes.len() == 8 => {
-                let _ = bytes;
-                *value = CborValue::Text("invalid-target".into());
-                true
-            }
-            CborValue::Array(values) => values.iter_mut().any(replace_bytes),
-            CborValue::Map(entries) => entries
-                .iter_mut()
-                .any(|(key, value)| replace_bytes(key) || replace_bytes(value)),
-            CborValue::Tag(_, value) => replace_bytes(value),
-            _ => false,
-        }
-    }
     assert!(replace_bytes(&mut instances[1]));
     inner.clear();
     for instance in instances {
@@ -1493,7 +1497,10 @@ fn duplicate_rule_override_counts_1_2_3_5_7_each_publish_once_and_keep_source_un
         );
         let mut service = InspectionService::new(active.clone()).expect("service");
         let datagram = service
-            .duplicate_rule_datagram(&request, 80 + count as u16)
+            .duplicate_rule_datagram(
+                &request,
+                80_u16 + u16::try_from(count).expect("test count fits u16"),
+            )
             .expect("table datagram");
         assert!(service
             .handle_datagram_no_response(&datagram)

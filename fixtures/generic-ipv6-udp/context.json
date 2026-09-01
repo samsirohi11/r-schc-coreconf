@@ -1,0 +1,14 @@
+{
+  "name": "Generic IPv6/UDP SCHC+CORECONF context",
+  "sid": "ietf-schc@2026-05-07.sid",
+  "sor": "initial.sor",
+  "application_base_rule": "20/8",
+  "application_fallback_rules": ["21/8"],
+  "protected_management_rules": ["16/8", "17/8", "26/8", "27/8", "28/8", "29/8"],
+  "dynamic_rules": [],
+  "allocation": {
+    "policy": "lowest-free",
+    "rule_id_bits": "parent-width",
+    "minimum_value": 0
+  }
+}
