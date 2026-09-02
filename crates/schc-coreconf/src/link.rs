@@ -438,8 +438,11 @@ impl SchcLink {
                     .cloned()
             })
             .flatten();
-        let management_rpc_sid = (encoded.rule_id() == RuleId::new(29, 8))
-            .then(|| Arc::clone(&self.active.recipe().sid_json));
+        let management_rpc_sid = (class == TrafficClass::ProtectedManagement
+            && Ipv6UdpPacket::parse(packet).is_ok_and(|packet| {
+                crate::management::is_duplicate_rule_datagram(packet.udp_payload())
+            }))
+        .then(|| Arc::clone(&self.active.recipe().sid_json));
         let report = LinkReport::encoded(
             snapshot.generation(),
             encoded.rule_id(),
@@ -539,8 +542,9 @@ impl SchcLink {
                     .cloned()
             })
             .flatten();
-        let management_rpc_sid = (decoded.rule_id() == RuleId::new(29, 8))
-            .then(|| Arc::clone(&self.active.recipe().sid_json));
+        let management_rpc_sid = (class == TrafficClass::ProtectedManagement
+            && crate::management::is_duplicate_rule_datagram(packet.udp_payload()))
+        .then(|| Arc::clone(&self.active.recipe().sid_json));
         let report = LinkReport::decoded(
             snapshot.generation(),
             decoded.rule_id(),

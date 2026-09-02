@@ -8,6 +8,7 @@
 //! logical packets over a raw UDP SCHC link. Management RPC
 //! semantics are added by higher-level components.
 
+mod allocation;
 mod application;
 mod codec;
 mod context;
@@ -18,6 +19,10 @@ mod packet_loop;
 mod policy;
 mod report;
 
+pub use allocation::{
+    overlaps as rule_ids_overlap, ContextProfile, DynamicRuleIdNamespace, RuleIdSpec,
+    RuleIdTreeError,
+};
 pub use application::{schema_lines, ApplicationError, DataClient, GenericDataService};
 pub use context::{
     ActiveContext, ActiveContextBackend, ContextSnapshot, ContextTag, LoadedContext,
@@ -38,9 +43,8 @@ pub use management::{
     validate_management_response, ContextCheckResult, ContextStatus, DuplicateRpcCost,
     DuplicateRpcOverride, DuplicateRuleResult, FlowChange, FlowDirection, InspectionError,
     InspectionService, ManagementBitBreakdown, ManagementExchange, PreparedManagementRequest,
-    ResolvedRuleUpdate, RuleAllocationPolicy, RuleDetail, RuleDuplicateOverride,
-    RuleDuplicateRequest, RuleEntry, RuleEntrySelector, RuleSelector, RuleSummary,
-    RuleUpdateRequest, CONTEXT_CHECK_MARKER,
+    ResolvedRuleUpdate, RuleDetail, RuleDuplicateOverride, RuleDuplicateRequest, RuleEntry,
+    RuleEntrySelector, RuleSelector, RuleSummary, RuleUpdateRequest, CONTEXT_CHECK_MARKER,
 };
 pub use packet::{
     CoapMessage, CoapOption, Ipv6UdpCoapPacket, Ipv6UdpPacket, PacketError, PacketMetadata,
@@ -100,6 +104,9 @@ pub enum ContextError {
     /// A rustconf operation failed.
     #[error("rustconf error: {0}")]
     Rustconf(#[from] CoreconfError),
+    /// The configured dynamic `RuleID` namespace is invalid or overlaps a rule.
+    #[error("invalid dynamic RuleID namespace: {0}")]
+    RuleIdTree(#[from] RuleIdTreeError),
     /// A rule ID supplied by explicit policy was not present in the context.
     #[error("protected RuleID {value}/{bit_len} is absent from the context")]
     MissingProtectedRule {

@@ -278,7 +278,7 @@ pub fn inspect_report(report: &LinkReport) -> Result<PacketReport, ReportError> 
             "meaningful bits {meaningful_bits} exceed padded bits {padded_bits}"
         ))
     })?;
-    let rpc = if report.rule_id == schc_core::RuleId::new(29, 8) {
+    let rpc = if report.management_rpc_sid.is_some() {
         let sid_json = report.management_rpc_sid.as_deref().ok_or_else(|| {
             ReportError::InvalidPacket("duplicate-rule report has no SID model source".to_owned())
         })?;

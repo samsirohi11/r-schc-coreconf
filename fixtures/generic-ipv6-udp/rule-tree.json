@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "description": "Canonical RuleID tree for the generic IPv6/UDP context",
+  "rules": [
+    {"value": 2, "length": 2, "role": "application-base"},
+    {"value": 6, "length": 3, "role": "application-fallback"},
+    {"value": 28, "length": 5, "role": "protected-management"},
+    {"value": 29, "length": 5, "role": "protected-management"},
+    {"value": 60, "length": 6, "role": "protected-management"},
+    {"value": 61, "length": 6, "role": "protected-management"},
+    {"value": 62, "length": 6, "role": "protected-management"},
+    {"value": 63, "length": 6, "role": "protected-management"}
+  ],
+  "dynamic_namespace": {
+    "prefix": {"value": 0, "length": 1},
+    "allowed_lengths": [4]
+  }
+}

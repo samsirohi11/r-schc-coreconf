@@ -5,10 +5,10 @@ use std::sync::Arc;
 
 use schc_coreconf::{
     context_check_request, format_report, inspect_report, parse_rule_duplicate_command,
-    protected_management_rule_ids, ActiveContext, CoapMessage, CoapOption, FlowChange,
-    FlowDirection, Ipv6UdpCoapPacket, Ipv6UdpPacket, LinkRole, PacketMetadata, PacketReport,
-    PreparedContext, ProtectionPolicy, ReportDirection, RuleAllocationPolicy, SchcLink,
-    TrafficOrigin, CORE_LOGICAL_ADDRESS, DEVICE_LOGICAL_ADDRESS, MANAGEMENT_PORT,
+    protected_management_rule_ids, ActiveContext, CoapMessage, CoapOption, ContextProfile,
+    FlowChange, FlowDirection, Ipv6UdpCoapPacket, Ipv6UdpPacket, LinkRole, PacketMetadata,
+    PacketReport, PreparedContext, ProtectionPolicy, ReportDirection, SchcLink, TrafficOrigin,
+    CORE_LOGICAL_ADDRESS, DEVICE_LOGICAL_ADDRESS, MANAGEMENT_PORT,
 };
 use schc_runtime::{DeviceId, DeviceProfile};
 use serde_json::{json, Value};
@@ -18,6 +18,7 @@ const SOR: &[u8] = include_bytes!("../../../fixtures/demo/initial.sor");
 const GENERIC_SID: &str =
     include_str!("../../../fixtures/generic-ipv6-udp/ietf-schc@2026-05-07.sid");
 const GENERIC_SOR: &[u8] = include_bytes!("../../../fixtures/generic-ipv6-udp/initial.sor");
+const GENERIC_PROFILE: &str = include_str!("../../../fixtures/generic-ipv6-udp/profile.json");
 
 fn active() -> Arc<ActiveContext> {
     Arc::new(ActiveContext::new(
@@ -33,13 +34,15 @@ fn active() -> Arc<ActiveContext> {
 }
 
 fn generic_context_active() -> Arc<ActiveContext> {
+    let context_profile =
+        ContextProfile::from_json_str(GENERIC_PROFILE).expect("generic context profile JSON");
     Arc::new(ActiveContext::new(
-        PreparedContext::from_sor_with_policy(
+        PreparedContext::from_sor_with_context_profile(
             GENERIC_SID,
             GENERIC_SOR,
             DeviceId::new("generic-report-test").expect("device ID"),
             DeviceProfile::default(),
-            ProtectionPolicy::from_rule_ids(protected_management_rule_ids()),
+            context_profile,
         )
         .expect("generic IPv6/UDP context"),
     ))
@@ -182,11 +185,7 @@ fn logical_header(packet: &Ipv6UdpPacket) -> Value {
 fn install_first_flow(service: &mut schc_coreconf::InspectionService) {
     let packet = generic_flow_packet(7, b"payload");
     let FlowChange::Duplicate { request, .. } = service
-        .flow_change(
-            &packet,
-            FlowDirection::Downlink,
-            RuleAllocationPolicy::default(),
-        )
+        .flow_change(&packet, FlowDirection::Downlink)
         .expect("first flow change")
     else {
         panic!("first flow must create a concrete rule");
@@ -211,11 +210,7 @@ fn duplicate_vector(count: usize, expected_indices: &[usize]) -> Value {
         transition_packet(count, b"payload")
     };
     let change = service
-        .flow_change(
-            &packet,
-            FlowDirection::Downlink,
-            RuleAllocationPolicy::default(),
-        )
+        .flow_change(&packet, FlowDirection::Downlink)
         .unwrap_or_else(|error| panic!("flow change for {count}: {error}"));
     let FlowChange::Duplicate { request, .. } = change else {
         panic!("flow with {count} changes must create a concrete rule: {change:?}");
@@ -281,11 +276,7 @@ fn steady_vectors() -> Vec<Value> {
     install_first_flow(&mut device_service);
     let first_packet = generic_flow_packet(7, b"payload");
     let first_request = core_service
-        .flow_change(
-            &first_packet,
-            FlowDirection::Downlink,
-            RuleAllocationPolicy::default(),
-        )
+        .flow_change(&first_packet, FlowDirection::Downlink)
         .expect("first installed flow remains stable");
     assert!(matches!(first_request, FlowChange::AlreadyMatches { .. }));
     let first_packet = generic_flow_packet(7, b"payload");
@@ -301,11 +292,7 @@ fn steady_vectors() -> Vec<Value> {
 
     let changed_packet = transition_packet(1, b"payload");
     let FlowChange::Duplicate { request, .. } = core_service
-        .flow_change(
-            &changed_packet,
-            FlowDirection::Downlink,
-            RuleAllocationPolicy::default(),
-        )
+        .flow_change(&changed_packet, FlowDirection::Downlink)
         .expect("field-change flow")
     else {
         panic!("field change must create a second concrete rule");

@@ -14,7 +14,7 @@ use crate::codec::{
     digest_context, encode_tree, ensure_schc_root, normalize_tree, strict_cbor_value,
 };
 use crate::policy::{ProtectedRules, ProtectionPolicy};
-use crate::{ContextError, Result};
+use crate::{ContextError, ContextProfile, DynamicRuleIdNamespace, Result};
 
 /// Number of bytes in a compact context tag.
 pub const CONTEXT_TAG_LEN: usize = 8;
@@ -220,6 +220,8 @@ pub(crate) struct ContextRecipe {
     pub(crate) device_id: DeviceId,
     pub(crate) profile: DeviceProfile,
     pub(crate) policy: ProtectionPolicy,
+    pub(crate) dynamic_rule_ids: Option<DynamicRuleIdNamespace>,
+    pub(crate) context_profile: Option<ContextProfile>,
 }
 
 /// A prepared context bound to one canonical tree, `SoR`, runtime, and digest.
@@ -280,6 +282,72 @@ impl PreparedContext {
                 device_id,
                 profile,
                 policy,
+                dynamic_rule_ids: None,
+                context_profile: None,
+            },
+            loaded,
+        )
+    }
+
+    /// Builds an initial prepared context with an explicit dynamic `RuleID` tree.
+    ///
+    /// The namespace is retained in every candidate context so automatic
+    /// management can allocate without receiving a `RuleID` from its caller.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the SID, `SoR`, or dynamic namespace is invalid.
+    pub fn from_sor_with_policy_and_allocation(
+        sid_json: &str,
+        sor: &[u8],
+        device_id: DeviceId,
+        profile: DeviceProfile,
+        policy: ProtectionPolicy,
+        dynamic_rule_ids: DynamicRuleIdNamespace,
+    ) -> Result<Self> {
+        let loaded = LoadedContext::from_sor_with_policy(sid_json, sor, policy.clone())?;
+        Self::from_loaded(
+            ContextRecipe {
+                sid_json: Arc::from(sid_json),
+                device_id,
+                profile,
+                policy,
+                dynamic_rule_ids: Some(dynamic_rule_ids),
+                context_profile: None,
+            },
+            loaded,
+        )
+    }
+
+    /// Builds an initial context from a mechanism-owned context profile.
+    ///
+    /// The profile supplies protected management identities and the explicit
+    /// dynamic `RuleID` namespace. D-IPT callers therefore do not select
+    /// either `RuleID` values or lengths.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when profile validation, SID/SoR loading, or runtime
+    /// construction fails.
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn from_sor_with_context_profile(
+        sid_json: &str,
+        sor: &[u8],
+        device_id: DeviceId,
+        profile: DeviceProfile,
+        context_profile: ContextProfile,
+    ) -> Result<Self> {
+        let context_profile = context_profile.validate()?;
+        let policy = context_profile.protection_policy();
+        let loaded = LoadedContext::from_sor_with_policy(sid_json, sor, policy.clone())?;
+        Self::from_loaded(
+            ContextRecipe {
+                sid_json: Arc::from(sid_json),
+                device_id,
+                profile,
+                policy,
+                dynamic_rule_ids: context_profile.dynamic_rule_ids.clone(),
+                context_profile: Some(context_profile),
             },
             loaded,
         )
@@ -320,12 +388,137 @@ impl PreparedContext {
                 device_id,
                 profile,
                 policy,
+                dynamic_rule_ids: None,
+                context_profile: None,
             },
             loaded,
         )
     }
 
-    fn from_loaded(recipe: ContextRecipe, loaded: LoadedContext) -> Result<Self> {
+    /// Builds a candidate context with an explicit dynamic `RuleID` tree.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the candidate is not canonical or the context
+    /// parameters are invalid.
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn from_tree_with_policy_and_allocation(
+        sid_json: &str,
+        tree: Value,
+        device_id: DeviceId,
+        profile: DeviceProfile,
+        policy: ProtectionPolicy,
+        dynamic_rule_ids: DynamicRuleIdNamespace,
+    ) -> Result<Self> {
+        let model = CoreconfModel::from_sid_str(sid_json)
+            .map_err(|error| ContextError::Model(error.to_string()))?;
+        let canonical_tree = normalize_tree(tree.clone())?;
+        if canonical_tree != tree {
+            return Err(ContextError::NonCanonicalCandidate);
+        }
+        let sor = encode_tree(&model, &canonical_tree)?;
+        let loaded = LoadedContext::from_sor_with_policy(sid_json, &sor, policy.clone())?;
+        if loaded.tree != canonical_tree {
+            return Err(ContextError::NonCanonicalCandidate);
+        }
+        Self::from_loaded(
+            ContextRecipe {
+                sid_json: Arc::from(sid_json),
+                device_id,
+                profile,
+                policy,
+                dynamic_rule_ids: Some(dynamic_rule_ids),
+                context_profile: None,
+            },
+            loaded,
+        )
+    }
+
+    /// Builds a candidate context from a mechanism-owned context profile.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the profile, candidate tree, or runtime is
+    /// invalid.
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn from_tree_with_context_profile(
+        sid_json: &str,
+        tree: Value,
+        device_id: DeviceId,
+        profile: DeviceProfile,
+        context_profile: ContextProfile,
+    ) -> Result<Self> {
+        let context_profile = context_profile.validate()?;
+        let policy = context_profile.protection_policy();
+        let model = CoreconfModel::from_sid_str(sid_json)
+            .map_err(|error| ContextError::Model(error.to_string()))?;
+        let canonical_tree = normalize_tree(tree.clone())?;
+        if canonical_tree != tree {
+            return Err(ContextError::NonCanonicalCandidate);
+        }
+        let sor = encode_tree(&model, &canonical_tree)?;
+        let loaded = LoadedContext::from_sor_with_policy(sid_json, &sor, policy.clone())?;
+        if loaded.tree != canonical_tree {
+            return Err(ContextError::NonCanonicalCandidate);
+        }
+        Self::from_loaded(
+            ContextRecipe {
+                sid_json: Arc::from(sid_json),
+                device_id,
+                profile,
+                policy,
+                dynamic_rule_ids: context_profile.dynamic_rule_ids.clone(),
+                context_profile: Some(context_profile),
+            },
+            loaded,
+        )
+    }
+
+    pub(crate) fn from_tree_for_recipe(recipe: &ContextRecipe, tree: Value) -> Result<Self> {
+        if let Some(context_profile) = &recipe.context_profile {
+            return Self::from_tree_with_context_profile(
+                recipe.sid_json.as_ref(),
+                tree,
+                recipe.device_id.clone(),
+                recipe.profile.clone(),
+                context_profile.clone(),
+            );
+        }
+        if let Some(dynamic_rule_ids) = &recipe.dynamic_rule_ids {
+            return Self::from_tree_with_policy_and_allocation(
+                recipe.sid_json.as_ref(),
+                tree,
+                recipe.device_id.clone(),
+                recipe.profile.clone(),
+                recipe.policy.clone(),
+                dynamic_rule_ids.clone(),
+            );
+        }
+        Self::from_tree(
+            recipe.sid_json.as_ref(),
+            tree,
+            recipe.device_id.clone(),
+            recipe.profile.clone(),
+            recipe.policy.clone(),
+        )
+    }
+
+    fn from_loaded(mut recipe: ContextRecipe, loaded: LoadedContext) -> Result<Self> {
+        if let Some(dynamic_rule_ids) = &mut recipe.dynamic_rule_ids {
+            *dynamic_rule_ids = dynamic_rule_ids.validate()?;
+            for rule in loaded.rule_context.rules().rules() {
+                if crate::rule_ids_overlap(rule.id(), dynamic_rule_ids.prefix().rule_id())
+                    && !dynamic_rule_ids.accepts(rule.id())
+                {
+                    return Err(ContextError::RuleIdTree(
+                        crate::RuleIdTreeError::Collision {
+                            value: rule.id().value(),
+                            length: rule.id().bit_len(),
+                        },
+                    ));
+                }
+            }
+        }
         let runtime = Runtime::new(
             recipe.device_id.clone(),
             loaded.rule_context.clone(),
@@ -405,6 +598,18 @@ impl PreparedContext {
     #[must_use]
     pub fn protected_rule_ids(&self) -> Vec<RuleId> {
         self.protected.ids()
+    }
+
+    /// Returns the explicit dynamic `RuleID` namespace, when configured.
+    #[must_use]
+    pub fn dynamic_rule_ids(&self) -> Option<&DynamicRuleIdNamespace> {
+        self.recipe.dynamic_rule_ids.as_ref()
+    }
+
+    /// Returns the mechanism-owned context profile, when one was supplied.
+    #[must_use]
+    pub fn context_profile(&self) -> Option<&ContextProfile> {
+        self.recipe.context_profile.as_ref()
     }
 
     /// Returns a copy of the digest as a hexadecimal string.
@@ -531,6 +736,8 @@ pub struct ContextSnapshot {
     rule_ids: Arc<[RuleId]>,
     rules: Arc<[Rule]>,
     tag: ContextTag,
+    dynamic_rule_ids: Option<DynamicRuleIdNamespace>,
+    context_profile: Option<ContextProfile>,
 }
 
 impl ContextSnapshot {
@@ -547,6 +754,8 @@ impl ContextSnapshot {
             rule_ids: Arc::clone(&prepared.rule_ids),
             rules: Arc::clone(&prepared.rules),
             tag: prepared.tag,
+            dynamic_rule_ids: prepared.recipe.dynamic_rule_ids.clone(),
+            context_profile: prepared.recipe.context_profile.clone(),
         }
     }
 
@@ -616,6 +825,18 @@ impl ContextSnapshot {
     #[must_use]
     pub fn contains_rule_id(&self, id: RuleId) -> bool {
         self.rule_ids.contains(&id)
+    }
+
+    /// Returns the explicit dynamic `RuleID` namespace, when configured.
+    #[must_use]
+    pub fn dynamic_rule_ids(&self) -> Option<&DynamicRuleIdNamespace> {
+        self.dynamic_rule_ids.as_ref()
+    }
+
+    /// Returns the mechanism-owned context profile, when one was supplied.
+    #[must_use]
+    pub fn context_profile(&self) -> Option<&ContextProfile> {
+        self.context_profile.as_ref()
     }
 }
 
@@ -730,6 +951,8 @@ impl ActiveContext {
             || prepared.recipe.device_id != self.recipe.device_id
             || prepared.recipe.profile != self.recipe.profile
             || prepared.recipe.policy != self.recipe.policy
+            || prepared.recipe.dynamic_rule_ids != self.recipe.dynamic_rule_ids
+            || prepared.recipe.context_profile != self.recipe.context_profile
         {
             return Err(ContextError::CandidateRecipeMismatch);
         }
@@ -783,14 +1006,8 @@ impl Backend for ActiveContextBackend {
         }
 
         let recipe = self.active.recipe();
-        let prepared = PreparedContext::from_tree(
-            &recipe.sid_json,
-            next,
-            recipe.device_id.clone(),
-            recipe.profile.clone(),
-            recipe.policy.clone(),
-        )
-        .map_err(|error| backend_error(&error))?;
+        let prepared = PreparedContext::from_tree_for_recipe(recipe, next)
+            .map_err(|error| backend_error(&error))?;
         self.active
             .validate_candidate(&current, &prepared)
             .map_err(|error| backend_error(&error))?;

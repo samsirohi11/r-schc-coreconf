@@ -31,9 +31,9 @@ use serde_json::{json, Value};
 use thiserror::Error;
 
 use crate::{
-    ActiveContext, ContextSnapshot, ContextTag, Ipv6UdpCoapPacket, Ipv6UdpPacket, LinkError,
-    LinkReport, PreparedContext, RawUdpLink, SchcLink, TrafficOrigin, TrafficRoute,
-    CORE_LOGICAL_ADDRESS, DEVICE_LOGICAL_ADDRESS, MANAGEMENT_PORT,
+    ActiveContext, ContextSnapshot, ContextTag, DynamicRuleIdNamespace, Ipv6UdpCoapPacket,
+    Ipv6UdpPacket, LinkError, LinkReport, PreparedContext, RawUdpLink, RuleIdTreeError, SchcLink,
+    TrafficOrigin, TrafficRoute, CORE_LOGICAL_ADDRESS, DEVICE_LOGICAL_ADDRESS, MANAGEMENT_PORT,
 };
 
 /// Marker used as the first byte of the compact context-check FETCH payload.
@@ -129,14 +129,12 @@ pub enum InspectionError {
     /// The remote endpoint returned unexpected content.
     #[error("unexpected management response: {0}")]
     UnexpectedResponse(String),
-    /// No unused `RuleID` satisfies the requested allocation policy.
-    #[error("no unused RuleID is available for {bits}-bit allocation starting at {minimum}")]
-    NoAvailableRuleId {
-        /// Requested `RuleID` width.
-        bits: usize,
-        /// Lowest value considered by the allocator.
-        minimum: u64,
-    },
+    /// Automatic flow management requires an explicit dynamic `RuleID` tree.
+    #[error("automatic flow management requires an explicit dynamic RuleID namespace")]
+    MissingDynamicRuleIdNamespace,
+    /// The configured dynamic `RuleID` tree rejected allocation or validation.
+    #[error("dynamic RuleID allocation failed: {0}")]
+    RuleIdTree(#[from] RuleIdTreeError),
     /// A flow contains a field that cannot be represented by the duplicate
     /// target-value operation.
     #[error("flow cannot be represented by duplicate-rule management: {0}")]
@@ -406,19 +404,6 @@ impl FlowDirection {
             Self::Downlink => crate::LinkRole::Core,
         }
     }
-}
-
-/// Policy controlling automatic destination `RuleID` allocation.
-///
-/// The allocator always uses the source rule's width unless
-/// [`Self::rule_id_bits`] is set. It never selects a `RuleID` supplied by a
-/// caller and never reuses an occupied or protected `RuleID`.
-#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
-pub struct RuleAllocationPolicy {
-    /// Lowest numeric `RuleID` value considered by the allocator.
-    pub minimum_value: u64,
-    /// Optional width for newly allocated `RuleIDs`.
-    pub rule_id_bits: Option<usize>,
 }
 
 /// Result of planning one logical flow change against the active context.
@@ -1505,7 +1490,7 @@ impl InspectionService {
     /// application rule that already encodes the packet is reported as
     /// [`FlowChange::AlreadyMatches`]. Otherwise, each eligible application
     /// rule is considered as a parent, with the destination allocated by
-    /// `allocation`. Candidates are ranked by the actual duplicate-rule
+    /// the active profile-owned `RuleID` tree. Candidates are ranked by the actual duplicate-rule
     /// management wire length, then by the number of complete changed entries,
     /// and finally by stable source `RuleID` order.
     ///
@@ -1517,9 +1502,29 @@ impl InspectionService {
         &self,
         packet: &Ipv6UdpPacket,
         direction: FlowDirection,
-        allocation: RuleAllocationPolicy,
     ) -> Result<FlowChange, InspectionError> {
         let snapshot = self.active.snapshot();
+        let dynamic_rule_ids = snapshot
+            .dynamic_rule_ids()
+            .ok_or(InspectionError::MissingDynamicRuleIdNamespace)?
+            .clone();
+        self.flow_change_impl(packet, direction, &dynamic_rule_ids)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn flow_change_impl(
+        &self,
+        packet: &Ipv6UdpPacket,
+        direction: FlowDirection,
+        dynamic_rule_ids: &DynamicRuleIdNamespace,
+    ) -> Result<FlowChange, InspectionError> {
+        let snapshot = self.active.snapshot();
+        if let Some(rule) = self.existing_application_match(&snapshot, packet, direction)? {
+            return Ok(FlowChange::AlreadyMatches { rule });
+        }
+        let dynamic_destination = dynamic_rule_ids
+            .allocate(snapshot.rules().iter().map(Rule::id))
+            .map_err(InspectionError::RuleIdTree)?;
         let mut candidates = Vec::new();
         for parent in snapshot.rules() {
             if parent.nature() != RuleNature::Compression
@@ -1534,19 +1539,10 @@ impl InspectionService {
             };
             let source = RuleSelector::new(parent.id().value(), parent.id().bit_len())?;
             if overrides.is_empty() {
-                let link = SchcLink::new(Arc::clone(&self.active), direction.link_role());
-                let Ok(encoded) = link.encode_bytes(TrafficOrigin::Application, packet.as_bytes())
-                else {
-                    continue;
-                };
-                if encoded.report().rule_id == source.rule_id() {
-                    return Ok(FlowChange::AlreadyMatches { rule: source });
-                }
                 continue;
             }
-            let destination_bits = allocation.rule_id_bits.unwrap_or(source.bits);
             let destination =
-                allocate_rule_id(&snapshot, destination_bits, allocation.minimum_value)?;
+                RuleSelector::new(dynamic_destination.value(), dynamic_destination.bit_len())?;
             let request = RuleDuplicateRequest {
                 source,
                 destination,
@@ -1570,13 +1566,8 @@ impl InspectionService {
                 continue;
             };
             let recipe = self.active.recipe();
-            let Ok(prepared) = PreparedContext::from_tree(
-                recipe.sid_json.as_ref(),
-                tree,
-                recipe.device_id.clone(),
-                recipe.profile.clone(),
-                recipe.policy.clone(),
-            ) else {
+            let prepared = PreparedContext::from_tree_for_recipe(recipe, tree);
+            let Ok(prepared) = prepared else {
                 continue;
             };
             let candidate_link = SchcLink::new(
@@ -1615,6 +1606,38 @@ impl InspectionService {
             parent: candidate.request.source,
             request: candidate.request,
         })
+    }
+
+    fn existing_application_match(
+        &self,
+        snapshot: &ContextSnapshot,
+        packet: &Ipv6UdpPacket,
+        direction: FlowDirection,
+    ) -> Result<Option<RuleSelector>, InspectionError> {
+        let link = SchcLink::new(Arc::clone(&self.active), direction.link_role());
+        for parent in snapshot.rules() {
+            if parent.nature() != RuleNature::Compression
+                || snapshot.protected_rules().contains(parent.id())
+                || !has_application_payload(parent)
+                || !has_complete_flow_fields(parent)
+            {
+                continue;
+            }
+            let Some(overrides) = flow_overrides(parent, packet, direction)? else {
+                continue;
+            };
+            if overrides.is_empty() {
+                let source = RuleSelector::new(parent.id().value(), parent.id().bit_len())?;
+                let Ok(encoded) = link.encode_bytes(TrafficOrigin::Application, packet.as_bytes())
+                else {
+                    continue;
+                };
+                if encoded.report().rule_id == source.rule_id() {
+                    return Ok(Some(source));
+                }
+            }
+        }
+        Ok(None)
     }
 
     fn duplicate_rule_wire_bytes(
@@ -1681,6 +1704,14 @@ impl InspectionService {
             .iter()
             .find(|rule| rule.id() == destination)
             .cloned();
+        if let Some(namespace) = snapshot.dynamic_rule_ids() {
+            if existing.is_none() && !namespace.accepts(destination) {
+                return Err(invalid_duplicate(format!(
+                    "new duplicate destination {} is outside the configured dynamic RuleID namespace",
+                    operation.request.destination
+                )));
+            }
+        }
         let expected_rule = find_tree_rule(
             &expected,
             self.model.composite_model(),
@@ -1688,14 +1719,8 @@ impl InspectionService {
         )?
         .ok_or_else(|| invalid_duplicate("constructed destination rule is missing"))?;
         let recipe = self.active.recipe();
-        let prepared = PreparedContext::from_tree(
-            recipe.sid_json.as_ref(),
-            expected,
-            recipe.device_id.clone(),
-            recipe.profile.clone(),
-            recipe.policy.clone(),
-        )
-        .map_err(|error| InspectionError::InvalidUpdate(error.to_string()))?;
+        let prepared = PreparedContext::from_tree_for_recipe(recipe, expected)
+            .map_err(|error| InspectionError::InvalidUpdate(error.to_string()))?;
         self.active
             .validate_candidate(&snapshot, &prepared)
             .map_err(|error| InspectionError::InvalidUpdate(error.to_string()))?;
@@ -1967,14 +1992,8 @@ impl InspectionService {
             .map_err(|error| PatchFailure::conflict(error.to_string()))?;
 
         let recipe = self.active.recipe();
-        let prepared = PreparedContext::from_tree(
-            recipe.sid_json.as_ref(),
-            candidate.get_all(),
-            recipe.device_id.clone(),
-            recipe.profile.clone(),
-            recipe.policy.clone(),
-        )
-        .map_err(|error| PatchFailure::conflict(error.to_string()))?;
+        let prepared = PreparedContext::from_tree_for_recipe(recipe, candidate.get_all())
+            .map_err(|error| PatchFailure::conflict(error.to_string()))?;
         self.active
             .validate_candidate(&snapshot, &prepared)
             .map_err(|error| PatchFailure::conflict(error.to_string()))?;
@@ -2020,35 +2039,6 @@ enum DuplicateLeaf {
 struct FlowChangeCandidate {
     request: RuleDuplicateRequest,
     management_wire_bytes: usize,
-}
-
-fn allocate_rule_id(
-    snapshot: &ContextSnapshot,
-    bits: usize,
-    minimum: u64,
-) -> Result<RuleSelector, InspectionError> {
-    RuleSelector::new(0, bits)?;
-    let maximum = if bits == 64 {
-        u64::MAX
-    } else {
-        (1_u64 << bits) - 1
-    };
-    if minimum > maximum {
-        return Err(InspectionError::NoAvailableRuleId { bits, minimum });
-    }
-    let mut value = minimum;
-    loop {
-        let candidate = RuleId::new(value, bits);
-        if !snapshot.contains_rule_id(candidate) && !snapshot.protected_rules().contains(candidate)
-        {
-            return RuleSelector::new(value, bits);
-        }
-        if value == maximum {
-            break;
-        }
-        value += 1;
-    }
-    Err(InspectionError::NoAvailableRuleId { bits, minimum })
 }
 
 fn has_application_payload(rule: &Rule) -> bool {
@@ -2252,6 +2242,17 @@ fn is_duplicate_rule_coap_shape(packet: &Packet) -> bool {
                         .front()
                         .is_some_and(|format| format.as_slice() == [142])
             })
+}
+
+/// Returns whether a raw CORECONF datagram is a duplicate-rule request.
+///
+/// Unlike the legacy [`is_duplicate_rule_request`] helper, this shape check
+/// does not assume a particular configured `RuleID`; the protected rule is
+/// selected by the active context profile.
+pub(crate) fn is_duplicate_rule_datagram(datagram: &[u8]) -> bool {
+    Packet::from_bytes(datagram)
+        .ok()
+        .is_some_and(|packet| is_duplicate_rule_coap_shape(&packet))
 }
 
 fn validate_duplicate_model_shape(model: &CompositeModel) -> Result<(), InspectionError> {
@@ -3843,7 +3844,7 @@ impl PreparedManagementRequest {
 ///
 /// The logical packet is always oriented from the core management endpoint
 /// (`2001:db8::2:8724`) to the device management endpoint
-/// (`2001:db8::1:8724`).  `RuleID` 29/8, the compact duplicate one-way path, is
+/// (`2001:db8::1:8724`). The profile-selected duplicate-rule path is
 /// deliberately not accepted here.
 ///
 /// This function performs no transport operations.  The returned value owns
@@ -3853,8 +3854,8 @@ impl PreparedManagementRequest {
 /// # Errors
 ///
 /// Returns an error when the datagram cannot form a logical packet, SCHC
-/// encoding fails, or the selected rule is not one of 16/8, 26/8, 27/8, or
-/// 28/8.
+/// encoding fails, or the selected rule is not protected by the active
+/// context profile.
 pub fn prepare_management_request(
     link: &SchcLink,
     coap_datagram: &[u8],
@@ -3868,10 +3869,9 @@ pub fn prepare_management_request(
     )
     .map_err(|error| InspectionError::Coap(error.to_string()))?;
     let encoded = link.encode(TrafficOrigin::Management, &request)?;
-    if !matches!(
-        encoded.report().rule_id,
-        id if [16_u64, 26, 27, 28].contains(&id.value()) && id.bit_len() == 8
-    ) {
+    if encoded.report().traffic_class != crate::TrafficClass::ProtectedManagement
+        || is_duplicate_rule_datagram(coap_datagram)
+    {
         return Err(InspectionError::UnexpectedResponse(format!(
             "management request selected unsupported protected RuleID {}/{}",
             encoded.report().rule_id.value(),
@@ -3889,9 +3889,9 @@ pub fn prepare_management_request(
 
 /// Validates one already decoded response against a prepared request.
 ///
-/// Validation requires protected-management route and `RuleID` 17/8, the exact
-/// device-to-core logical orientation and management ports, and matching CoAP
-/// MID and token.  No transport operation is performed.
+/// Validation requires protected-management route, the exact device-to-core
+/// logical orientation and management ports, and matching CoAP MID and token.
+/// No transport operation is performed.
 ///
 /// # Errors
 ///
@@ -3902,11 +3902,9 @@ pub fn validate_management_response(
     prepared: &PreparedManagementRequest,
     decoded: &crate::LinkDecoded,
 ) -> Result<(u8, ManagementExchange), InspectionError> {
-    if decoded.route() != TrafficRoute::ProtectedManagement
-        || decoded.rule_id() != RuleId::new(17, 8)
-    {
+    if decoded.route() != TrafficRoute::ProtectedManagement {
         return Err(InspectionError::UnexpectedResponse(format!(
-            "management response selected {:?} instead of protected 17/8",
+            "management response selected {:?} instead of protected management",
             decoded.rule_id()
         )));
     }

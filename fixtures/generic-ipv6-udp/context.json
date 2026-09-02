@@ -2,13 +2,15 @@
   "name": "Generic IPv6/UDP SCHC+CORECONF context",
   "sid": "ietf-schc@2026-05-07.sid",
   "sor": "initial.sor",
-  "application_base_rule": "20/8",
-  "application_fallback_rules": ["21/8"],
-  "protected_management_rules": ["16/8", "17/8", "26/8", "27/8", "28/8", "29/8"],
+  "profile": "profile.json",
+  "rule_tree": "rule-tree.json",
+  "application_base_rule": "2/2",
+  "application_fallback_rules": ["6/3"],
+  "protected_management_rules": ["28/5", "29/5", "60/6", "61/6", "62/6", "63/6"],
   "dynamic_rules": [],
   "allocation": {
-    "policy": "lowest-free",
-    "rule_id_bits": "parent-width",
-    "minimum_value": 0
+    "policy": "shortest-valid-leaf-then-lowest-pattern",
+    "dynamic_prefix": "0/1",
+    "allowed_leaf_lengths": [4]
   }
 }
