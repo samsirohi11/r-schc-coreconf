@@ -3,22 +3,20 @@
 use std::sync::Arc;
 
 use schc_coreconf::{
-    format_rule_detail, parse_rule_selector, protected_management_rule_ids, ActiveContext,
-    InspectionService, PreparedContext, ProtectionPolicy,
+    format_rule_detail, parse_rule_selector, ActiveContext, InspectionService, PreparedContext,
 };
 use schc_runtime::{DeviceId, DeviceProfile};
 
-const SID: &str = include_str!("../../../fixtures/demo/ietf-schc@2026-05-07.sid");
+const SID: &str = include_str!("../../../fixtures/demo/ietf-schc@2026-09-22.sid");
 const SOR: &[u8] = include_bytes!("../../../fixtures/demo/initial.sor");
 
 fn active(id: &str) -> Arc<ActiveContext> {
     Arc::new(ActiveContext::new(
-        PreparedContext::from_sor_with_policy(
+        PreparedContext::from_sor(
             SID,
             SOR,
             DeviceId::new(id).expect("device ID"),
             DeviceProfile::default(),
-            ProtectionPolicy::from_rule_ids(protected_management_rule_ids()),
         )
         .expect("context"),
     ))

@@ -19,32 +19,28 @@ mod packet_loop;
 mod policy;
 mod report;
 
-pub use allocation::{
-    overlaps as rule_ids_overlap, ContextProfile, DynamicRuleIdNamespace, RuleIdSpec,
-    RuleIdTreeError,
-};
-pub use application::{schema_lines, ApplicationError, DataClient, GenericDataService};
+pub use allocation::{ContextProfile, DynamicRuleIdNamespace, RuleIdSpec, RuleIdTreeError};
+pub use application::{ApplicationError, DataClient, GenericDataService};
 pub use context::{
-    ActiveContext, ActiveContextBackend, ContextSnapshot, ContextTag, LoadedContext,
+    ActiveContext, ActiveContextBackend, ContextSnapshot, ContextTag, GuardPeriod, LoadedContext,
     PreparedContext, CONTEXT_TAG_LEN,
 };
 pub use link::{
-    temporary_ordinary_response, LinkDecoded, LinkDecodedBytes, LinkEncoding, LinkError,
-    LinkOperation, LinkReport, LinkRole, RawDatagram, RawUdpLink, SchcLink, TrafficClass,
-    TrafficOrigin, TrafficRoute, APPLICATION_PORT, CORE_LOGICAL_ADDRESS, DEVICE_LOGICAL_ADDRESS,
-    MANAGEMENT_PORT,
+    LinkDecoded, LinkDecodedBytes, LinkEncoding, LinkError, LinkOperation, LinkReport, LinkRole,
+    RawDatagram, RawUdpLink, SchcLink, TrafficClass, TrafficOrigin, TrafficRoute, APPLICATION_PORT,
+    CORE_LOGICAL_ADDRESS, DEVICE_LOGICAL_ADDRESS, MANAGEMENT_PORT,
 };
 pub use management::{
-    context_check_request, context_check_response, decode_context_check_payload,
-    decode_rule_detail_payload, decode_rule_list_payload, exchange_management,
-    exchange_management_update, format_rule_detail, format_rule_list, is_duplicate_rule_request,
+    context_check_request, decode_context_check_payload, decode_rule_detail_payload,
+    decode_rule_list_payload, format_rule_detail, format_rule_list, is_duplicate_rule_datagram,
     management_bit_breakdown, parse_rule_duplicate_command, parse_rule_selector,
     parse_rule_update_command, prepare_management_request, rule_get_request, rule_list_request,
-    validate_management_response, ContextCheckResult, ContextStatus, DuplicateRpcCost,
-    DuplicateRpcOverride, DuplicateRuleResult, FlowChange, FlowDirection, InspectionError,
-    InspectionService, ManagementBitBreakdown, ManagementExchange, PreparedManagementRequest,
-    ResolvedRuleUpdate, RuleDetail, RuleDuplicateOverride, RuleDuplicateRequest, RuleEntry,
-    RuleEntrySelector, RuleSelector, RuleSummary, RuleUpdateRequest, CONTEXT_CHECK_MARKER,
+    validate_management_response, CoapToken, ContextCheckResult, ContextStatus, DuplicateRpcCost,
+    DuplicateRpcOverride, DuplicateRuleResult, ExchangeId, FlowChange, FlowDirection,
+    InspectionError, InspectionService, ManagementBitBreakdown, ManagementExchange,
+    PreparedManagementRequest, ResolvedRuleUpdate, RuleDetail, RuleDuplicateOverride,
+    RuleDuplicateRequest, RuleEntry, RuleEntrySelector, RuleSelector, RuleSummary,
+    RuleUpdateRequest, TokenPolicy, CONTEXT_CHECK_MARKER,
 };
 pub use packet::{
     CoapMessage, CoapOption, Ipv6UdpCoapPacket, Ipv6UdpPacket, PacketError, PacketMetadata,
@@ -52,24 +48,11 @@ pub use packet::{
     IPV6_VERSION, MAX_COAP_DATAGRAM_LEN, MAX_UDP_PAYLOAD_LEN, UDP_HEADER_LEN, UDP_NEXT_HEADER,
 };
 pub use packet_loop::{PacketEventLoop, PacketLoopError, PacketPoll};
-pub use policy::{ProtectedRule, ProtectedRules, ProtectionPolicy};
+pub use policy::{ProtectedRule, ProtectedRules};
 pub use report::{
     format_report, inspect_report, CoapCost, CoapOptionCost, CoapOptionDescription, CoapReport,
     Ipv6Report, PacketLayerCost, PacketReport, ReportDirection, ReportError, SchcCost, UdpReport,
 };
-
-/// Returns the immutable protected management rule identities used by the prototype.
-#[must_use]
-pub fn protected_management_rule_ids() -> [RuleId; 6] {
-    [
-        RuleId::new(16, 8),
-        RuleId::new(17, 8),
-        RuleId::new(26, 8),
-        RuleId::new(27, 8),
-        RuleId::new(28, 8),
-        RuleId::new(29, 8),
-    ]
-}
 
 use coreconf_model::{CoreconfError, SidFile};
 use schc_core::{RuleId, SidRegistry};
@@ -107,14 +90,6 @@ pub enum ContextError {
     /// The configured dynamic `RuleID` namespace is invalid or overlaps a rule.
     #[error("invalid dynamic RuleID namespace: {0}")]
     RuleIdTree(#[from] RuleIdTreeError),
-    /// A rule ID supplied by explicit policy was not present in the context.
-    #[error("protected RuleID {value}/{bit_len} is absent from the context")]
-    MissingProtectedRule {
-        /// Numeric `RuleID` value.
-        value: u64,
-        /// `RuleID` encoded bit length.
-        bit_len: usize,
-    },
 }
 
 /// Result alias for this crate.
@@ -196,8 +171,9 @@ pub fn derive_protected_management_rule_ids(sid_json: &str, sor: &[u8]) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+    use schc_core::RuleContext;
 
-    const SID: &str = include_str!("../../../fixtures/demo/ietf-schc@2026-05-07.sid");
+    const SID: &str = include_str!("../../../fixtures/demo/ietf-schc@2026-09-22.sid");
     const SOR: &[u8] = include_bytes!("../../../fixtures/demo/initial.sor");
 
     #[test]
@@ -206,6 +182,17 @@ mod tests {
         let (tree_b, sor_b) = canonicalize_sor(SID, SOR).expect("canonical fixture");
         assert_eq!(tree_a, tree_b);
         assert_eq!(sor_a, sor_b);
+        assert_eq!(
+            LoadedContext::from_sor(SID, SOR)
+                .expect("loaded fixture")
+                .guard_period(),
+            Some(GuardPeriod {
+                ticks_duration: 20,
+                ticks_numbers: 10,
+            })
+        );
+        let registry = SidRegistry::from_json_str(SID).expect("current SID registry");
+        RuleContext::from_cbor_slice(SOR, registry).expect("current SoR loads directly");
     }
 
     #[test]

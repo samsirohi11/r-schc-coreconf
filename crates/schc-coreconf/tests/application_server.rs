@@ -137,7 +137,7 @@ fn standalone_server_and_bound_client_exchange_ipv6_application_requests() {
     let mut input = client.stdin.take().unwrap();
     input
         .write_all(
-            b"fetch /demo-data:config/count\nset /demo-data:config/count 42\nfetch /demo-data:config/count\ndelete /demo-data:config/count\nfetch /demo-data:config/count\nreload\nquit\n",
+            b"fetch /demo-data:config/count\nset /demo-data:config/count 42\nfetch /demo-data:config/count\ndelete /demo-data:config/count\nfetch /demo-data:config/count\nquit\n",
         )
         .expect("write client commands");
     drop(input);
@@ -182,10 +182,6 @@ fn standalone_server_and_bound_client_exchange_ipv6_application_requests() {
     assert!(
         client_stdout.contains("\nnot found\n"),
         "deleted fetch missing: {client_stdout}"
-    );
-    assert!(
-        client_stdout.contains("\nOK reload\n"),
-        "reload result missing: {client_stdout}"
     );
     assert!(client_stderr.is_empty(), "client stderr: {client_stderr}");
     assert!(

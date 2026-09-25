@@ -1,7 +1,6 @@
 # Deterministic demonstration context
 
-The two OpenSCHC JSON documents are the user-facing rule sources for the final demonstration.
-They are not YANG datastore JSON.
+The OpenSCHC JSON document is the user-facing rule source for the final demonstration.
 
 `initial-rules.json` contains these exact rules:
 
@@ -18,17 +17,12 @@ They are not YANG datastore JSON.
 Application request rules `20/8` and `25/8` map hop limits 63 and 64 with one residue bit.
 This covers packets forwarded once by the core namespace as well as locally constructed packets without fixing the research topology to one kernel forwarding behavior.
 
-`updated-rules.json` is identical except that rule `20/8` changes the `IPV6.APP_IID` target from `::5` to `::2`.
-The fixed data-client request uses `2001:db8::2` as its application/core source address and `2001:db8::1` as its device destination.
-It is handled by rule `25/8` before the update and rule `20/8` after it.
-The optimized rule carries only the request residue, so the demonstration can prove fewer SCHC bits without changing the application operation.
-
 The protected management rules compress the fixed IPv6, UDP, CoAP, URI, and Content-Format fields.
 Rule `29/8` fixes CoAP NON POST and code 0.02, uses the same seven-bit MID residue, and carries only the modeled duplicate-rule payload as the final variable field.
 They use zero-length CoAP tokens and encode CoAP MID with MSB(9)/LSB, which carries seven MID bits for the bounded range 0..=127.
 The payload field is modeled as `PAYLOAD` and r-schc reconstructs the CoAP `0xff` payload marker rather than sending it as residue.
 The default iPATCH rule and the If-Match iPATCH rule are separate so the optional dynamic option remains exact.
-The integration policy protects the exact rule identities `16/8`, `17/8`, `26/8`, `27/8`, `28/8`, and `29/8`.
+The SoR marks Rules `16/8`, `17/8`, `26/8`, `27/8`, `28/8`, and `29/8` with `nature-management`; the runtime derives protection from that nature.
 The ordinary Rule `25/8` fallback remains a header-only compression rule with the remaining packet carried as suffix.
 
 The fixed logical addresses are `2001:db8::1` for the device and `2001:db8::2` for the application/core.
@@ -44,23 +38,7 @@ The core reuses MIDs modulo 128 only after each synchronous exchange completes; 
 The fixture entries use `BI` direction indicators so each rule is a complete bidirectional field path.
 Exact request, response, management, and application separation comes from fixed field values and the matched RuleID.
 Dispatch uses the exact matched RuleID and does not authorize management by URI or port alone.
-
-`rule2sor` 0.1.0 from <https://github.com/ltn22/rule2sor> emits `nature-compression` for OpenSCHC `Compression` entries.
-It does not expose management nature in its JSON grammar.
-The generated `initial.sor` and `updated.sor` files must be regenerated with the real documented CLI through the repository checker.
-The expected PyPI wheel SHA-256 is `8893b4cd5d9f2008cc6a8eb484ff241d84631f5e224ab1b861fc104f6e3631d7`.
-
-Install the pinned package in an isolated environment, then run:
-
-```text
-python3 -m venv /tmp/rule2sor-venv
-/tmp/rule2sor-venv/bin/python -m pip download --only-binary=:all: --no-deps --dest /tmp/rule2sor-wheel rule2sor==0.1.0
-test "$(sha256sum /tmp/rule2sor-wheel/rule2sor-0.1.0-py3-none-any.whl | cut -d' ' -f1)" = "8893b4cd5d9f2008cc6a8eb484ff241d84631f5e224ab1b861fc104f6e3631d7"
-/tmp/rule2sor-venv/bin/python -m pip install rule2sor==0.1.0
-RULE2SOR=/tmp/rule2sor-venv/bin/rule2sor python3 tools/generate_demo_fixtures.py
-RULE2SOR=/tmp/rule2sor-venv/bin/rule2sor python3 tools/generate_demo_fixtures.py --check
-```
-
-The checker runs `rule2sor <rules.json> -s <sid-file> -o <temporary.sor> -q` twice per source.
-It compares both outputs byte-for-byte with the checked-in SoR.
-It fails clearly when the executable is unavailable or output is nondeterministic.
+The checked-in `initial.sor` is the encoded fixture used by the repository.
+Build, tests, demo, and fixture checks use it directly; alternate test trees
+are derived in memory. See the [fixture index](../README.md) for the artifact
+inventory and the optional `rule2sor` validation and regeneration commands.

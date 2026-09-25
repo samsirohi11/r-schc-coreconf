@@ -1,10 +1,5 @@
 #!/usr/bin/env python3
-"""Generate and verify the deterministic demonstration SCHC fixtures.
-
-The JSON inputs use the OpenSCHC format accepted by rule2sor 0.1.0.
-This script deliberately invokes the documented rule2sor executable instead
-of importing its implementation, so a missing external tool fails clearly.
-"""
+"""Generate and verify the deterministic demonstration SCHC fixtures."""
 
 from __future__ import annotations
 
@@ -13,19 +8,14 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 DEMO = ROOT / "fixtures" / "demo"
-SID = DEMO / "ietf-schc@2026-05-07.sid"
-RULE2SOR_VERSION = "0.1.0"
-RULE2SOR_WHEEL_SHA256 = (
-    "8893b4cd5d9f2008cc6a8eb484ff241d84631f5e224ab1b861fc104f6e3631d7"
-)
-FIXTURES = (
-    (DEMO / "initial-rules.json", DEMO / "initial.sor"),
-    (DEMO / "updated-rules.json", DEMO / "updated.sor"),
-)
+SID = DEMO / "ietf-schc@2026-09-22.sid"
+RULES = DEMO / "initial-rules.json"
+SOR = DEMO / "initial.sor"
 
 
 def parse_args() -> argparse.Namespace:
@@ -39,15 +29,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--rule2sor",
         type=Path,
-        default=Path(os.environ.get("RULE2SOR", "rule2sor")),
-        help="rule2sor 0.1.0 executable (default: RULE2SOR or rule2sor)",
+        required=True,
+        help="path to a compatible rule2sor executable or source/package directory",
     )
     return parser.parse_args()
 
 
-def run_rule2sor(tool: Path, rules: Path, output: Path) -> bytes:
-    """Run the documented rule2sor CLI and return its captured diagnostics."""
-    command = [str(tool), str(rules), "-s", str(SID), "-o", str(output), "-q"]
+def run_rule2sor(tool: Path, rules: Path, output: Path) -> None:
+    """Run rule2sor from an explicit executable or source directory."""
+    environment = None
+    if tool.is_dir():
+        command = [sys.executable, "-m", "rule2sor.cli"]
+        environment = os.environ.copy()
+        source_path = tool.resolve()
+        source_root = str(
+            source_path.parent if (source_path / "__init__.py").is_file() else source_path
+        )
+        environment["PYTHONPATH"] = os.pathsep.join(
+            part for part in (source_root, environment.get("PYTHONPATH")) if part
+        )
+    else:
+        command = [str(tool)]
+    command.extend([str(rules), "-s", str(SID), "-o", str(output), "-q"])
     try:
         completed = subprocess.run(
             command,
@@ -55,12 +58,13 @@ def run_rule2sor(tool: Path, rules: Path, output: Path) -> bytes:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            env=environment,
         )
     except FileNotFoundError as error:
         raise SystemExit(
-            f"rule2sor executable unavailable: {tool}. "
-            f"Install rule2sor=={RULE2SOR_VERSION} and verify wheel SHA-256 "
-            f"{RULE2SOR_WHEEL_SHA256}, or pass --rule2sor PATH."
+            f"rule2sor tool unavailable: {tool}; install a compatible package or "
+            "clone its repository, then pass its executable or source directory "
+            "with --rule2sor PATH."
         ) from error
     except OSError as error:
         raise SystemExit(f"cannot execute rule2sor at {tool}: {error}") from error
@@ -71,7 +75,6 @@ def run_rule2sor(tool: Path, rules: Path, output: Path) -> bytes:
             f"rule2sor failed with exit status {completed.returncode}: "
             f"{' '.join(command)}\n{details}"
         )
-    return completed.stdout.encode() + completed.stderr.encode()
 
 
 def regenerate(tool: Path, rules: Path, output: Path) -> None:
@@ -114,21 +117,15 @@ def generate_one(tool: Path, rules: Path, destination: Path) -> None:
 
 
 def main() -> None:
-    """Generate or verify both demonstration SoRs."""
+    """Generate or verify the checked-in demonstration SoR."""
     args = parse_args()
     if not SID.is_file():
         raise SystemExit(f"missing SID fixture: {SID}")
     tool = args.rule2sor.expanduser()
     if args.check:
-        for rules, expected in FIXTURES:
-            check_one(tool, rules, expected)
+        check_one(tool, RULES, SOR)
     else:
-        for rules, destination in FIXTURES:
-            generate_one(tool, rules, destination)
-    print(
-        f"rule2sor {RULE2SOR_VERSION} expected; wheel SHA-256 "
-        f"{RULE2SOR_WHEEL_SHA256}"
-    )
+        generate_one(tool, RULES, SOR)
 
 
 if __name__ == "__main__":

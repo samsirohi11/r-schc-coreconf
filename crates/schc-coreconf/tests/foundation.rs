@@ -9,9 +9,8 @@ use coreconf_runtime::{
 };
 use schc_core::{RuleContext, RuleId, SidRegistry};
 use schc_coreconf::{
-    canonical_sor_from_tree, canonicalize_sor, derive_protected_management_rule_ids,
-    protected_management_rule_ids, tree_from_sor, ActiveContext, ContextError, PreparedContext,
-    ProtectionPolicy,
+    canonical_sor_from_tree, canonicalize_sor, derive_protected_management_rule_ids, tree_from_sor,
+    ActiveContext, ContextError, ContextTag, PreparedContext, CONTEXT_TAG_LEN,
 };
 use schc_runtime::{DeviceId, DeviceProfile};
 use serde_json::Value;
@@ -19,28 +18,22 @@ use sha2::Digest;
 
 type Mutation = Box<dyn Fn(&mut Value)>;
 
-const SID: &str = include_str!("../../../fixtures/demo/ietf-schc@2026-05-07.sid");
+const SID: &str = include_str!("../../../fixtures/demo/ietf-schc@2026-09-22.sid");
 const SOR: &[u8] = include_bytes!("../../../fixtures/demo/initial.sor");
 
 fn device() -> DeviceId {
     DeviceId::new("foundation-integration-device").expect("device")
 }
 
-fn policy() -> ProtectionPolicy {
-    // Protection is an integration policy over the exact protected
-    // management identities, independent of ordinary application rules.
-    ProtectionPolicy::from_rule_ids(protected_management_rule_ids())
-}
-
 fn prepared() -> PreparedContext {
-    PreparedContext::from_sor_with_policy(SID, SOR, device(), DeviceProfile::default(), policy())
+    PreparedContext::from_sor(SID, SOR, device(), DeviceProfile::default())
         .expect("fixture prepared")
 }
 
 fn root_ipatch_payload(tree: &Value) -> Vec<u8> {
     let model = CoreconfModel::from_sid_str(SID).expect("model");
     let mut path = InstancePath::new();
-    assert!(path.push_delta(2574).is_ok());
+    assert!(path.push_delta(2800).is_ok());
     let instance = Instance::new(
         path,
         tree.get("ietf-schc:schc").cloned().expect("SCHC root"),
@@ -63,7 +56,10 @@ fn binary_values_round_trip_losslessly_through_both_models() {
     let (tree, canonical_sor) = canonicalize_sor(SID, SOR).expect("canonical");
     let rebuilt = canonical_sor_from_tree(SID, &tree).expect("re-encode");
     assert_eq!(canonical_sor, rebuilt);
-    assert!(tree["ietf-schc:schc"]["rule"][1]["entry"][19]["target-value"][0]["value"].is_string());
+    assert!(
+        tree["ietf-schc:schc"]["rule"][1]["entry-universal"][19]["target-value"][0]["value"]
+            .is_string()
+    );
 }
 
 #[test]
@@ -87,18 +83,26 @@ fn management_nature_derives_immutable_protected_rule_ids() {
     let sor = canonical_sor_from_tree(SID, &tree).expect("managed SoR");
     assert_eq!(
         derive_protected_management_rule_ids(SID, &sor).expect("derived IDs"),
-        vec![RuleId::new(20, 8)]
+        vec![
+            RuleId::new(16, 8),
+            RuleId::new(17, 8),
+            RuleId::new(20, 8),
+            RuleId::new(26, 8),
+            RuleId::new(27, 8),
+            RuleId::new(28, 8),
+            RuleId::new(29, 8),
+        ]
     );
 }
 
 #[test]
 fn canonical_mutable_order_is_required() {
     let (mut tree, _) = canonicalize_sor(SID, SOR).expect("canonical");
-    tree["ietf-schc:schc"]["rule"][1]["entry"]
+    tree["ietf-schc:schc"]["rule"][1]["entry-universal"]
         .as_array_mut()
         .expect("entries")
         .swap(0, 1);
-    let error = PreparedContext::from_tree(SID, tree, device(), DeviceProfile::default(), policy())
+    let error = PreparedContext::from_tree(SID, tree, device(), DeviceProfile::default())
         .expect_err("noncanonical ordering must reject");
     assert!(matches!(error, ContextError::NonCanonicalCandidate));
 }
@@ -127,7 +131,7 @@ fn rejected_protected_commit_leaves_everything_unchanged() {
     let before = active.snapshot();
     let mut handler = handler_for_active(&active);
     let mut candidate = initial.tree().clone();
-    candidate["ietf-schc:schc"]["rule"][1]["entry"][0]["field-position"] = Value::from(2);
+    candidate["ietf-schc:schc"]["rule"][1]["entry-universal"][0]["field-position"] = Value::from(2);
     let request = Request::new(Method::IPatch)
         .with_interface(Interface::Management)
         .with_payload(
@@ -139,7 +143,7 @@ fn rejected_protected_commit_leaves_everything_unchanged() {
     assert_eq!(handler.datastore().get_all(), initial.tree().clone());
     assert_eq!(active.tree(), initial.tree().clone());
     assert_eq!(active.generation(), 1);
-    assert_eq!(active.digest(), initial.digest());
+    assert_eq!(active.tag(), initial.tag());
     assert!(Arc::ptr_eq(&before, &active.snapshot()));
 }
 
@@ -149,7 +153,7 @@ fn mixed_root_ipatch_failure_is_atomic() {
     let active = Arc::new(ActiveContext::new(initial.clone()));
     let model = CoreconfModel::from_sid_str(SID).expect("model");
     let mut first_path = InstancePath::new();
-    assert!(first_path.push_delta(2574).is_ok());
+    assert!(first_path.push_delta(2800).is_ok());
     let first = Instance::new(first_path, initial.tree()["ietf-schc:schc"].clone());
     let mut invalid_path = InstancePath::new();
     assert!(invalid_path.push_delta(9999).is_ok());
@@ -170,7 +174,7 @@ fn mixed_root_ipatch_failure_is_atomic() {
     assert_eq!(response.code, ResponseCode::Conflict);
     assert_eq!(handler.datastore().get_all(), initial.tree().clone());
     assert_eq!(active.generation(), 1);
-    assert_eq!(active.digest(), initial.digest());
+    assert_eq!(active.tag(), initial.tag());
 }
 
 #[test]
@@ -179,7 +183,8 @@ fn every_protected_lifecycle_mutation_is_rejected() {
         (
             "content",
             Box::new(|tree| {
-                tree["ietf-schc:schc"]["rule"][1]["entry"][0]["field-position"] = Value::from(2);
+                tree["ietf-schc:schc"]["rule"][1]["entry-universal"][0]["field-position"] =
+                    Value::from(2);
             }),
         ),
         (
@@ -236,7 +241,7 @@ fn every_protected_lifecycle_mutation_is_rejected() {
         );
         assert_eq!(active.generation(), 1, "{name}");
         assert_eq!(active.tree(), initial.tree().clone(), "{name}");
-        assert_eq!(active.digest(), initial.digest(), "{name}");
+        assert_eq!(active.tag(), initial.tag(), "{name}");
         assert_eq!(
             handler.datastore().get_all(),
             initial.tree().clone(),
@@ -254,7 +259,7 @@ fn active_backend_datastore_is_live_source_of_truth() {
         .expect("active datastore");
     assert_eq!(datastore.get_all(), initial.tree().clone());
     let mut candidate = initial.tree().clone();
-    candidate["ietf-schc:schc"]["rule"][2]["entry"][0]["target-value"][0]["value"] =
+    candidate["ietf-schc:schc"]["rule"][2]["entry-universal"][0]["target-value"][0]["value"] =
         Value::String("Bw==".to_owned());
     datastore.replace_tree(candidate.clone()).expect("publish");
     assert_eq!(datastore.get_all(), candidate);
@@ -268,7 +273,7 @@ fn valid_local_root_ipatch_publishes_once_as_one_tuple() {
     let active = Arc::new(ActiveContext::new(initial.clone()));
     let mut handler = handler_for_active(&active);
     let mut candidate = initial.tree().clone();
-    candidate["ietf-schc:schc"]["rule"][2]["entry"][0]["target-value"][0]["value"] =
+    candidate["ietf-schc:schc"]["rule"][2]["entry-universal"][0]["target-value"][0]["value"] =
         Value::String("Bw==".to_owned());
     let request = Request::new(Method::IPatch)
         .with_interface(Interface::Management)
@@ -295,24 +300,17 @@ fn valid_local_root_ipatch_publishes_once_as_one_tuple() {
 }
 
 #[test]
-fn digest_changes_only_when_canonical_context_changes() {
+fn tag_changes_only_when_canonical_context_changes() {
     let initial = prepared();
-    let same = PreparedContext::from_sor_with_policy(
-        SID,
-        SOR,
-        device(),
-        DeviceProfile::default(),
-        policy(),
-    )
-    .expect("same");
-    assert_eq!(initial.digest(), same.digest());
+    let same =
+        PreparedContext::from_sor(SID, SOR, device(), DeviceProfile::default()).expect("same");
+    assert_eq!(initial.tag(), same.tag());
     let mut tree = initial.tree().clone();
-    tree["ietf-schc:schc"]["rule"][2]["entry"][0]["target-value"][0]["value"] =
+    tree["ietf-schc:schc"]["rule"][2]["entry-universal"][0]["target-value"][0]["value"] =
         Value::String("Bw==".to_owned());
     let changed =
-        PreparedContext::from_tree(SID, tree, device(), DeviceProfile::default(), policy())
-            .expect("changed");
-    assert_ne!(initial.digest(), changed.digest());
+        PreparedContext::from_tree(SID, tree, device(), DeviceProfile::default()).expect("changed");
+    assert_ne!(initial.tag(), changed.tag());
 }
 
 fn run_competing_writer(
@@ -343,14 +341,14 @@ fn invalid_backend_candidate_has_no_hidden_pending_state() {
     let mut datastore = Datastore::with_backend(model.composite_model().clone(), active.backend())
         .expect("active datastore");
     let mut invalid = initial.tree().clone();
-    invalid["ietf-schc:schc"]["rule"][1]["entry"][0]["field-position"] = Value::from(2);
+    invalid["ietf-schc:schc"]["rule"][1]["entry-universal"][0]["field-position"] = Value::from(2);
     assert!(datastore.replace_tree(invalid).is_err());
     assert_eq!(active.generation(), 1);
     assert_eq!(active.tree(), initial.tree().clone());
-    assert_eq!(active.digest(), initial.digest());
+    assert_eq!(active.tag(), initial.tag());
 
     let mut valid = initial.tree().clone();
-    valid["ietf-schc:schc"]["rule"][2]["entry"][0]["target-value"][0]["value"] =
+    valid["ietf-schc:schc"]["rule"][2]["entry-universal"][0]["target-value"][0]["value"] =
         Value::String("Bw==".to_owned());
     datastore
         .replace_tree(valid.clone())
@@ -364,11 +362,11 @@ fn concurrent_backend_writers_reject_stale_candidates_without_lost_updates() {
     let initial = prepared();
     let active = Arc::new(ActiveContext::new(initial.clone()));
     let mut first_candidate = initial.tree().clone();
-    first_candidate["ietf-schc:schc"]["rule"][2]["entry"][0]["target-value"][0]["value"] =
-        Value::String("Bw==".to_owned());
+    first_candidate["ietf-schc:schc"]["rule"][2]["entry-universal"][0]["target-value"][0]
+        ["value"] = Value::String("Bw==".to_owned());
     let mut second_candidate = initial.tree().clone();
-    second_candidate["ietf-schc:schc"]["rule"][2]["entry"][0]["target-value"][0]["value"] =
-        Value::String("CA==".to_owned());
+    second_candidate["ietf-schc:schc"]["rule"][2]["entry-universal"][0]["target-value"][0]
+        ["value"] = Value::String("CA==".to_owned());
     let barrier = Arc::new(Barrier::new(2));
     let first_thread =
         run_competing_writer(Arc::clone(&active), first_candidate, Arc::clone(&barrier));
@@ -402,7 +400,12 @@ fn concurrent_snapshot_reads_observe_consistent_tuples() {
             hasher.update((snapshot.sor().len() as u64).to_be_bytes());
             hasher.update(snapshot.sor());
             let expected_digest: [u8; 32] = hasher.finalize().into();
-            assert_eq!(snapshot.digest(), expected_digest);
+            let expected_tag = ContextTag::new(
+                expected_digest[..CONTEXT_TAG_LEN]
+                    .try_into()
+                    .expect("context tag length"),
+            );
+            assert_eq!(snapshot.tag(), expected_tag);
             assert_eq!(
                 snapshot.runtime().device_id().as_str(),
                 "foundation-integration-device"

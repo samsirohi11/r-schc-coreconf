@@ -187,7 +187,7 @@ def derive_proof(core_text: str, device_text: str, server_text: str, client_text
     if core_text.count("OK context check  equal") < 3:
         _fail("context checks did not prove initial, update, and duplicate equality")
 
-    for expected in ("OK set", "OK delete", "OK reload", "not found"):
+    for expected in ("OK set", "OK delete", "not found"):
         if expected not in client_text:
             _fail(f"client result is missing {expected!r}")
     break_even = math.ceil(duplicate_bits / saved)

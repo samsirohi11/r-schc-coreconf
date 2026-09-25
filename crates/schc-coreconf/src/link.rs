@@ -14,7 +14,7 @@ use schc_runtime::{DeviceId, NodeRole, RuntimeError, SchcFrame};
 pub use schc_runtime::NodeRole as LinkRole;
 use thiserror::Error;
 
-use crate::{ActiveContext, Ipv6UdpCoapPacket, Ipv6UdpPacket, PacketError, PacketResult};
+use crate::{ActiveContext, Ipv6UdpCoapPacket, Ipv6UdpPacket, PacketError};
 
 /// The fixed logical address used by the demonstration core.
 pub const CORE_LOGICAL_ADDRESS: std::net::Ipv6Addr =
@@ -400,7 +400,7 @@ impl SchcLink {
         origin: TrafficOrigin,
         packet: &Ipv6UdpCoapPacket,
     ) -> Result<LinkEncoding, LinkError> {
-        self.encode_bytes(origin, packet.as_bytes())
+        self.encode_validated(origin, packet.as_bytes(), packet.coap_datagram())
     }
 
     /// Compresses one complete logical IPv6/UDP packet.
@@ -419,7 +419,16 @@ impl SchcLink {
         origin: TrafficOrigin,
         packet: &[u8],
     ) -> Result<LinkEncoding, LinkError> {
-        Ipv6UdpPacket::parse(packet)?;
+        let parsed = Ipv6UdpPacket::parse(packet)?;
+        self.encode_validated(origin, parsed.as_bytes(), parsed.udp_payload())
+    }
+
+    fn encode_validated(
+        &self,
+        origin: TrafficOrigin,
+        packet: &[u8],
+        udp_payload: &[u8],
+    ) -> Result<LinkEncoding, LinkError> {
         let snapshot = self.active.snapshot();
         let (endpoint, flow) = self.role.outbound();
         let runtime = match origin {
@@ -439,9 +448,7 @@ impl SchcLink {
             })
             .flatten();
         let management_rpc_sid = (class == TrafficClass::ProtectedManagement
-            && Ipv6UdpPacket::parse(packet).is_ok_and(|packet| {
-                crate::management::is_duplicate_rule_datagram(packet.udp_payload())
-            }))
+            && crate::management::is_duplicate_rule_datagram(udp_payload))
         .then(|| Arc::clone(&self.active.recipe().sid_json));
         let report = LinkReport::encoded(
             snapshot.generation(),
@@ -466,8 +473,8 @@ impl SchcLink {
     /// Returns [`LinkError`] when decompression fails, the frame is empty, or
     /// the reconstructed logical packet is malformed.
     pub fn decode(&self, frame: &[u8]) -> Result<LinkDecoded, LinkError> {
-        let decoded = self.decode_bytes(frame)?;
-        let packet = Ipv6UdpCoapPacket::parse(decoded.packet())?;
+        let decoded = self.decode_packet(frame)?;
+        let packet = Ipv6UdpCoapPacket::from_udp_packet(decoded.packet)?;
         Ok(LinkDecoded {
             packet,
             rule_id: decoded.rule_id,
@@ -488,6 +495,17 @@ impl SchcLink {
     /// Returns [`LinkError`] when the frame is empty, decompression fails, the
     /// reconstructed packet is malformed, or the frame is non-canonical.
     pub fn decode_bytes(&self, frame: &[u8]) -> Result<LinkDecodedBytes, LinkError> {
+        let decoded = self.decode_packet(frame)?;
+        Ok(LinkDecodedBytes {
+            packet: decoded.packet.to_vec(),
+            rule_id: decoded.rule_id,
+            traffic_class: decoded.traffic_class,
+            route: decoded.route,
+            report: decoded.report,
+        })
+    }
+
+    fn decode_packet(&self, frame: &[u8]) -> Result<DecodedPacket, LinkError> {
         if frame.is_empty() {
             return Err(LinkError::EmptyFrame);
         }
@@ -555,8 +573,8 @@ impl SchcLink {
             management_rule,
             management_rpc_sid,
         );
-        Ok(LinkDecodedBytes {
-            packet: packet.to_vec(),
+        Ok(DecodedPacket {
+            packet,
             rule_id: decoded.rule_id(),
             traffic_class: class,
             route: class.route(),
@@ -569,6 +587,14 @@ impl SchcLink {
     pub fn generation(&self) -> u64 {
         self.active.snapshot().generation()
     }
+}
+
+struct DecodedPacket {
+    packet: Ipv6UdpPacket,
+    rule_id: RuleId,
+    traffic_class: TrafficClass,
+    route: TrafficRoute,
+    report: LinkReport,
 }
 
 fn classify(snapshot: &crate::ContextSnapshot, rule_id: RuleId) -> Result<TrafficClass, LinkError> {
@@ -751,38 +777,4 @@ impl RawUdpLink {
     pub fn recv_bytes(&self) -> Result<Vec<u8>, LinkError> {
         Ok(self.recv()?.bytes)
     }
-}
-
-/// Builds a synthetic format-142 `yang-instances+cbor-seq` FETCH response.
-///
-/// The response carries the format-142 Content-Format option used by the
-/// sample application.
-/// The CoAP message ID and token are retained, and both logical IPv6 and UDP
-/// endpoints are swapped.  This helper is intentionally independent of any
-/// datastore or URI semantics.
-///
-/// # Errors
-///
-/// Returns a packet error if the response cannot be serialized or validated.
-pub fn temporary_ordinary_response(request: &Ipv6UdpCoapPacket) -> PacketResult<Ipv6UdpCoapPacket> {
-    let request_message = request.coap_message();
-    let content_format = crate::CoapOption::new(12, vec![142]).map_err(PacketError::Coap)?;
-    let response = crate::CoapMessage::from_parts(
-        1,
-        2,
-        69,
-        request_message.message_id(),
-        request_message.token().to_vec(),
-        vec![content_format],
-        Vec::new(),
-    )
-    .map_err(PacketError::Coap)?
-    .to_vec();
-    Ipv6UdpCoapPacket::new(
-        request.destination(),
-        request.source(),
-        request.destination_port(),
-        request.source_port(),
-        &response,
-    )
 }

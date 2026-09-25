@@ -4,33 +4,6 @@ use schc_core::{Rule, RuleContext, RuleId, RuleNature};
 
 use crate::{ContextError, Result};
 
-/// Explicit protected `RuleIDs` in addition to rules whose nature is management.
-///
-/// The default policy derives protected IDs from `nature-management` rules.
-/// Explicit IDs are useful for the deterministic demonstration fixture because
-/// its protected management rules are policy-selected rather than management-nature rules.
-#[derive(Debug, Clone, Default, Eq, PartialEq)]
-pub struct ProtectionPolicy {
-    pub(crate) ids: Vec<RuleId>,
-}
-
-impl ProtectionPolicy {
-    /// Creates a policy from explicit `RuleIDs`.
-    #[must_use]
-    pub fn from_rule_ids(ids: impl IntoIterator<Item = RuleId>) -> Self {
-        let mut ids: Vec<_> = ids.into_iter().collect();
-        ids.sort_by(rule_id_order);
-        ids.dedup_by(|left, right| left == right);
-        Self { ids }
-    }
-
-    /// Returns explicit protected `RuleIDs` in deterministic order.
-    #[must_use]
-    pub fn rule_ids(&self) -> &[RuleId] {
-        &self.ids
-    }
-}
-
 /// One immutable protected rule and its complete SCHC definition.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ProtectedRule {
@@ -59,32 +32,31 @@ pub struct ProtectedRules {
 }
 
 impl ProtectedRules {
-    /// Derives policy from management-nature rules and explicit protected IDs.
+    /// Derives protected rules from the `management` rule nature.
     ///
     /// # Errors
     ///
-    /// Returns [`ContextError::MissingProtectedRule`] when an explicitly
-    /// protected `RuleID` is absent from the context.
-    pub fn derive(context: &RuleContext, policy: &ProtectionPolicy) -> Result<Self> {
-        let mut ids = policy.ids.clone();
-        ids.extend(
-            context
-                .rules()
-                .rules()
-                .iter()
-                .filter(|rule| rule.nature() == RuleNature::Management)
-                .map(Rule::id),
-        );
+    /// Returns an error when a management rule cannot be found after its
+    /// identifier is collected from the context.
+    pub fn derive(context: &RuleContext) -> Result<Self> {
+        let mut ids: Vec<_> = context
+            .rules()
+            .rules()
+            .iter()
+            .filter(|rule| rule.nature() == RuleNature::Management)
+            .map(Rule::id)
+            .collect();
         ids.sort_by(rule_id_order);
         ids.dedup_by(|left, right| left == right);
 
         let mut rules = Vec::with_capacity(ids.len());
         for id in ids {
             let Some(rule) = context.find_rule(id).cloned() else {
-                return Err(ContextError::MissingProtectedRule {
-                    value: id.value(),
-                    bit_len: id.bit_len(),
-                });
+                return Err(ContextError::ProtectedRuleChanged(format!(
+                    "management RuleID {}/{} is absent from the context",
+                    id.value(),
+                    id.bit_len()
+                )));
             };
             rules.push(ProtectedRule { id, rule });
         }

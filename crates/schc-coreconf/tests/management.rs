@@ -1,5 +1,7 @@
 //! Focused protected inspection and compact-context tests.
 
+mod support;
+
 use std::io::Cursor;
 use std::sync::Arc;
 
@@ -11,20 +13,19 @@ use coreconf_runtime::coap_types::{ContentFormat, Interface, Method};
 use coreconf_runtime::Datastore;
 use schc_core::{RuleId, SidRegistry};
 use schc_coreconf::{
-    context_check_request, context_check_response, decode_rule_detail_payload,
-    decode_rule_list_payload, format_rule_detail, format_rule_list, is_duplicate_rule_request,
+    context_check_request, decode_context_check_payload, decode_rule_detail_payload,
+    decode_rule_list_payload, format_rule_detail, format_rule_list, is_duplicate_rule_datagram,
     parse_rule_duplicate_command, parse_rule_selector, parse_rule_update_command,
-    prepare_management_request, protected_management_rule_ids, rule_get_request, rule_list_request,
-    temporary_ordinary_response, validate_management_response, ActiveContext, ContextTag,
-    InspectionError, InspectionService, Ipv6UdpCoapPacket, LinkDecoded, LinkRole, PreparedContext,
-    PreparedManagementRequest, ProtectionPolicy, RuleDetail, RuleEntry, SchcLink, TrafficOrigin,
-    APPLICATION_PORT, CONTEXT_TAG_LEN, CORE_LOGICAL_ADDRESS, DEVICE_LOGICAL_ADDRESS,
-    MANAGEMENT_PORT,
+    prepare_management_request, rule_get_request, rule_list_request, validate_management_response,
+    ActiveContext, ContextTag, InspectionError, InspectionService, Ipv6UdpCoapPacket, LinkDecoded,
+    LinkRole, PreparedContext, PreparedManagementRequest, RuleDetail, RuleEntry, SchcLink,
+    TokenPolicy, TrafficOrigin, APPLICATION_PORT, CONTEXT_TAG_LEN, CORE_LOGICAL_ADDRESS,
+    DEVICE_LOGICAL_ADDRESS, MANAGEMENT_PORT,
 };
 use schc_runtime::{DeviceId, DeviceProfile};
 use serde_json::Value;
 
-const SID: &str = include_str!("../../../fixtures/demo/ietf-schc@2026-05-07.sid");
+const SID: &str = include_str!("../../../fixtures/demo/ietf-schc@2026-09-22.sid");
 const APP_SID: &str = include_str!("../../../fixtures/demo/demo-data.sid");
 const SOR: &[u8] = include_bytes!("../../../fixtures/demo/initial.sor");
 
@@ -38,12 +39,11 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 fn active() -> Arc<ActiveContext> {
-    let prepared = PreparedContext::from_sor_with_policy(
+    let prepared = PreparedContext::from_sor(
         SID,
         SOR,
         DeviceId::new("management-test-device").expect("device"),
         DeviceProfile::default(),
-        ProtectionPolicy::from_rule_ids(protected_management_rule_ids()),
     )
     .expect("prepared");
     Arc::new(ActiveContext::new(prepared))
@@ -62,7 +62,7 @@ const FIRST_FLOW_OVERRIDES: [(usize, &str, &str); 7] = [
 fn generic_base_active() -> Arc<ActiveContext> {
     let base = active();
     let mut tree = base.tree();
-    let entries = tree["ietf-schc:schc"]["rule"][2]["entry"]
+    let entries = tree["ietf-schc:schc"]["rule"][2]["entry-universal"]
         .as_array_mut()
         .expect("source entries");
     for &(entry_index, _, value) in &FIRST_FLOW_OVERRIDES {
@@ -79,9 +79,31 @@ fn generic_base_active() -> Arc<ActiveContext> {
         tree,
         DeviceId::new("management-test-device").expect("device"),
         DeviceProfile::default(),
-        ProtectionPolicy::from_rule_ids(protected_management_rule_ids()),
     )
     .expect("generic base context");
+    Arc::new(ActiveContext::new(prepared))
+}
+
+fn remapped_management_active() -> Arc<ActiveContext> {
+    let base = active();
+    let mut tree = base.tree();
+    for rule in tree["ietf-schc:schc"]["rule"]
+        .as_array_mut()
+        .expect("rules")
+    {
+        match rule["rule-id-value"].as_u64() {
+            Some(17) => rule["rule-id-value"] = serde_json::json!(18),
+            Some(29) => rule["rule-id-value"] = serde_json::json!(30),
+            _ => {}
+        }
+    }
+    let prepared = PreparedContext::from_tree(
+        SID,
+        tree,
+        DeviceId::new("remapped-management-device").expect("device"),
+        DeviceProfile::default(),
+    )
+    .expect("remapped management context");
     Arc::new(ActiveContext::new(prepared))
 }
 
@@ -130,7 +152,7 @@ fn tamper_second_target_value(datagram: &[u8]) -> Vec<u8> {
     };
     let (_, operation) = root
         .iter_mut()
-        .find(|(key, _)| *key == CborValue::Integer(2680.into()))
+        .find(|(key, _)| *key == CborValue::Integer(2906.into()))
         .expect("duplicate-rule root");
     let CborValue::Map(operation) = operation else {
         panic!("duplicate-rule operation is not a map");
@@ -206,8 +228,9 @@ fn prepared_response_fixture() -> (
     let core_link = SchcLink::new(Arc::clone(&core), LinkRole::Core);
     let device_link = SchcLink::new(Arc::clone(&device), LinkRole::Device);
     let mut service = InspectionService::new(device).expect("service");
-    let request_datagram = rule_list_request(21, &[]).expect("request");
-    let prepared = prepare_management_request(&core_link, &request_datagram).expect("prepare");
+    let request_datagram = rule_list_request(SID, 21).expect("request");
+    let prepared = prepare_management_request(&core_link, &request_datagram, TokenPolicy::Empty)
+        .expect("prepare");
     let decoded_request = device_link
         .decode(prepared.frame().bytes())
         .expect("decode request");
@@ -262,14 +285,17 @@ fn prepared_management_request_validates_a_transport_neutral_exchange() {
     let core_link = SchcLink::new(Arc::clone(&core), LinkRole::Core);
     let device_link = SchcLink::new(Arc::clone(&device), LinkRole::Device);
     let mut service = InspectionService::new(Arc::clone(&device)).expect("service");
-    let request_datagram = rule_list_request(21, &[]).expect("request");
+    let request_datagram = rule_list_request(SID, 21).expect("request");
 
-    let prepared = prepare_management_request(&core_link, &request_datagram).expect("prepare");
+    let prepared = prepare_management_request(&core_link, &request_datagram, TokenPolicy::Empty)
+        .expect("prepare");
     assert!(matches!(
         prepared.report().rule_id.value(),
         16 | 26 | 27 | 28
     ));
     assert_eq!(prepared.report().frame_bytes, prepared.frame().bytes());
+    assert_eq!(prepared.exchange_id().message_id(), 21);
+    assert!(prepared.exchange_id().token().is_empty());
     let decoded_request = device_link
         .decode(prepared.frame().bytes())
         .expect("decode request");
@@ -344,7 +370,7 @@ fn validator_rejects_a_decoded_ordinary_application_response() {
         .decode(request_frame.frame().bytes())
         .expect("decode application request");
     let response =
-        temporary_ordinary_response(decoded_request.packet()).expect("application response");
+        support::ordinary_response(decoded_request.packet()).expect("application response");
     let response_frame = device
         .encode(TrafficOrigin::Application, &response)
         .expect("encode application response");
@@ -360,7 +386,7 @@ fn validator_rejects_a_decoded_ordinary_application_response() {
     let error = validate_management_response(&prepared, &decoded_response)
         .expect_err("ordinary response must be rejected");
     let expected = format!(
-        "management response selected {:?} instead of protected 17/8",
+        "management response selected {:?} instead of protected management",
         RuleId::new(21, 8)
     );
     assert!(matches!(error, InspectionError::UnexpectedResponse(message) if message == expected));
@@ -369,8 +395,9 @@ fn validator_rejects_a_decoded_ordinary_application_response() {
 #[test]
 fn validator_rejects_a_decoded_protected_request_rule() {
     let (prepared, _, core, device, _) = prepared_response_fixture();
-    let request_datagram = context_check_request(active().tag(), 22, &[]);
-    let request = prepare_management_request(&core, &request_datagram).expect("prepare request");
+    let request_datagram = context_check_request(active().tag(), 22);
+    let request = prepare_management_request(&core, &request_datagram, TokenPolicy::Empty)
+        .expect("prepare request");
     assert_eq!(request.report().rule_id, RuleId::new(16, 8));
     let decoded_request = device
         .decode(request.frame().bytes())
@@ -379,10 +406,7 @@ fn validator_rejects_a_decoded_protected_request_rule() {
 
     let error = validate_management_response(&prepared, &decoded_request)
         .expect_err("request rule must be rejected");
-    let expected = format!(
-        "management response selected {:?} instead of protected 17/8",
-        RuleId::new(16, 8)
-    );
+    let expected = "management response logical orientation is invalid";
     assert!(matches!(error, InspectionError::UnexpectedResponse(message) if message == expected));
 }
 
@@ -504,24 +528,25 @@ fn prepared_management_request_excludes_compact_duplicate_rule() {
     let default_update = update_for(&active, "rule update 20/8 entry=9 tv=2");
     let conditional_update = update_for(&active, "rule update 20/8 entry=9 tv=2 --if-match");
     let requests = [
-        (context_check_request(active.tag(), 1, &[]), 16),
-        (rule_list_request(2, &[]).expect("inspection request"), 26),
+        (context_check_request(active.tag(), 1), 16),
+        (rule_list_request(SID, 2).expect("inspection request"), 26),
         (
             default_update
-                .ipatch_datagram(3, &[], None)
+                .ipatch_datagram(3, None)
                 .expect("default update"),
             27,
         ),
         (
             conditional_update
-                .ipatch_datagram(4, &[], Some(active.tag()))
+                .ipatch_datagram(4, Some(active.tag()))
                 .expect("conditional update"),
             28,
         ),
     ];
     let link = SchcLink::new(Arc::clone(&active), LinkRole::Core);
     for (datagram, expected_rule) in requests {
-        let prepared = prepare_management_request(&link, &datagram).expect("prepare request");
+        let prepared = prepare_management_request(&link, &datagram, TokenPolicy::Empty)
+            .expect("prepare request");
         assert_eq!(
             prepared.report().rule_id,
             schc_core::RuleId::new(expected_rule, 8)
@@ -534,11 +559,12 @@ fn prepared_management_request_excludes_compact_duplicate_rule() {
         .duplicate_rule_datagram(&request, 37)
         .expect("duplicate datagram");
     let link = SchcLink::new(active, LinkRole::Core);
-    let error = prepare_management_request(&link, &datagram).expect_err("duplicate rejected");
+    let error = prepare_management_request(&link, &datagram, TokenPolicy::Empty)
+        .expect_err("duplicate rejected");
     assert!(matches!(
         error,
         InspectionError::UnexpectedResponse(message)
-            if message == "management request selected unsupported protected RuleID 29/8"
+            if message == "duplicate-rule NON POST is one-way and is not prepared for response tracking"
     ));
 }
 
@@ -548,14 +574,13 @@ fn tags_are_stable_and_have_lowercase_wire_format() {
     let b = active();
     assert_eq!(a.tag(), b.tag());
     let mut tree = a.tree();
-    tree["ietf-schc:schc"]["rule"][2]["entry"][9]["target-value"][0]["value"] =
+    tree["ietf-schc:schc"]["rule"][2]["entry-universal"][9]["target-value"][0]["value"] =
         serde_json::json!("0000000000000006");
     let changed = PreparedContext::from_tree(
         SID,
         tree,
         DeviceId::new("management-test-device").expect("device"),
         DeviceProfile::default(),
-        ProtectionPolicy::from_rule_ids(protected_management_rule_ids()),
     )
     .expect("changed context");
     assert_ne!(a.tag(), changed.tag());
@@ -567,7 +592,7 @@ fn tags_are_stable_and_have_lowercase_wire_format() {
 #[test]
 fn compact_context_check_has_only_marker_and_tag_on_mismatch() {
     let tag = ContextTag::new([1; CONTEXT_TAG_LEN]);
-    let request = context_check_request(tag, 9, &[0x44]);
+    let request = context_check_request(tag, 9);
     let request_packet = Packet::from_bytes(&request).expect("request");
     assert!(request_packet.get_token().is_empty());
     assert_eq!(request_packet.payload.len(), CONTEXT_TAG_LEN + 1);
@@ -577,8 +602,13 @@ fn compact_context_check_has_only_marker_and_tag_on_mismatch() {
     response.header.set_type(MessageType::Acknowledgement);
     response.set_token(request_packet.get_token().to_vec());
     response.payload = vec![0xC6, 1, 2, 3, 4, 5, 6, 7, 8, 9];
-    let result =
-        context_check_response(&response.to_bytes().expect("response"), tag).expect("check");
+    let response_packet =
+        Packet::from_bytes(&response.to_bytes().expect("response")).expect("response packet");
+    assert_eq!(
+        response_packet.header.code,
+        MessageClass::Response(ResponseType::Content)
+    );
+    let result = decode_context_check_payload(&response_packet.payload, tag).expect("check");
     assert!(!result.equal);
     assert_eq!(result.device_tag.bytes(), [2, 3, 4, 5, 6, 7, 8, 9]);
 }
@@ -588,25 +618,28 @@ fn device_context_check_reports_updated_tag_without_context_payload() {
     let core = active();
     let device = active();
     let mut tree = device.tree();
-    tree["ietf-schc:schc"]["rule"][2]["entry"][9]["target-value"][0]["value"] =
+    tree["ietf-schc:schc"]["rule"][2]["entry-universal"][9]["target-value"][0]["value"] =
         serde_json::json!("0000000000000006");
     let changed = PreparedContext::from_tree(
         SID,
         tree,
         DeviceId::new("management-test-device").expect("device"),
         DeviceProfile::default(),
-        ProtectionPolicy::from_rule_ids(protected_management_rule_ids()),
     )
     .expect("changed context");
     let device = Arc::new(ActiveContext::new(changed));
     let mut service = InspectionService::new(device.clone()).expect("service");
-    let request = context_check_request(core.tag(), 10, &[0x44]);
+    let request = context_check_request(core.tag(), 10);
     let response = service.handle_datagram(&request).expect("response");
     let response_packet = Packet::from_bytes(&response).expect("response packet");
     assert!(response_packet
         .get_option(CoapOption::ContentFormat)
         .is_none());
-    let result = context_check_response(&response, core.tag()).expect("check");
+    assert_eq!(
+        response_packet.header.code,
+        MessageClass::Response(ResponseType::Content)
+    );
+    let result = decode_context_check_payload(&response_packet.payload, core.tag()).expect("check");
     assert!(!result.equal);
     assert_eq!(result.device_tag, device.tag());
     assert_eq!(response.len(), 4 + 1 + 1 + CONTEXT_TAG_LEN + 1);
@@ -618,7 +651,7 @@ fn inspection_projects_summaries_and_rejects_mutations() {
     let mut service = InspectionService::new(active.clone()).expect("service");
     let before = active.snapshot();
     let before_runtime = before.runtime_arc();
-    let request = rule_list_request(11, &[0xC1]).expect("rule-list request");
+    let request = rule_list_request(SID, 11).expect("rule-list request");
     let response = Packet::from_bytes(&service.handle_datagram(&request).expect("list response"))
         .expect("response");
     assert_eq!(
@@ -629,8 +662,8 @@ fn inspection_projects_summaries_and_rejects_mutations() {
         decode_instances_with_model(service.model().composite_model(), &response.payload)
             .expect("instances");
     assert_eq!(instances.len(), 1);
-    assert_eq!(instances[0].path.absolute_sid(), Some(2574));
-    assert!(instances[0].path.components.len() == 1);
+    assert_eq!(instances[0].path.absolute_sid(), Some(2800));
+    assert!(instances[0].path.components().len() == 1);
     assert!(instances[0].value.as_ref().is_some_and(Value::is_object));
     let summaries =
         decode_rule_list_payload(&response.payload, service.model()).expect("root rule summaries");
@@ -659,7 +692,7 @@ fn inspection_projects_summaries_and_rejects_mutations() {
         );
         let after = active.snapshot();
         assert_eq!(before.tree(), after.tree());
-        assert_eq!(before.digest(), after.digest());
+        assert_eq!(before.tag(), after.tag());
         assert_eq!(before.generation(), after.generation());
         assert_eq!(before.tag(), after.tag());
         assert!(Arc::ptr_eq(&before_runtime, &after.runtime_arc()));
@@ -668,7 +701,7 @@ fn inspection_projects_summaries_and_rejects_mutations() {
 
 #[test]
 fn rule_list_fetch_requests_one_root_identifier_with_format_141() {
-    let packet = Packet::from_bytes(&rule_list_request(21, &[0xC1]).expect("rule-list request"))
+    let packet = Packet::from_bytes(&rule_list_request(SID, 21).expect("rule-list request"))
         .expect("request packet");
     assert!(packet.get_token().is_empty());
     assert_eq!(
@@ -679,7 +712,7 @@ fn rule_list_fetch_requests_one_root_identifier_with_format_141() {
     );
     let path = coreconf_model::instance_id::InstancePath::decode_cbor(&packet.payload)
         .expect("root identifier");
-    assert_eq!(path.components, vec![PathComponent::SidDelta(2574)]);
+    assert_eq!(path.components(), [PathComponent::SidDelta(2800)]);
 }
 
 #[test]
@@ -695,7 +728,7 @@ fn bare_rule_list_fetch_is_rejected_without_mutation() {
     packet.add_option(CoapOption::UriPath, b"schc".to_vec());
     packet.add_option(CoapOption::ContentFormat, vec![141]);
     let mut path = coreconf_model::instance_id::InstancePath::new();
-    path.push_delta(2574).expect("root SID");
+    path.push_delta(2800).expect("root SID");
     path.push_delta(23).expect("rule SID delta");
     packet.payload = path.encode_cbor().expect("bare list identifier");
     let response = Packet::from_bytes(
@@ -778,11 +811,11 @@ fn resolved_update_has_exact_sid_path_and_fixed_width_wire_value() {
 
     assert_eq!(update.entry_index, 9);
     assert_eq!(update.target_value_index, 0);
-    assert_eq!(update.path.absolute_sid(), Some(2631));
+    assert_eq!(update.path.absolute_sid(), Some(2857));
     assert_eq!(
-        update.path.components,
+        update.path.components(),
         vec![
-            PathComponent::SidDelta(2574),
+            PathComponent::SidDelta(2800),
             PathComponent::SidDelta(23),
             PathComponent::KeyValue(serde_json::json!(20)),
             PathComponent::KeyValue(serde_json::json!(8)),
@@ -827,7 +860,7 @@ fn ipatch_datagram_builder_emits_exact_optional_if_match_option() {
     let default_update = update_for(&active, "rule update 20/8 entry=9 tv=6");
     let default_packet = Packet::from_bytes(
         &default_update
-            .ipatch_datagram(50, &[0xD0], None)
+            .ipatch_datagram(50, None)
             .expect("default datagram"),
     )
     .expect("default packet");
@@ -855,7 +888,7 @@ fn ipatch_datagram_builder_emits_exact_optional_if_match_option() {
     let tag = active.tag();
     let tagged_packet = Packet::from_bytes(
         &tagged_update
-            .ipatch_datagram(51, &[0xD1], Some(tag))
+            .ipatch_datagram(51, Some(tag))
             .expect("tagged datagram"),
     )
     .expect("tagged packet");
@@ -871,17 +904,16 @@ fn ipatch_datagram_builder_emits_exact_optional_if_match_option() {
         tagged_update.ipatch_payload().expect("payload")
     );
     assert!(tagged_update.ipatch_request().is_err());
-    assert!(tagged_update.ipatch_datagram(52, &[0xD2], None).is_err());
-    assert!(default_update
-        .ipatch_datagram(53, &[0xD3], Some(tag))
-        .is_err());
+    assert!(tagged_update.ipatch_datagram(52, None).is_err());
+    assert!(default_update.ipatch_datagram(53, Some(tag)).is_err());
 }
 
 #[test]
 fn detached_update_changes_only_requested_target_value() {
     let active = active();
     assert_eq!(
-        active.tree()["ietf-schc:schc"]["rule"][2]["entry"][9]["target-value"][0]["value"],
+        active.tree()["ietf-schc:schc"]["rule"][2]["entry-universal"][9]["target-value"][0]
+            ["value"],
         "AAAAAAAAAAU="
     );
     let service = InspectionService::new(active.clone()).expect("service");
@@ -901,21 +933,21 @@ fn detached_update_changes_only_requested_target_value() {
         .composite_model()
         .sid_value_to_identifier_value_at_path(
             instances[0].value.clone().expect("replacement value"),
-            "/ietf-schc:schc/rule/entry/target-value/value",
+            "/ietf-schc:schc/rule/entry-universal/target-value/value",
         )
         .expect("identifier value");
 
     let before = active.tree();
     assert_eq!(
-        before["ietf-schc:schc"]["rule"][2]["entry"][9]["target-value"][0]["value"],
+        before["ietf-schc:schc"]["rule"][2]["entry-universal"][9]["target-value"][0]["value"],
         "AAAAAAAAAAU="
     );
     let mut expected = before.clone();
-    expected["ietf-schc:schc"]["rule"][2]["entry"][9]["target-value"][0]["value"] =
+    expected["ietf-schc:schc"]["rule"][2]["entry-universal"][9]["target-value"][0]["value"] =
         identifier_value;
     assert_ne!(before, expected);
     assert_eq!(
-        expected["ietf-schc:schc"]["rule"][2]["entry"][9]["target-value"][0]["value"],
+        expected["ietf-schc:schc"]["rule"][2]["entry-universal"][9]["target-value"][0]["value"],
         "AAAAAAAAAAY="
     );
 
@@ -925,7 +957,7 @@ fn detached_update_changes_only_requested_target_value() {
     let sid = instance.path.absolute_sid().expect("target SID");
     let keys = instance
         .path
-        .components
+        .components()
         .iter()
         .filter_map(|component| match component {
             PathComponent::KeyValue(value) => Some(value.clone()),
@@ -938,7 +970,7 @@ fn detached_update_changes_only_requested_target_value() {
         .composite_model()
         .sid_value_to_identifier_value_at_path(
             instance.value.clone().expect("replacement value"),
-            "/ietf-schc:schc/rule/entry/target-value/value",
+            "/ietf-schc:schc/rule/entry-universal/target-value/value",
         )
         .expect("candidate identifier value");
     candidate
@@ -973,7 +1005,7 @@ fn device_ipatch_requires_instance_sequence_content_format_without_publication()
     assert_eq!(unchanged.tree(), before.tree());
     assert_eq!(unchanged.sor(), before.sor());
     assert_eq!(unchanged.generation(), before.generation());
-    assert_eq!(unchanged.digest(), before.digest());
+    assert_eq!(unchanged.tag(), before.tag());
     assert_eq!(unchanged.tag(), before.tag());
     assert!(Arc::ptr_eq(&unchanged.runtime_arc(), &before_runtime));
 
@@ -1003,11 +1035,7 @@ fn device_ipatch_publishes_one_valid_target_update_and_keeps_inspection_live() {
     let mut service = InspectionService::new(Arc::clone(&active)).expect("service");
     let response = Packet::from_bytes(
         &service
-            .handle_datagram(
-                &update
-                    .ipatch_datagram(60, &[0xD1], None)
-                    .expect("default datagram"),
-            )
+            .handle_datagram(&update.ipatch_datagram(60, None).expect("default datagram"))
             .expect("response"),
     )
     .expect("response packet");
@@ -1017,11 +1045,11 @@ fn device_ipatch_publishes_one_valid_target_update_and_keeps_inspection_live() {
     );
     let after = active.snapshot();
     assert_eq!(after.generation(), before.generation() + 1);
-    assert_ne!(after.digest(), before.digest());
+    assert_ne!(after.tag(), before.tag());
     assert_ne!(after.tag(), before.tag());
     assert_ne!(after.sor(), before.sor());
     assert_eq!(
-        after.tree()["ietf-schc:schc"]["rule"][2]["entry"][9]["target-value"][0]["value"],
+        after.tree()["ietf-schc:schc"]["rule"][2]["entry-universal"][9]["target-value"][0]["value"],
         "AAAAAAAAAAY="
     );
     assert_eq!(
@@ -1033,7 +1061,7 @@ fn device_ipatch_publishes_one_valid_target_update_and_keeps_inspection_live() {
     );
     let inspect = service
         .handle_datagram(
-            &rule_get_request(parse_rule_selector("20/8").expect("selector"), 61, &[0xD2])
+            &rule_get_request(SID, parse_rule_selector("20/8").expect("selector"), 61)
                 .expect("rule-get request"),
         )
         .expect("inspection response");
@@ -1056,7 +1084,7 @@ fn device_ipatch_accepts_current_if_match_tag_and_publishes_once() {
         &service
             .handle_datagram(
                 &update
-                    .ipatch_datagram(65, &[0xD4], Some(before.tag()))
+                    .ipatch_datagram(65, Some(before.tag()))
                     .expect("tagged datagram"),
             )
             .expect("response"),
@@ -1070,7 +1098,7 @@ fn device_ipatch_accepts_current_if_match_tag_and_publishes_once() {
     assert_eq!(after.generation(), before.generation() + 1);
     assert_ne!(after.tag(), before.tag());
     assert_eq!(
-        after.tree()["ietf-schc:schc"]["rule"][2]["entry"][9]["target-value"][0]["value"],
+        after.tree()["ietf-schc:schc"]["rule"][2]["entry-universal"][9]["target-value"][0]["value"],
         "AAAAAAAAAAY="
     );
 }
@@ -1088,7 +1116,7 @@ fn device_ipatch_rejects_stale_if_match_without_publication() {
         &service
             .handle_datagram(
                 &update
-                    .ipatch_datagram(66, &[0xD5], Some(ContextTag::new(stale_bytes)))
+                    .ipatch_datagram(66, Some(ContextTag::new(stale_bytes)))
                     .expect("stale datagram"),
             )
             .expect("response"),
@@ -1102,7 +1130,7 @@ fn device_ipatch_rejects_stale_if_match_without_publication() {
     assert_eq!(after.tree(), before.tree());
     assert_eq!(after.sor(), before.sor());
     assert_eq!(after.generation(), before.generation());
-    assert_eq!(after.digest(), before.digest());
+    assert_eq!(after.tag(), before.tag());
     assert_eq!(after.tag(), before.tag());
     assert!(Arc::ptr_eq(&after.runtime_arc(), &before_runtime));
 }
@@ -1112,7 +1140,7 @@ fn device_ipatch_rejects_malformed_and_duplicate_if_match_atomically() {
     let active = active();
     let update = update_for(&active, "rule update 20/8 entry=9 tv=6 --if-match");
     let valid_datagram = update
-        .ipatch_datagram(67, &[0xD6], Some(active.tag()))
+        .ipatch_datagram(67, Some(active.tag()))
         .expect("tagged datagram");
     let mut malformed = Packet::from_bytes(&valid_datagram).expect("packet");
     malformed.clear_option(CoapOption::IfMatch);
@@ -1137,7 +1165,6 @@ fn device_ipatch_rejects_malformed_and_duplicate_if_match_atomically() {
         assert_eq!(after.tree(), before.tree());
         assert_eq!(after.sor(), before.sor());
         assert_eq!(after.generation(), before.generation());
-        assert_eq!(after.digest(), before.digest());
         assert_eq!(after.tag(), before.tag());
         assert!(Arc::ptr_eq(&after.runtime_arc(), &before_runtime));
     }
@@ -1152,7 +1179,6 @@ fn device_ipatch_rejects_invalid_values_paths_and_multiple_operations_atomically
     let baseline_sor = baseline.sor().to_vec();
     let baseline_runtime = baseline.runtime_arc();
     let baseline_generation = baseline.generation();
-    let baseline_digest = baseline.digest();
     let baseline_tag = baseline.tag();
     let mut service = InspectionService::new(Arc::clone(&active)).expect("service");
 
@@ -1213,33 +1239,35 @@ fn device_ipatch_rejects_invalid_values_paths_and_multiple_operations_atomically
         assert_eq!(current.tree(), &baseline_tree);
         assert_eq!(current.sor(), baseline_sor.as_slice());
         assert_eq!(current.generation(), baseline_generation);
-        assert_eq!(current.digest(), baseline_digest);
         assert_eq!(current.tag(), baseline_tag);
         assert!(Arc::ptr_eq(&current.runtime_arc(), &baseline_runtime));
     }
 }
 
 #[test]
-fn device_ipatch_rejects_both_configured_protected_rule_ids_without_publication() {
+fn device_ipatch_rejects_updates_to_management_rules_without_publication() {
     let active = active();
     let mut service = InspectionService::new(Arc::clone(&active)).expect("service");
-    for (message_id, command) in [
-        (63, "rule update 16/8 entry=0 tv=6"),
-        (64, "rule update 17/8 entry=0 tv=6"),
-    ] {
+    for (message_id, rule_value) in [(63, 16), (64, 17)] {
         let before = active.snapshot();
         let before_runtime = before.runtime_arc();
-        let update = if command.starts_with("rule update 16/8") {
-            let mut update = update_for(&active, "rule update 20/8 entry=9 tv=6");
-            update.path.components[2] = PathComponent::KeyValue(serde_json::json!(16));
-            update.path.components[3] = PathComponent::KeyValue(serde_json::json!(8));
-            update
-        } else {
-            let mut update = update_for(&active, "rule update 20/8 entry=9 tv=6");
-            update.path.components[2] = PathComponent::KeyValue(serde_json::json!(17));
-            update.path.components[3] = PathComponent::KeyValue(serde_json::json!(8));
-            update
-        };
+        let mut update = update_for(&active, "rule update 20/8 entry=9 tv=6");
+        let mut path = coreconf_model::instance_id::InstancePath::new();
+        for (index, component) in update.path.components().iter().enumerate() {
+            if index == 2 {
+                path.push_key(serde_json::json!(rule_value));
+                continue;
+            }
+            if index == 3 {
+                path.push_key(serde_json::json!(8));
+                continue;
+            }
+            match component {
+                PathComponent::SidDelta(delta) => path.push_delta(*delta).expect("SID delta"),
+                PathComponent::KeyValue(value) => path.push_key(value.clone()),
+            }
+        }
+        update.path = path;
         let response = Packet::from_bytes(
             &service
                 .handle_datagram(&target_ipatch_datagram(
@@ -1257,7 +1285,7 @@ fn device_ipatch_rejects_both_configured_protected_rule_ids_without_publication(
         assert_eq!(after.tree(), before.tree());
         assert_eq!(after.sor(), before.sor());
         assert_eq!(after.generation(), before.generation());
-        assert_eq!(after.digest(), before.digest());
+        assert_eq!(after.tag(), before.tag());
         assert_eq!(after.tag(), before.tag());
         assert!(Arc::ptr_eq(&after.runtime_arc(), &before_runtime));
     }
@@ -1413,7 +1441,7 @@ fn duplicate_rule_generic_base_first_flow_creates_all_seven_overrides_and_replay
     );
     for &(entry_index, _, target_value) in &FIRST_FLOW_OVERRIDES {
         assert_ne!(
-            source_before_rule["entry"][entry_index]["target-value"][0]["value"],
+            source_before_rule["entry-universal"][entry_index]["target-value"][0]["value"],
             target_value
         );
     }
@@ -1430,7 +1458,7 @@ fn duplicate_rule_generic_base_first_flow_creates_all_seven_overrides_and_replay
         .is_none());
     let after = active.snapshot();
     assert_eq!(after.generation(), before.generation() + 1);
-    assert_ne!(after.digest(), before.digest());
+    assert_ne!(after.tag(), before.tag());
     assert_ne!(after.tag(), before.tag());
     assert_ne!(after.tree(), before.tree());
     assert_ne!(Arc::as_ptr(&after), Arc::as_ptr(&before));
@@ -1447,7 +1475,7 @@ fn duplicate_rule_generic_base_first_flow_creates_all_seven_overrides_and_replay
     let destination = tree_rule(after.tree(), 22);
     for &(entry_index, _, target_value) in &FIRST_FLOW_OVERRIDES {
         assert_eq!(
-            destination["entry"][entry_index]["target-value"][0]["value"], target_value,
+            destination["entry-universal"][entry_index]["target-value"][0]["value"], target_value,
             "entry {entry_index} target value"
         );
     }
@@ -1461,7 +1489,6 @@ fn duplicate_rule_generic_base_first_flow_creates_all_seven_overrides_and_replay
     let replay_before = active.snapshot();
     let replay_generation = replay_before.generation();
     let replay_tag = replay_before.tag();
-    let replay_digest = replay_before.digest();
     let replay_tree = replay_before.tree().clone();
     assert!(service
         .handle_datagram_no_response(&datagram)
@@ -1470,7 +1497,6 @@ fn duplicate_rule_generic_base_first_flow_creates_all_seven_overrides_and_replay
     let replay_after = active.snapshot();
     assert_eq!(replay_after.generation(), replay_generation);
     assert_eq!(replay_after.tag(), replay_tag);
-    assert_eq!(replay_after.digest(), replay_digest);
     assert_eq!(replay_after.tree(), &replay_tree);
     assert!(Arc::ptr_eq(&replay_before, &replay_after));
 }
@@ -1512,7 +1538,8 @@ fn duplicate_rule_override_counts_1_2_3_5_7_each_publish_once_and_keep_source_un
         let destination = tree_rule(after.tree(), destination_id as u64);
         for &(entry_index, _, target_value) in FIRST_FLOW_OVERRIDES.iter().take(count) {
             assert_eq!(
-                destination["entry"][entry_index]["target-value"][0]["value"], target_value,
+                destination["entry-universal"][entry_index]["target-value"][0]["value"],
+                target_value,
                 "destination {destination_id}, entry {entry_index}"
             );
         }
@@ -1527,7 +1554,6 @@ fn duplicate_rule_invalid_multi_entry_request_is_atomic_at_device_handler() {
     let before_sor = before.sor().to_vec();
     let before_generation = before.generation();
     let before_tag = before.tag();
-    let before_digest = before.digest();
     let before_runtime = before.runtime_arc();
     let mut service = InspectionService::new(active.clone()).expect("service");
     let request = parse_rule_duplicate_command(&first_flow_command(35, 2))
@@ -1547,7 +1573,6 @@ fn duplicate_rule_invalid_multi_entry_request_is_atomic_at_device_handler() {
     assert_eq!(after.sor(), before_sor.as_slice());
     assert_eq!(after.generation(), before_generation);
     assert_eq!(after.tag(), before_tag);
-    assert_eq!(after.digest(), before_digest);
     assert!(Arc::ptr_eq(&after, &before));
     assert!(Arc::ptr_eq(&after.runtime_arc(), &before_runtime));
 }
@@ -1568,7 +1593,7 @@ fn duplicate_rule_rejects_modeled_output_before_publication() {
     };
     let (_, operation) = root
         .iter_mut()
-        .find(|(key, _)| *key == CborValue::Integer(2680.into()))
+        .find(|(key, _)| *key == CborValue::Integer(2906.into()))
         .expect("duplicate-rule root");
     let CborValue::Map(operation) = operation else {
         panic!("duplicate-rule operation is not a map");
@@ -1597,16 +1622,83 @@ fn duplicate_rule_rejects_modeled_output_before_publication() {
 }
 
 #[test]
-fn duplicate_rule_dispatch_requires_exact_rule_29() {
+fn duplicate_rule_datagram_has_the_expected_shape() {
     let active = active();
     let service = InspectionService::new(active).expect("service");
     let request =
         schc_coreconf::parse_rule_duplicate_command("rule duplicate 20/8 22/8 entry=9 tv=2")
             .expect("duplicate request");
     let datagram = service.duplicate_rule_datagram(&request, 45).unwrap();
-    let packet = Packet::from_bytes(&datagram).expect("duplicate packet");
-    assert!(is_duplicate_rule_request(RuleId::new(29, 8), &packet));
-    assert!(!is_duplicate_rule_request(RuleId::new(28, 8), &packet));
+    assert!(is_duplicate_rule_datagram(&datagram));
+}
+
+#[test]
+fn duplicate_dispatch_uses_management_nature_after_rule_id_remap() {
+    let active = remapped_management_active();
+    let mut service = InspectionService::new(Arc::clone(&active)).expect("service");
+    let request = parse_rule_duplicate_command("rule duplicate 20/8 22/8 entry=9 tv=2")
+        .expect("duplicate request");
+    let datagram = service
+        .duplicate_rule_datagram(&request, 46)
+        .expect("duplicate datagram");
+    assert!(is_duplicate_rule_datagram(&datagram));
+
+    let packet = Ipv6UdpCoapPacket::new(
+        CORE_LOGICAL_ADDRESS,
+        DEVICE_LOGICAL_ADDRESS,
+        MANAGEMENT_PORT,
+        MANAGEMENT_PORT,
+        &datagram,
+    )
+    .expect("logical management packet");
+    let encoded = SchcLink::new(Arc::clone(&active), LinkRole::Core)
+        .encode(TrafficOrigin::Management, &packet)
+        .expect("remapped management request encodes");
+    assert_eq!(
+        encoded.report().traffic_class,
+        schc_coreconf::TrafficClass::ProtectedManagement
+    );
+    assert_eq!(encoded.report().rule_id, RuleId::new(30, 8));
+
+    let decoded = SchcLink::new(Arc::clone(&active), LinkRole::Device)
+        .decode(encoded.frame().bytes())
+        .expect("remapped management request decodes");
+    assert_eq!(
+        decoded.route(),
+        schc_coreconf::TrafficRoute::ProtectedManagement
+    );
+    assert!(is_duplicate_rule_datagram(decoded.packet().coap_datagram()));
+
+    let list_request = rule_list_request(SID, 47).expect("list request");
+    let request_packet = Ipv6UdpCoapPacket::new(
+        CORE_LOGICAL_ADDRESS,
+        DEVICE_LOGICAL_ADDRESS,
+        MANAGEMENT_PORT,
+        MANAGEMENT_PORT,
+        &list_request,
+    )
+    .expect("logical list request");
+    let request_frame = SchcLink::new(Arc::clone(&active), LinkRole::Core)
+        .encode(TrafficOrigin::Management, &request_packet)
+        .expect("remapped list request encodes");
+    let decoded_request = SchcLink::new(Arc::clone(&active), LinkRole::Device)
+        .decode(request_frame.frame().bytes())
+        .expect("remapped list request decodes");
+    let response_datagram = service
+        .handle_datagram(decoded_request.packet().coap_datagram())
+        .expect("list response");
+    let response_packet = Ipv6UdpCoapPacket::new(
+        DEVICE_LOGICAL_ADDRESS,
+        CORE_LOGICAL_ADDRESS,
+        MANAGEMENT_PORT,
+        MANAGEMENT_PORT,
+        &response_datagram,
+    )
+    .expect("logical list response");
+    let response_frame = SchcLink::new(active, LinkRole::Device)
+        .encode(TrafficOrigin::Management, &response_packet)
+        .expect("remapped list response encodes");
+    assert_eq!(response_frame.report().rule_id, RuleId::new(18, 8));
 }
 
 #[test]
@@ -1841,9 +1933,10 @@ fn malformed_update_commands_fail_clearly() {
 #[test]
 fn rule_get_fetch_contains_only_selected_instance() {
     let mut service = InspectionService::new(active()).expect("service");
-    let request = rule_get_request(parse_rule_selector("20/8").expect("selector"), 22, &[0xC2])
+    let request = rule_get_request(SID, parse_rule_selector("20/8").expect("selector"), 22)
         .expect("rule-get request");
     let request_packet = Packet::from_bytes(&request).expect("request packet");
+    assert!(request_packet.get_token().is_empty());
     assert_eq!(
         request_packet
             .get_option(CoapOption::ContentFormat)
@@ -1858,9 +1951,9 @@ fn rule_get_fetch_contains_only_selected_instance() {
     )
     .expect("request path");
     assert_eq!(
-        request_path.components,
+        request_path.components(),
         vec![
-            PathComponent::SidDelta(2574),
+            PathComponent::SidDelta(2800),
             PathComponent::SidDelta(23),
             PathComponent::KeyValue(serde_json::json!(20)),
             PathComponent::KeyValue(serde_json::json!(8)),
@@ -1882,14 +1975,13 @@ fn rule_get_fetch_contains_only_selected_instance() {
 fn remote_decoders_display_updated_device_rule_values() {
     let core = active();
     let mut tree = core.tree();
-    tree["ietf-schc:schc"]["rule"][2]["entry"][0]["target-value"][0]["value"] =
+    tree["ietf-schc:schc"]["rule"][2]["entry-universal"][0]["target-value"][0]["value"] =
         serde_json::json!("00000006");
     let prepared = PreparedContext::from_tree(
         SID,
         tree,
         DeviceId::new("management-device-updated").expect("device"),
         DeviceProfile::default(),
-        ProtectionPolicy::from_rule_ids(protected_management_rule_ids()),
     )
     .expect("updated context");
     let device = Arc::new(ActiveContext::new(prepared));
@@ -1898,7 +1990,7 @@ fn remote_decoders_display_updated_device_rule_values() {
 
     let list_packet = Packet::from_bytes(
         &service
-            .handle_datagram(&rule_list_request(23, &[0xC1]).expect("rule-list request"))
+            .handle_datagram(&rule_list_request(SID, 23).expect("rule-list request"))
             .expect("list response"),
     )
     .expect("list packet");
@@ -1907,7 +1999,7 @@ fn remote_decoders_display_updated_device_rule_values() {
 
     let detail_packet = Packet::from_bytes(
         &service
-            .handle_datagram(&rule_get_request(selector, 24, &[0xC2]).expect("rule-get request"))
+            .handle_datagram(&rule_get_request(SID, selector, 24).expect("rule-get request"))
             .expect("detail response"),
     )
     .expect("detail packet");

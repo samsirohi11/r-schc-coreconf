@@ -1,7 +1,10 @@
-[
+{
+  "Context": {"GuardPeriod": {"TicksDuration": 20, "TicksNumbers": 10}},
+  "SoR": [
   {
     "RuleID": 16,
     "RuleIDLength": 8,
+    "RuleNature": "Management",
     "Compression": [
       {"FID":"IPV6.VER","FL":4,"FP":1,"DI":"BI","TV":6,"MO":"equal","CDA":"not-sent"},
       {"FID":"IPV6.TC","FL":8,"FP":1,"DI":"BI","TV":0,"MO":"equal","CDA":"not-sent"},
@@ -23,12 +26,13 @@
       {"FID":"COAP.CODE","FL":8,"FP":1,"DI":"DW","TV":5,"MO":"equal","CDA":"not-sent"},
       {"FID":"COAP.MID","FL":16,"FP":1,"DI":"BI","TV":0,"MO":"MSB","MO.VAL":9,"CDA":"LSB"},
       {"FID":"COAP.option(11)","FL":32,"FP":1,"DI":"BI","TV":"schc","MO":"equal","CDA":"not-sent"},
-      {"FID":"PAYLOAD","FL":"var","FP":1,"DI":"BI","MO":"ignore","CDA":"value-sent","TV":""}
+      {"FID":"PAYLOAD","FL":"fl-remaining","FP":1,"DI":"BI","MO":"ignore","CDA":"value-sent","TV":""}
     ]
   },
   {
     "RuleID": 17,
     "RuleIDLength": 8,
+    "RuleNature": "Management",
     "Compression": [
       {"FID":"IPV6.VER","FL":4,"FP":1,"DI":"BI","TV":6,"MO":"equal","CDA":"not-sent"},
       {"FID":"IPV6.TC","FL":8,"FP":1,"DI":"BI","TV":0,"MO":"equal","CDA":"not-sent"},
@@ -49,12 +53,13 @@
       {"FID":"COAP.TKL","FL":4,"FP":1,"DI":"BI","TV":0,"MO":"equal","CDA":"not-sent"},
       {"FID":"COAP.CODE","FL":8,"FP":1,"DI":"UP","TV":[65,66,68,69,128,129,130,132,133,136,137,140,141,143,160],"MO":"match-mapping","CDA":"mapping-sent"},
       {"FID":"COAP.MID","FL":16,"FP":1,"DI":"BI","TV":0,"MO":"MSB","MO.VAL":9,"CDA":"LSB"},
-      {"FID":"PAYLOAD","FL":"var","FP":1,"DI":"BI","MO":"ignore","CDA":"value-sent","TV":""}
+      {"FID":"PAYLOAD","FL":"fl-remaining","FP":1,"DI":"BI","MO":"ignore","CDA":"value-sent","TV":""}
     ]
   },
   {
     "RuleID": 26,
     "RuleIDLength": 8,
+    "RuleNature": "Management",
     "Compression": [
       {"FID":"IPV6.VER","FL":4,"FP":1,"DI":"BI","TV":6,"MO":"equal","CDA":"not-sent"},
       {"FID":"IPV6.TC","FL":8,"FP":1,"DI":"BI","TV":0,"MO":"equal","CDA":"not-sent"},
@@ -77,12 +82,13 @@
       {"FID":"COAP.MID","FL":16,"FP":1,"DI":"BI","TV":0,"MO":"MSB","MO.VAL":9,"CDA":"LSB"},
       {"FID":"COAP.option(11)","FL":32,"FP":1,"DI":"BI","TV":"schc","MO":"equal","CDA":"not-sent"},
       {"FID":"COAP.option(12)","FL":8,"FP":1,"DI":"BI","TV":141,"MO":"equal","CDA":"not-sent"},
-      {"FID":"PAYLOAD","FL":"var","FP":1,"DI":"BI","MO":"ignore","CDA":"value-sent","TV":""}
+      {"FID":"PAYLOAD","FL":"fl-remaining","FP":1,"DI":"BI","MO":"ignore","CDA":"value-sent","TV":""}
     ]
   },
   {
     "RuleID": 27,
     "RuleIDLength": 8,
+    "RuleNature": "Management",
     "Compression": [
       {"FID":"IPV6.VER","FL":4,"FP":1,"DI":"BI","TV":6,"MO":"equal","CDA":"not-sent"},
       {"FID":"IPV6.TC","FL":8,"FP":1,"DI":"BI","TV":0,"MO":"equal","CDA":"not-sent"},
@@ -105,12 +111,13 @@
       {"FID":"COAP.MID","FL":16,"FP":1,"DI":"BI","TV":0,"MO":"MSB","MO.VAL":9,"CDA":"LSB"},
       {"FID":"COAP.option(11)","FL":32,"FP":1,"DI":"BI","TV":"schc","MO":"equal","CDA":"not-sent"},
       {"FID":"COAP.option(12)","FL":8,"FP":1,"DI":"BI","TV":142,"MO":"equal","CDA":"not-sent"},
-      {"FID":"PAYLOAD","FL":"var","FP":1,"DI":"BI","MO":"ignore","CDA":"value-sent","TV":""}
+      {"FID":"PAYLOAD","FL":"fl-remaining","FP":1,"DI":"BI","MO":"ignore","CDA":"value-sent","TV":""}
     ]
   },
   {
     "RuleID": 28,
     "RuleIDLength": 8,
+    "RuleNature": "Management",
     "Compression": [
       {"FID":"IPV6.VER","FL":4,"FP":1,"DI":"BI","TV":6,"MO":"equal","CDA":"not-sent"},
       {"FID":"IPV6.TC","FL":8,"FP":1,"DI":"BI","TV":0,"MO":"equal","CDA":"not-sent"},
@@ -134,12 +141,13 @@
       {"FID":"COAP.option(1)","FL":64,"FP":1,"DI":"BI","MO":"ignore","CDA":"value-sent"},
       {"FID":"COAP.option(11)","FL":32,"FP":1,"DI":"BI","TV":"schc","MO":"equal","CDA":"not-sent"},
       {"FID":"COAP.option(12)","FL":8,"FP":1,"DI":"BI","TV":142,"MO":"equal","CDA":"not-sent"},
-      {"FID":"PAYLOAD","FL":"var","FP":1,"DI":"BI","MO":"ignore","CDA":"value-sent","TV":""}
+      {"FID":"PAYLOAD","FL":"fl-remaining","FP":1,"DI":"BI","MO":"ignore","CDA":"value-sent","TV":""}
     ]
   },
   {
     "RuleID": 29,
     "RuleIDLength": 8,
+    "RuleNature": "Management",
     "Compression": [
       {"FID":"IPV6.VER","FL":4,"FP":1,"DI":"BI","TV":6,"MO":"equal","CDA":"not-sent"},
       {"FID":"IPV6.TC","FL":8,"FP":1,"DI":"BI","TV":0,"MO":"equal","CDA":"not-sent"},
@@ -162,7 +170,7 @@
       {"FID":"COAP.MID","FL":16,"FP":1,"DI":"BI","TV":0,"MO":"MSB","MO.VAL":9,"CDA":"LSB"},
       {"FID":"COAP.option(11)","FL":32,"FP":1,"DI":"BI","TV":"schc","MO":"equal","CDA":"not-sent"},
       {"FID":"COAP.option(12)","FL":8,"FP":1,"DI":"BI","TV":142,"MO":"equal","CDA":"not-sent"},
-      {"FID":"PAYLOAD","FL":"var","FP":1,"DI":"BI","MO":"ignore","CDA":"value-sent","TV":""}
+      {"FID":"PAYLOAD","FL":"fl-remaining","FP":1,"DI":"BI","MO":"ignore","CDA":"value-sent","TV":""}
     ]
   },
   {
@@ -191,7 +199,7 @@
       {"FID":"COAP.TOKEN","FL":"tkl","FP":1,"DI":"BI","TV":null,"MO":"ignore","CDA":"value-sent"},
       {"FID":"COAP.option(11)","FL":"var","FP":1,"DI":"BI","TV":"c","MO":"equal","CDA":"not-sent"},
       {"FID":"COAP.option(12)","FL":"var","FP":1,"DI":"BI","TV":141,"MO":"equal","CDA":"not-sent"},
-      {"FID":"PAYLOAD","FL":"var","FP":1,"DI":"BI","TV":"","MO":"ignore","CDA":"value-sent"}
+      {"FID":"PAYLOAD","FL":"fl-remaining","FP":1,"DI":"BI","TV":"","MO":"ignore","CDA":"value-sent"}
     ]
   },
   {
@@ -219,7 +227,7 @@
       {"FID":"COAP.MID","FL":16,"FP":1,"DI":"BI","TV":null,"MO":"ignore","CDA":"value-sent"},
       {"FID":"COAP.TOKEN","FL":"tkl","FP":1,"DI":"BI","TV":null,"MO":"ignore","CDA":"value-sent"},
       {"FID":"COAP.option(12)","FL":"var","FP":1,"DI":"BI","TV":142,"MO":"equal","CDA":"not-sent"},
-      {"FID":"PAYLOAD","FL":"var","FP":1,"DI":"BI","TV":"","MO":"ignore","CDA":"value-sent"}
+      {"FID":"PAYLOAD","FL":"fl-remaining","FP":1,"DI":"BI","TV":"","MO":"ignore","CDA":"value-sent"}
     ]
   },
   {
@@ -240,4 +248,5 @@
       {"FID":"UDP.APP_PORT","FL":16,"FP":1,"DI":"BI","TV":5683,"MO":"equal","CDA":"not-sent"}
     ]
   }
-]
+  ]
+}

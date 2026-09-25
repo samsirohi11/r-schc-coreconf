@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 use std::io::Cursor;
 
 use ciborium::value::Value as CborValue;
-use coreconf_model::{CompositeModel, CoreconfModel, YangType};
+use coreconf_model::{CompositeModel, CoreconfModel};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
@@ -47,17 +47,17 @@ fn reject_duplicate_map_keys(value: &CborValue) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn ensure_schc_root(value: &CborValue) -> Result<()> {
+pub(crate) fn ensure_schc_root(value: &CborValue, root_sid: i64) -> Result<()> {
     let CborValue::Map(entries) = value else {
         return Err(ContextError::Cbor("SoR root must be a CBOR map".to_owned()));
     };
     let has_root = entries
         .iter()
-        .any(|(key, _)| matches!(key, CborValue::Integer(integer) if i128::from(*integer) == 2574));
+        .any(|(key, _)| matches!(key, CborValue::Integer(integer) if i128::from(*integer) == i128::from(root_sid)));
     if !has_root {
-        return Err(ContextError::Cbor(
-            "SoR root is missing SCHC SID 2574".to_owned(),
-        ));
+        return Err(ContextError::Cbor(format!(
+            "SoR root is missing SCHC SID {root_sid}"
+        )));
     }
     Ok(())
 }
@@ -80,7 +80,7 @@ fn normalize_value(value: &mut Value, key: Option<&str>) -> Result<()> {
             }
             match key {
                 Some("rule") => values.sort_by(compare_rule_values),
-                Some("entry") => {
+                Some("entry-universal") => {
                     values.sort_by(compare_entry_values);
                     let mut seen = BTreeSet::new();
                     for value in values.iter() {
@@ -143,93 +143,13 @@ fn compare_entry_values(left: &Value, right: &Value) -> std::cmp::Ordering {
 
 pub(crate) fn encode_tree(model: &CoreconfModel, tree: &Value) -> Result<Vec<u8>> {
     let composite: &CompositeModel = model.composite_model();
-    let sid_value = composite
-        .identifier_value_to_sid_value(tree.clone())
+    let cbor_value = coreconf_model::codec::identifier_json_to_cbor_value(composite, tree)
         .map_err(ContextError::Rustconf)?;
-    let cbor_value = coreconf_model::codec::json_to_cbor_value(composite, &sid_value, 0)
-        .map_err(ContextError::Rustconf)?;
-    // rustconf models identityrefs as ordinary integers in JSON/CBOR. The
-    // SCHC SoR uses the identityref tag, so restore that tag after rustconf's
-    // lossless modeled conversion. This also keeps union field-length
-    // identities (for example fl-variable) distinguishable from numeric
-    // lengths to r-schc.
-    let cbor_value = restore_identity_tags(cbor_value, 0, composite)?;
     let mut bytes = Vec::new();
     ciborium::ser::into_writer(&cbor_value, &mut bytes)
         .map_err(|error| ContextError::Cbor(error.to_string()))?;
     let _ = strict_cbor_value(&bytes)?;
     Ok(bytes)
-}
-
-fn restore_identity_tags(
-    value: CborValue,
-    parent_sid: i64,
-    model: &CompositeModel,
-) -> Result<CborValue> {
-    match value {
-        CborValue::Map(entries) => {
-            let mut restored = Vec::with_capacity(entries.len());
-            for (key, child) in entries {
-                let sid_delta = match &key {
-                    CborValue::Integer(integer) => i64::try_from(i128::from(*integer)).ok(),
-                    _ => None,
-                };
-                let absolute_sid = sid_delta.map_or(parent_sid, |delta| parent_sid + delta);
-                let child = restore_identity_tags(child, absolute_sid, model)?;
-                let child = if let Some(identifier) = model.get_identifier(absolute_sid) {
-                    if let Some(yang_type) = model.get_type(identifier) {
-                        if is_identity_like(yang_type) && is_identity_sid(&child, model) {
-                            CborValue::Tag(45, Box::new(child))
-                        } else {
-                            child
-                        }
-                    } else {
-                        child
-                    }
-                } else {
-                    child
-                };
-                restored.push((key, child));
-            }
-            Ok(CborValue::Map(restored))
-        }
-        CborValue::Array(values) => {
-            let values = values
-                .into_iter()
-                .map(|value| restore_identity_tags(value, parent_sid, model))
-                .collect::<Result<Vec<_>>>()?;
-            Ok(CborValue::Array(values))
-        }
-        CborValue::Tag(tag, value) => Ok(CborValue::Tag(
-            tag,
-            Box::new(restore_identity_tags(*value, parent_sid, model)?),
-        )),
-        other => Ok(other),
-    }
-}
-
-fn is_identity_like(yang_type: &YangType) -> bool {
-    match yang_type {
-        // r-schc's SoR representation keeps ordinary identityrefs as integers.
-        // Only a union needs the explicit tag to distinguish an identity SID
-        // from a numeric union member such as field-length=4.
-        YangType::Union(types) => types
-            .iter()
-            .any(|member| matches!(member, YangType::Identityref) || is_identity_like(member)),
-        _ => false,
-    }
-}
-
-fn is_identity_sid(value: &CborValue, model: &CompositeModel) -> bool {
-    let CborValue::Integer(integer) = value else {
-        return false;
-    };
-    let Ok(sid) = i64::try_from(i128::from(*integer)) else {
-        return false;
-    };
-    model
-        .get_identifier(sid)
-        .is_some_and(|identifier| !identifier.contains('/'))
 }
 
 pub(crate) fn digest_context(tree: &Value, sor: &[u8]) -> Result<[u8; 32]> {

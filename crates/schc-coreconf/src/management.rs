@@ -4,10 +4,14 @@
 //! and one strict root iPATCH shape for detached, validated target updates.
 //! Context checks use a compact marker and eight-byte tag because the fixed
 //! management rules do not describe an `ETag` option.
+//! CoAP correlation supports empty or generated opaque tokens at this boundary.
+//! The current SCHC profile selects [`TokenPolicy::Empty`] because its
+//! management rules do not carry arbitrary token bytes.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::io::Cursor;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use ciborium::value::Value as CborValue;
@@ -32,35 +36,82 @@ use thiserror::Error;
 
 use crate::{
     ActiveContext, ContextSnapshot, ContextTag, DynamicRuleIdNamespace, Ipv6UdpCoapPacket,
-    Ipv6UdpPacket, LinkError, LinkReport, PreparedContext, RawUdpLink, RuleIdTreeError, SchcLink,
+    Ipv6UdpPacket, LinkError, LinkReport, PreparedContext, RuleIdTreeError, SchcLink,
     TrafficOrigin, TrafficRoute, CORE_LOGICAL_ADDRESS, DEVICE_LOGICAL_ADDRESS, MANAGEMENT_PORT,
+};
+
+mod duplicate;
+pub(crate) use duplicate::duplicate_rpc_cost;
+pub use duplicate::is_duplicate_rule_datagram;
+use duplicate::{
+    decode_duplicate_operation, duplicate_inner_payload, encode_duplicate_rpc_payload,
+    expected_duplicate_tree, find_tree_rule, flow_overrides, has_application_payload,
+    has_complete_flow_fields, invalid_duplicate, is_duplicate_rule_coap_shape,
+    DecodedDuplicateOperation, FlowChangeCandidate,
 };
 
 /// Marker used as the first byte of the compact context-check FETCH payload.
 pub const CONTEXT_CHECK_MARKER: u8 = 0xC6;
 const CONTEXT_CHECK_EQUAL: u8 = 0;
 const CONTEXT_CHECK_MISMATCH: u8 = 1;
-const SCHC_ROOT_SID: i64 = 2574;
-const RULE_LIST_SID: i64 = 2597;
-const RULE_ID_LENGTH_SID: i64 = 2598;
-const RULE_ID_VALUE_SID: i64 = 2599;
-const RULE_ENTRY_LIST_SID: i64 = 2620;
-const RULE_ENTRY_INDEX_SID: i64 = 2621;
-const FIELD_LENGTH_SID: i64 = 2625;
-const TARGET_VALUE_LIST_SID: i64 = 2629;
-const TARGET_VALUE_INDEX_SID: i64 = 2630;
-const TARGET_VALUE_VALUE_SID: i64 = 2631;
-const MATCHING_OPERATOR_SID: i64 = 2632;
-const CDA_SID: i64 = 2636;
-const DUPLICATE_RULE_SID: i64 = 2680;
-const DUPLICATE_INPUT_SID: i64 = 2681;
-const DUPLICATE_FROM_SID: i64 = 2682;
-const DUPLICATE_FROM_LENGTH_SID: i64 = 2683;
-const DUPLICATE_FROM_VALUE_SID: i64 = 2684;
-const DUPLICATE_IPATCH_SID: i64 = 2685;
-const DUPLICATE_TO_SID: i64 = 2686;
-const DUPLICATE_TO_LENGTH_SID: i64 = 2687;
-const DUPLICATE_TO_VALUE_SID: i64 = 2688;
+
+#[derive(Clone, Copy)]
+struct ModelSids {
+    root: i64,
+    rule: i64,
+    rule_id_length: i64,
+    rule_id_value: i64,
+    entry: i64,
+    entry_index: i64,
+    field_length: i64,
+    target: i64,
+    target_index: i64,
+    target_value: i64,
+    duplicate_rule: i64,
+    duplicate_input: i64,
+    duplicate_from: i64,
+    duplicate_from_length: i64,
+    duplicate_from_value: i64,
+    duplicate_ipatch: i64,
+    duplicate_to: i64,
+    duplicate_to_length: i64,
+    duplicate_to_value: i64,
+    matching_operator: i64,
+    cda: i64,
+}
+
+impl ModelSids {
+    fn resolve(model: &CompositeModel) -> Result<Self, InspectionError> {
+        let sid = |path: &str| {
+            model
+                .get_sid(path)
+                .ok_or_else(|| invalid_target(format!("SID model is missing identifier {path}")))
+        };
+        Ok(Self {
+            root: sid("/ietf-schc:schc")?,
+            rule: sid("/ietf-schc:schc/rule")?,
+            rule_id_length: sid("/ietf-schc:schc/rule/rule-id-length")?,
+            rule_id_value: sid("/ietf-schc:schc/rule/rule-id-value")?,
+            entry: sid("/ietf-schc:schc/rule/entry-universal")?,
+            entry_index: sid("/ietf-schc:schc/rule/entry-universal/entry-index")?,
+            field_length: sid("/ietf-schc:schc/rule/entry-universal/field-length")?,
+            target: sid("/ietf-schc:schc/rule/entry-universal/target-value")?,
+            target_index: sid("/ietf-schc:schc/rule/entry-universal/target-value/index")?,
+            target_value: sid("/ietf-schc:schc/rule/entry-universal/target-value/value")?,
+            duplicate_rule: sid("/ietf-schc:duplicate-rule")?,
+            duplicate_input: sid("/ietf-schc:duplicate-rule/input")?,
+            duplicate_from: sid("/ietf-schc:duplicate-rule/input/from")?,
+            duplicate_from_length: sid("/ietf-schc:duplicate-rule/input/from/rule-id-length")?,
+            duplicate_from_value: sid("/ietf-schc:duplicate-rule/input/from/rule-id-value")?,
+            duplicate_ipatch: sid("/ietf-schc:duplicate-rule/input/ipatch-sequence")?,
+            duplicate_to: sid("/ietf-schc:duplicate-rule/input/to")?,
+            duplicate_to_length: sid("/ietf-schc:duplicate-rule/input/to/rule-id-length")?,
+            duplicate_to_value: sid("/ietf-schc:duplicate-rule/input/to/rule-id-value")?,
+            matching_operator: sid("/ietf-schc:schc/rule/entry-universal/matching-operator")?,
+            cda: sid("/ietf-schc:schc/rule/entry-universal/comp-decomp-action")?,
+        })
+    }
+}
 
 /// Errors returned by context inspection and its protected exchange.
 #[derive(Debug, Error)]
@@ -120,6 +171,9 @@ pub enum InspectionError {
     /// A CoAP request or response could not be represented.
     #[error("management CoAP error: {0}")]
     Coap(String),
+    /// A CoAP token exceeded the protocol's eight-byte limit.
+    #[error("invalid CoAP token: {0}")]
+    InvalidToken(String),
     /// A protected link operation failed.
     #[error("management SCHC link error: {0}")]
     Link(#[from] LinkError),
@@ -139,6 +193,141 @@ pub enum InspectionError {
     /// target-value operation.
     #[error("flow cannot be represented by duplicate-rule management: {0}")]
     UnrepresentableFlow(String),
+}
+
+const MAX_COAP_TOKEN_LEN: usize = 8;
+const COAP_CONFIRMABLE: u8 = 0;
+const COAP_NON_CONFIRMABLE: u8 = 1;
+const COAP_ACKNOWLEDGEMENT: u8 = 2;
+
+/// The validated opaque token carried by a CoAP exchange.
+#[derive(Debug, Clone, Eq, Hash, PartialEq)]
+pub struct CoapToken(Vec<u8>);
+
+impl CoapToken {
+    /// Creates a token after enforcing CoAP's zero-to-eight-byte limit.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InspectionError::InvalidToken`] when the token is longer
+    /// than eight bytes.
+    pub fn new(bytes: impl AsRef<[u8]>) -> Result<Self, InspectionError> {
+        let bytes = bytes.as_ref();
+        if bytes.len() > MAX_COAP_TOKEN_LEN {
+            return Err(InspectionError::InvalidToken(format!(
+                "length must be at most {MAX_COAP_TOKEN_LEN} bytes, got {}",
+                bytes.len()
+            )));
+        }
+        Ok(Self(bytes.to_vec()))
+    }
+
+    /// Returns the empty CoAP token.
+    #[must_use]
+    pub const fn empty() -> Self {
+        Self(Vec::new())
+    }
+
+    /// Returns the token bytes.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+
+    /// Returns whether this token is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+/// Identifies one CoAP exchange by message ID and token.
+#[derive(Debug, Clone, Eq, Hash, PartialEq)]
+pub struct ExchangeId {
+    message_id: u16,
+    token: CoapToken,
+}
+
+impl ExchangeId {
+    /// Creates an exchange identifier after validating its token.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InspectionError::InvalidToken`] when the token is longer
+    /// than eight bytes.
+    pub fn new(message_id: u16, token: impl AsRef<[u8]>) -> Result<Self, InspectionError> {
+        Ok(Self {
+            message_id,
+            token: CoapToken::new(token)?,
+        })
+    }
+
+    /// Builds an exchange identifier from a parsed CoAP message.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InspectionError::InvalidToken`] when the message token is
+    /// outside the validated CoAP range.
+    pub fn from_message(message: &crate::CoapMessage) -> Result<Self, InspectionError> {
+        Self::new(message.message_id(), message.token())
+    }
+
+    /// Returns the CoAP message ID.
+    #[must_use]
+    pub const fn message_id(&self) -> u16 {
+        self.message_id
+    }
+
+    /// Returns the validated CoAP token.
+    #[must_use]
+    pub const fn token(&self) -> &CoapToken {
+        &self.token
+    }
+
+    /// Returns whether a response's exchange identity is valid for a CoAP
+    /// message type. Confirmable and non-confirmable separate responses may
+    /// use a new MID; a piggybacked acknowledgement must keep the request
+    /// MID. All supported response forms must retain the token.
+    #[must_use]
+    fn matches_response(&self, response: &Self, message_type: u8) -> bool {
+        self.token == response.token
+            && match message_type {
+                COAP_CONFIRMABLE | COAP_NON_CONFIRMABLE => true,
+                COAP_ACKNOWLEDGEMENT => self.message_id == response.message_id,
+                _ => false,
+            }
+    }
+}
+
+static NEXT_GENERATED_TOKEN: AtomicU64 = AtomicU64::new(1);
+
+/// Selects the token policy used when a management request crosses the CoAP
+/// boundary.
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub enum TokenPolicy {
+    /// Use the empty token required by the current compact SCHC profile.
+    #[default]
+    Empty,
+    /// Generate a process-local eight-byte opaque token.
+    ///
+    /// This mode is a CoAP-boundary capability. The current management SCHC
+    /// rules still reject arbitrary nonempty tokens, so callers must select
+    /// it only with a profile that transports token bytes.
+    Generated,
+}
+
+impl TokenPolicy {
+    /// Produces the token selected by this policy.
+    #[must_use]
+    fn token(self) -> CoapToken {
+        match self {
+            Self::Empty => CoapToken::empty(),
+            Self::Generated => {
+                let sequence = NEXT_GENERATED_TOKEN.fetch_add(1, Ordering::Relaxed);
+                CoapToken(sequence.to_be_bytes().to_vec())
+            }
+        }
+    }
 }
 
 /// A strict numeric `RuleID` selector containing both value and bit length.
@@ -821,16 +1010,16 @@ impl ResolvedRuleUpdate {
         model: &CoreconfModel,
     ) -> Result<Self, InspectionError> {
         let composite = model.composite_model();
-        validate_update_model_shape(composite)?;
-        let root_key = tree_key_for_sid(composite, SCHC_ROOT_SID)?;
-        let rule_key = tree_key_for_sid(composite, RULE_LIST_SID)?;
-        let entry_key = tree_key_for_sid(composite, RULE_ENTRY_LIST_SID)?;
-        let target_value_key = tree_key_for_sid(composite, TARGET_VALUE_LIST_SID)?;
-        let rule_value_key = tree_key_for_sid(composite, RULE_ID_VALUE_SID)?;
-        let rule_length_key = tree_key_for_sid(composite, RULE_ID_LENGTH_SID)?;
-        let entry_index_key = tree_key_for_sid(composite, RULE_ENTRY_INDEX_SID)?;
-        let target_index_key = tree_key_for_sid(composite, TARGET_VALUE_INDEX_SID)?;
-        let target_value_leaf_key = tree_key_for_sid(composite, TARGET_VALUE_VALUE_SID)?;
+        let sids = validate_update_model_shape(composite)?;
+        let root_key = tree_key_for_sid(composite, sids.root)?;
+        let rule_key = tree_key_for_sid(composite, sids.rule)?;
+        let entry_key = tree_key_for_sid(composite, sids.entry)?;
+        let target_value_key = tree_key_for_sid(composite, sids.target)?;
+        let rule_value_key = tree_key_for_sid(composite, sids.rule_id_value)?;
+        let rule_length_key = tree_key_for_sid(composite, sids.rule_id_length)?;
+        let entry_index_key = tree_key_for_sid(composite, sids.entry_index)?;
+        let target_index_key = tree_key_for_sid(composite, sids.target_index)?;
+        let target_value_leaf_key = tree_key_for_sid(composite, sids.target_value)?;
 
         let root = tree
             .get(&root_key)
@@ -916,18 +1105,18 @@ impl ResolvedRuleUpdate {
             .identifier_value_to_sid_value_at_path(
                 current_identifier_value.clone(),
                 composite
-                    .get_identifier(TARGET_VALUE_VALUE_SID)
+                    .get_identifier(sids.target_value)
                     .ok_or_else(|| invalid_target("target-value/value SID is unavailable"))?,
             )
             .map_err(|error| invalid_target(format!("current target value is invalid: {error}")))?;
         let current_bytes = binary_bytes(&current_wire_value)?;
         let field_length = entry
-            .get(&tree_key_for_sid(composite, FIELD_LENGTH_SID)?)
+            .get(&tree_key_for_sid(composite, sids.field_length)?)
             .ok_or_else(|| invalid_target("selected entry has no field-length"))?;
         let replacement =
             numeric_target_value(&request.target_value, &current_bytes, field_length)?;
         let value_path = composite
-            .get_identifier(TARGET_VALUE_VALUE_SID)
+            .get_identifier(sids.target_value)
             .ok_or_else(|| invalid_target("target-value/value SID is unavailable"))?;
         composite
             .sid_value_to_identifier_value_at_path(replacement.clone(), value_path)
@@ -935,7 +1124,7 @@ impl ResolvedRuleUpdate {
                 invalid_target(format!("replacement target value is invalid: {error}"))
             })?;
 
-        let path = target_value_path(request.rule, entry_index, target_value_index)?;
+        let path = target_value_path(sids, request.rule, entry_index, target_value_index)?;
         Ok(Self {
             request: request.clone(),
             entry_index,
@@ -1005,7 +1194,6 @@ impl ResolvedRuleUpdate {
     pub fn ipatch_datagram(
         &self,
         message_id: u16,
-        token: &[u8],
         base_tag: Option<ContextTag>,
     ) -> Result<Vec<u8>, InspectionError> {
         match (self.request.if_match, base_tag) {
@@ -1021,9 +1209,6 @@ impl ResolvedRuleUpdate {
         packet.header.message_id = message_id;
         packet.header.code = MessageClass::Request(RequestType::IPatch);
         packet.header.set_type(MessageType::Confirmable);
-        // Protected management uses a zero-length token; the endpoint and
-        // bounded CoAP MID provide the correlation key.
-        let _ = token;
         packet.set_token(Vec::new());
         packet.add_option(CoapOption::UriPath, b"schc".to_vec());
         packet.add_option(CoapOption::ContentFormat, vec![142]);
@@ -1102,12 +1287,12 @@ impl RuleDetail {
 pub struct ContextStatus {
     /// Publication generation.
     pub generation: u64,
-    /// Full local digest.
-    pub digest: [u8; 32],
     /// Compact context tag.
     pub tag: ContextTag,
     /// Number of loaded rules.
     pub rule_count: usize,
+    /// Context-level management guard period, when configured.
+    pub guard_period: Option<crate::GuardPeriod>,
 }
 
 impl ContextStatus {
@@ -1116,9 +1301,9 @@ impl ContextStatus {
     pub fn from_snapshot(snapshot: &ContextSnapshot) -> Self {
         Self {
             generation: snapshot.generation(),
-            digest: snapshot.digest(),
             tag: snapshot.tag(),
             rule_count: snapshot.rules().len(),
+            guard_period: snapshot.guard_period(),
         }
     }
 }
@@ -1233,7 +1418,7 @@ pub fn management_bit_breakdown(
                 };
             }
             FieldRef::Payload if field.action == Cda::ValueSent => {
-                payload_length_bits = variable_length_prefix_bits(message.payload().len());
+                payload_length_bits = payload_prefix_bits(&field.length, message.payload().len());
             }
             FieldRef::CoapOption { number } if field.action == Cda::ValueSent => {
                 option_residue_bits += message
@@ -1295,6 +1480,19 @@ fn variable_length_prefix_bits(value: usize) -> usize {
         12
     } else {
         28
+    }
+}
+
+fn payload_prefix_bits(length: &FieldLength, payload_len: usize) -> usize {
+    match length {
+        FieldLength::VariableBytes | FieldLength::VariableBits => {
+            variable_length_prefix_bits(payload_len)
+        }
+        FieldLength::FixedBits(_)
+        | FieldLength::Remaining
+        | FieldLength::TokenLength
+        | FieldLength::FromPreviousField { .. }
+        | FieldLength::FunctionSid(_) => 0,
     }
 }
 
@@ -1475,7 +1673,7 @@ impl InspectionService {
         message_id: u16,
     ) -> Result<Vec<u8>, InspectionError> {
         let payload = self.duplicate_rule_payload(request)?;
-        let mut packet = base_request(RequestType::Post, message_id, &[]);
+        let mut packet = base_request(RequestType::Post, message_id);
         packet.header.set_type(MessageType::NonConfirmable);
         packet.add_option(CoapOption::ContentFormat, vec![142]);
         packet.payload = payload;
@@ -1762,66 +1960,64 @@ impl InspectionService {
     /// Returns an error when the CoAP datagram is malformed or the response
     /// cannot be serialized.
     pub fn handle_datagram(&mut self, datagram: &[u8]) -> Result<Vec<u8>, InspectionError> {
-        let peek = Packet::from_bytes(datagram)
+        let packet = Packet::from_bytes(datagram)
             .map_err(|error| InspectionError::Coap(error.to_string()))?;
-        if is_duplicate_rule_coap_shape(&peek) {
+        if is_duplicate_rule_coap_shape(&packet) {
             return Err(InspectionError::UnexpectedResponse(
                 "duplicate-rule NON POST must use handle_datagram_no_response".into(),
             ));
         }
-        let request = Packet::from_bytes(datagram)
-            .map_err(|error| InspectionError::Coap(error.to_string()))?;
         if matches!(
-            request.header.code,
+            packet.header.code,
             MessageClass::Request(RequestType::IPatch)
         ) {
-            if request.payload.is_empty()
-                && request.get_option(CoapOption::ContentFormat).is_none()
-                && request.get_option(CoapOption::IfMatch).is_none()
+            if packet.payload.is_empty()
+                && packet.get_option(CoapOption::ContentFormat).is_none()
+                && packet.get_option(CoapOption::IfMatch).is_none()
             {
                 let response = coreconf_runtime::coap_types::Response::method_not_allowed(
                     coreconf_runtime::coap_types::Method::Fetch,
                 );
-                return packet_without_content_format(&request, response);
+                return packet_without_content_format(&packet, response);
             }
-            return self.handle_target_ipatch(&request);
+            return self.handle_target_ipatch(&packet);
         }
-        if is_mutation(&request) {
+        if is_mutation(&packet) {
             let response = coreconf_runtime::coap_types::Response::method_not_allowed(
                 coreconf_runtime::coap_types::Method::Fetch,
             );
-            return packet_without_content_format(&request, response);
+            return packet_without_content_format(&packet, response);
         }
         if !matches!(
-            request.header.code,
+            packet.header.code,
             MessageClass::Request(RequestType::Get | RequestType::Fetch)
         ) {
             let response = coreconf_runtime::coap_types::Response::method_not_allowed(
                 coreconf_runtime::coap_types::Method::Fetch,
             );
-            return packet_without_content_format(&request, response);
+            return packet_without_content_format(&packet, response);
         }
-        if request
+        if packet
             .get_option(CoapOption::UriPath)
             .is_none_or(|segments| segments.iter().any(|segment| segment.as_slice() != b"schc"))
         {
             let response = coreconf_runtime::coap_types::Response::not_found("/schc");
-            return packet_without_content_format(&request, response);
+            return packet_without_content_format(&packet, response);
         }
 
         if matches!(
-            request.header.code,
+            packet.header.code,
             MessageClass::Request(RequestType::Fetch)
-        ) && request.payload.first() == Some(&CONTEXT_CHECK_MARKER)
+        ) && packet.payload.first() == Some(&CONTEXT_CHECK_MARKER)
         {
-            return self.handle_context_check(&request);
+            return self.handle_context_check(&packet);
         }
 
-        let request = packet_to_request(&request, "schc").map_err(|response| {
+        let coreconf_request = packet_to_request(&packet, "schc").map_err(|response| {
             InspectionError::Coap(format!("CORECONF request rejected with {}", response.code))
         })?;
-        let response = self.handler.handle(&request);
-        packet_without_content_format(&datagram_packet(&request, datagram)?, response)
+        let response = self.handler.handle(&coreconf_request);
+        packet_without_content_format(&packet, response)
     }
 
     fn handle_target_ipatch(&self, packet: &Packet) -> Result<Vec<u8>, InspectionError> {
@@ -1873,7 +2069,7 @@ impl InspectionService {
                 "targeted iPATCH payload must contain one replacement",
             ));
         }
-        validate_update_model_shape(self.model.composite_model())
+        let sids = validate_update_model_shape(self.model.composite_model())
             .map_err(|error| PatchFailure::internal(error.to_string()))?;
         let instances = decode_instances_with_model(self.model.composite_model(), &request.payload)
             .map_err(|error| PatchFailure::bad(format!("invalid iPATCH payload: {error}")))?;
@@ -1883,7 +2079,7 @@ impl InspectionService {
                 instances.len()
             )));
         }
-        let target = target_patch_from_instance(&instances[0])?;
+        let target = target_patch_from_instance(&instances[0], sids)?;
 
         let _writer = self
             .active
@@ -1918,7 +2114,7 @@ impl InspectionService {
             })?;
         let keys = target
             .path
-            .components
+            .components()
             .iter()
             .filter_map(|component| match component {
                 PathComponent::KeyValue(value) => Some(value.clone()),
@@ -1944,13 +2140,13 @@ impl InspectionService {
         let current_bytes = binary_bytes(&current_wire)
             .map_err(|error| PatchFailure::conflict(error.to_string()))?;
         let entry_xpath = candidate
-            .create_xpath(RULE_ENTRY_LIST_SID, &keys[..3])
+            .create_xpath(sids.entry, &keys[..3])
             .map_err(|error| PatchFailure::conflict(error.to_string()))?;
         let entry_value = candidate
             .get_path(&entry_xpath)
             .map_err(|error| PatchFailure::conflict(error.to_string()))?
             .ok_or_else(|| PatchFailure::conflict("target entry does not exist"))?;
-        let field_length_key = tree_key_for_sid(composite, FIELD_LENGTH_SID)
+        let field_length_key = tree_key_for_sid(composite, sids.field_length)
             .map_err(|error| PatchFailure::conflict(error.to_string()))?;
         let field_length = entry_value
             .get(&field_length_key)
@@ -2028,1105 +2224,6 @@ impl InspectionService {
     }
 }
 
-#[derive(Debug, Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
-enum DuplicateLeaf {
-    Target,
-    MatchingOperator,
-    Cda,
-}
-
-#[derive(Debug)]
-struct FlowChangeCandidate {
-    request: RuleDuplicateRequest,
-    management_wire_bytes: usize,
-}
-
-fn has_application_payload(rule: &Rule) -> bool {
-    rule.fields().iter().any(|field| {
-        matches!(
-            field.field,
-            FieldRef::Payload | FieldRef::Udp("fid-udp-payload")
-        )
-    })
-}
-
-/// Returns whether a rule models the complete seven-field flow identity used
-/// by the generic IPv6/UDP workload.  Header-only fallback rules can still
-/// encode a packet, but they are not suitable parents for a concrete flow
-/// duplicate and must not make an otherwise new flow look already installed.
-fn has_complete_flow_fields(rule: &Rule) -> bool {
-    let mut seen = [false; 7];
-    for field in rule.fields() {
-        if field.matching == MatchingOperator::Ignore
-            || !matches!(field.target, TargetValue::Bytes(_))
-        {
-            continue;
-        }
-        let index = match field.field {
-            FieldRef::Ipv6("fid-ipv6-flowlabel") => 0,
-            FieldRef::Ipv6("fid-ipv6-devprefix") => 1,
-            FieldRef::Ipv6("fid-ipv6-deviid") => 2,
-            FieldRef::Ipv6("fid-ipv6-appprefix") => 3,
-            FieldRef::Ipv6("fid-ipv6-appiid") => 4,
-            FieldRef::Udp("fid-udp-dev-port") => 5,
-            FieldRef::Udp("fid-udp-app-port") => 6,
-            _ => continue,
-        };
-        seen[index] = true;
-    }
-    seen.into_iter().all(|present| present)
-}
-
-fn flow_overrides(
-    parent: &Rule,
-    packet: &Ipv6UdpPacket,
-    direction: FlowDirection,
-) -> Result<Option<Vec<RuleDuplicateOverride>>, InspectionError> {
-    let schc_direction = direction.schc_direction();
-    let mut overrides = Vec::new();
-    for field in parent.fields() {
-        if !field.direction.accepts(schc_direction) || field.matching == MatchingOperator::Ignore {
-            continue;
-        }
-        let Some((actual, bits)) = logical_field_value(packet, direction, &field.field) else {
-            if matches!(field.target, TargetValue::None) {
-                continue;
-            }
-            return Ok(None);
-        };
-        let target_matches = match &field.target {
-            TargetValue::None => false,
-            TargetValue::Bytes(target) => target_matches(&actual, target, bits, field.matching),
-            TargetValue::Mapping(targets) => targets
-                .iter()
-                .any(|target| target_matches(&actual, target, bits, field.matching)),
-        };
-        if target_matches {
-            continue;
-        }
-        if !matches!(field.target, TargetValue::Bytes(_))
-            || !matches!(field.length, FieldLength::FixedBits(_))
-            || bits > 64
-        {
-            return Ok(None);
-        }
-        let value = bytes_to_u64(&actual).ok_or_else(|| {
-            InspectionError::UnrepresentableFlow(format!(
-                "entry {} exceeds 64 bits",
-                field.entry_index
-            ))
-        })?;
-        overrides.push(RuleDuplicateOverride {
-            entry_index: field.entry_index,
-            target_value: Some(value.to_string()),
-            matching_operator: None,
-            cda: None,
-        });
-    }
-    overrides.sort_by_key(|override_| override_.entry_index);
-    Ok(Some(overrides))
-}
-
-fn logical_field_value(
-    packet: &Ipv6UdpPacket,
-    direction: FlowDirection,
-    field: &FieldRef,
-) -> Option<(Vec<u8>, usize)> {
-    let (device, application, device_port, application_port) = match direction {
-        FlowDirection::Uplink => (
-            packet.source(),
-            packet.destination(),
-            packet.source_port(),
-            packet.destination_port(),
-        ),
-        FlowDirection::Downlink => (
-            packet.destination(),
-            packet.source(),
-            packet.destination_port(),
-            packet.source_port(),
-        ),
-    };
-    let integer = |value: u64, bits: usize| Some((integer_bytes(value, bits), bits));
-    match field {
-        FieldRef::Ipv6(name) => match *name {
-            "fid-ipv6-version" => integer(6, 4),
-            "fid-ipv6-trafficclass" => integer(u64::from(packet.traffic_class()), 8),
-            "fid-ipv6-flowlabel" => integer(u64::from(packet.flow_label()), 20),
-            "fid-ipv6-payload-length" => integer(u64::from(packet.ipv6_payload_length()), 16),
-            "fid-ipv6-nextheader" => integer(u64::from(packet.next_header()), 8),
-            "fid-ipv6-hoplimit" => integer(u64::from(packet.hop_limit()), 8),
-            "fid-ipv6-devprefix" => Some((device.octets()[..8].to_vec(), 64)),
-            "fid-ipv6-deviid" => Some((device.octets()[8..].to_vec(), 64)),
-            "fid-ipv6-appprefix" => Some((application.octets()[..8].to_vec(), 64)),
-            "fid-ipv6-appiid" => Some((application.octets()[8..].to_vec(), 64)),
-            _ => None,
-        },
-        FieldRef::Udp(name) => match *name {
-            "fid-udp-dev-port" => integer(u64::from(device_port), 16),
-            "fid-udp-app-port" => integer(u64::from(application_port), 16),
-            "fid-udp-length" => integer(u64::from(packet.udp_length()), 16),
-            "fid-udp-checksum" => integer(u64::from(packet.udp_checksum()), 16),
-            _ => None,
-        },
-        _ => None,
-    }
-}
-
-fn integer_bytes(value: u64, bits: usize) -> Vec<u8> {
-    let length = bits.div_ceil(8);
-    let bytes = value.to_be_bytes();
-    bytes[bytes.len() - length..].to_vec()
-}
-
-fn bytes_to_u64(bytes: &[u8]) -> Option<u64> {
-    if bytes.len() > 8 {
-        return None;
-    }
-    let mut value = 0_u64;
-    for byte in bytes {
-        value = value.checked_shl(8)? | u64::from(*byte);
-    }
-    Some(value)
-}
-
-fn target_matches(actual: &[u8], target: &[u8], bits: usize, matching: MatchingOperator) -> bool {
-    if matching == MatchingOperator::Equal {
-        return bytes_to_u64(actual) == bytes_to_u64(target);
-    }
-    let compare_bits = match matching {
-        MatchingOperator::Msb(prefix) => prefix.min(bits),
-        _ => bits,
-    };
-    (0..compare_bits).all(|index| bit_at(actual, index) == bit_at(target, index))
-}
-
-fn bit_at(bytes: &[u8], index: usize) -> bool {
-    bytes
-        .get(index / 8)
-        .is_some_and(|byte| byte & (0x80 >> (index % 8)) != 0)
-}
-
-#[derive(Debug)]
-struct DecodedDuplicateOperation {
-    request: RuleDuplicateRequest,
-    instances: Vec<Instance>,
-    inner_payload: Vec<u8>,
-}
-
-fn invalid_duplicate(message: impl Into<String>) -> InspectionError {
-    InspectionError::InvalidUpdate(format!("duplicate-rule: {}", message.into()))
-}
-
-/// Returns whether a decoded packet is the dedicated duplicate-rule request.
-///
-/// The exact protected `RuleID` is part of classification so a packet with a
-/// duplicate-like CoAP shape under another protected `RuleID` cannot dispatch to
-/// the duplicate operation.
-#[must_use]
-pub fn is_duplicate_rule_request(rule_id: RuleId, packet: &Packet) -> bool {
-    rule_id == RuleId::new(29, 8) && is_duplicate_rule_coap_shape(packet)
-}
-
-fn is_duplicate_rule_coap_shape(packet: &Packet) -> bool {
-    packet.header.code == MessageClass::Request(RequestType::Post)
-        && packet.header.get_type() == MessageType::NonConfirmable
-        && packet.get_token().is_empty()
-        && packet.get_option(CoapOption::UriPath).is_some_and(|paths| {
-            paths.len() == 1 && paths.front().is_some_and(|path| path.as_slice() == b"schc")
-        })
-        && packet
-            .get_option(CoapOption::ContentFormat)
-            .is_some_and(|formats| {
-                formats.len() == 1
-                    && formats
-                        .front()
-                        .is_some_and(|format| format.as_slice() == [142])
-            })
-}
-
-/// Returns whether a raw CORECONF datagram is a duplicate-rule request.
-///
-/// Unlike the legacy [`is_duplicate_rule_request`] helper, this shape check
-/// does not assume a particular configured `RuleID`; the protected rule is
-/// selected by the active context profile.
-pub(crate) fn is_duplicate_rule_datagram(datagram: &[u8]) -> bool {
-    Packet::from_bytes(datagram)
-        .ok()
-        .is_some_and(|packet| is_duplicate_rule_coap_shape(&packet))
-}
-
-fn validate_duplicate_model_shape(model: &CompositeModel) -> Result<(), InspectionError> {
-    for sid in [
-        DUPLICATE_RULE_SID,
-        DUPLICATE_INPUT_SID,
-        DUPLICATE_FROM_SID,
-        DUPLICATE_FROM_LENGTH_SID,
-        DUPLICATE_FROM_VALUE_SID,
-        DUPLICATE_IPATCH_SID,
-        DUPLICATE_TO_SID,
-        DUPLICATE_TO_LENGTH_SID,
-        DUPLICATE_TO_VALUE_SID,
-        MATCHING_OPERATOR_SID,
-        CDA_SID,
-    ] {
-        if model.get_identifier(sid).is_none() {
-            return Err(invalid_duplicate(format!(
-                "SID model is missing identifier {sid}"
-            )));
-        }
-    }
-    Ok(())
-}
-
-fn rule_key(model: &CompositeModel, sid: i64) -> Result<String, InspectionError> {
-    model
-        .get_identifier(sid)
-        .and_then(|identifier| identifier.rsplit('/').next())
-        .filter(|key| !key.is_empty())
-        .map(str::to_owned)
-        .ok_or_else(|| invalid_duplicate(format!("SID model is missing rule key {sid}")))
-}
-
-fn find_tree_rule(
-    tree: &Value,
-    model: &CompositeModel,
-    selector: RuleSelector,
-) -> Result<Option<Value>, InspectionError> {
-    let root_key = rule_key(model, SCHC_ROOT_SID)?;
-    let list_key = rule_key(model, RULE_LIST_SID)?;
-    let value_key = rule_key(model, RULE_ID_VALUE_SID)?;
-    let length_key = rule_key(model, RULE_ID_LENGTH_SID)?;
-    Ok(tree
-        .get(&root_key)
-        .and_then(Value::as_object)
-        .and_then(|root| root.get(&list_key))
-        .and_then(Value::as_array)
-        .and_then(|rules| {
-            rules.iter().find(|rule| {
-                rule.get(&value_key).and_then(Value::as_u64) == Some(selector.value)
-                    && rule.get(&length_key).and_then(Value::as_u64) == Some(selector.bits as u64)
-            })
-        })
-        .cloned())
-}
-
-fn set_tree_rule_key(
-    rule: &mut Value,
-    model: &CompositeModel,
-    sid: i64,
-    value: Value,
-) -> Result<(), InspectionError> {
-    let key = rule_key(model, sid)?;
-    let object = rule
-        .as_object_mut()
-        .ok_or_else(|| invalid_duplicate("source rule is not an object"))?;
-    object.insert(key, value);
-    Ok(())
-}
-
-#[allow(clippy::too_many_lines)]
-fn expected_duplicate_tree(
-    model: &CoreconfModel,
-    snapshot: &ContextSnapshot,
-    request: &RuleDuplicateRequest,
-    instances: &[Instance],
-) -> Result<Value, InspectionError> {
-    validate_duplicate_model_shape(model.composite_model())?;
-    let source_rule = find_tree_rule(snapshot.tree(), model.composite_model(), request.source)?
-        .ok_or(InspectionError::MissingRule {
-            value: request.source.value,
-            bits: request.source.bits,
-        })?;
-    let source_typed = snapshot
-        .rules()
-        .iter()
-        .find(|rule| rule.id() == request.source.rule_id())
-        .ok_or_else(|| invalid_duplicate("source rule is absent from the typed snapshot"))?;
-    if source_typed.nature() == RuleNature::Management
-        || snapshot
-            .protected_rules()
-            .contains(request.source.rule_id())
-    {
-        return Err(invalid_duplicate(
-            "source RuleID is protected or management",
-        ));
-    }
-    if snapshot
-        .protected_rules()
-        .contains(request.destination.rule_id())
-    {
-        return Err(invalid_duplicate("destination RuleID is protected"));
-    }
-    if request.source == request.destination {
-        return Err(invalid_duplicate(
-            "source and destination RuleIDs must differ",
-        ));
-    }
-
-    let root_key = rule_key(model.composite_model(), SCHC_ROOT_SID)?;
-    let list_key = rule_key(model.composite_model(), RULE_LIST_SID)?;
-    let value_key = rule_key(model.composite_model(), RULE_ID_VALUE_SID)?;
-    let length_key = rule_key(model.composite_model(), RULE_ID_LENGTH_SID)?;
-    let mut destination_rule = source_rule;
-    set_tree_rule_key(
-        &mut destination_rule,
-        model.composite_model(),
-        RULE_ID_VALUE_SID,
-        json!(request.destination.value),
-    )?;
-    set_tree_rule_key(
-        &mut destination_rule,
-        model.composite_model(),
-        RULE_ID_LENGTH_SID,
-        json!(request.destination.bits),
-    )?;
-
-    let mut candidate = snapshot.tree().clone();
-    let rules = candidate
-        .get_mut(&root_key)
-        .and_then(Value::as_object_mut)
-        .and_then(|root| root.get_mut(&list_key))
-        .and_then(Value::as_array_mut)
-        .ok_or_else(|| invalid_duplicate("active tree is missing the rule list"))?;
-    rules.retain(|rule| {
-        !(rule.get(&value_key).and_then(Value::as_u64) == Some(request.destination.value)
-            && rule.get(&length_key).and_then(Value::as_u64)
-                == Some(request.destination.bits as u64))
-    });
-    rules.push(destination_rule);
-    rules.sort_by(|left, right| {
-        left.get(&length_key)
-            .and_then(Value::as_u64)
-            .unwrap_or_default()
-            .cmp(
-                &right
-                    .get(&length_key)
-                    .and_then(Value::as_u64)
-                    .unwrap_or_default(),
-            )
-            .then_with(|| {
-                left.get(&value_key)
-                    .and_then(Value::as_u64)
-                    .unwrap_or_default()
-                    .cmp(
-                        &right
-                            .get(&value_key)
-                            .and_then(Value::as_u64)
-                            .unwrap_or_default(),
-                    )
-            })
-    });
-
-    let mut datastore = Datastore::with_data(model.clone(), candidate)
-        .map_err(|error| invalid_duplicate(format!("candidate tree is invalid: {error}")))?;
-    let mut seen = BTreeSet::new();
-    for instance in instances {
-        let (entry_index, leaf) = duplicate_leaf_from_path(&instance.path, request.destination)?;
-        let key = (entry_index, leaf);
-        if !seen.insert(key) {
-            return Err(invalid_duplicate(format!(
-                "duplicate override for entry {entry_index} leaf {leaf:?}"
-            )));
-        }
-        let value = instance
-            .value
-            .clone()
-            .ok_or_else(|| invalid_duplicate("override values cannot delete leaves"))?;
-        let sid = instance
-            .path
-            .absolute_sid()
-            .ok_or_else(|| invalid_duplicate("override path has no leaf SID"))?;
-        let keys = instance
-            .path
-            .components
-            .iter()
-            .filter_map(|component| match component {
-                PathComponent::KeyValue(value) => Some(value.clone()),
-                PathComponent::SidDelta(_) => None,
-            })
-            .collect::<Vec<_>>();
-        let xpath = datastore
-            .create_xpath(sid, &keys)
-            .map_err(|error| invalid_duplicate(error.to_string()))?;
-        datastore
-            .set_path(&xpath, value)
-            .map_err(|error| invalid_duplicate(error.to_string()))?;
-    }
-    Ok(datastore.get_all())
-}
-
-fn duplicate_leaf_from_path(
-    path: &InstancePath,
-    destination: RuleSelector,
-) -> Result<(usize, DuplicateLeaf), InspectionError> {
-    let mut absolute = 0_i64;
-    let mut sids = Vec::new();
-    let mut keys = Vec::new();
-    for component in &path.components {
-        match component {
-            PathComponent::SidDelta(delta) => {
-                absolute += delta;
-                sids.push(absolute);
-            }
-            PathComponent::KeyValue(value) => keys.push(value.clone()),
-        }
-    }
-    let Some(value) = keys.first().and_then(Value::as_u64) else {
-        return Err(invalid_duplicate(
-            "override path is missing destination value",
-        ));
-    };
-    let Some(bits) = keys.get(1).and_then(Value::as_u64) else {
-        return Err(invalid_duplicate(
-            "override path is missing destination length",
-        ));
-    };
-    if value != destination.value || bits != destination.bits as u64 {
-        return Err(invalid_duplicate(
-            "override path destination does not match RPC destination",
-        ));
-    }
-    let Some(entry) = keys.get(2).and_then(Value::as_u64) else {
-        return Err(invalid_duplicate("override path is missing entry-index"));
-    };
-    let entry =
-        usize::try_from(entry).map_err(|_| invalid_duplicate("entry-index is too large"))?;
-    let leaf = match sids.as_slice() {
-        [2574, 2597, 2620, 2632] => DuplicateLeaf::MatchingOperator,
-        [2574, 2597, 2620, 2636] => DuplicateLeaf::Cda,
-        [2574, 2597, 2620, 2629, 2631] if keys.len() == 4 => DuplicateLeaf::Target,
-        _ => {
-            return Err(invalid_duplicate(
-                "override path names an unsupported field",
-            ))
-        }
-    };
-    if matches!(leaf, DuplicateLeaf::Target) && keys.get(3).and_then(Value::as_u64) != Some(0) {
-        return Err(invalid_duplicate("target-value index must be zero"));
-    }
-    Ok((entry, leaf))
-}
-
-fn duplicate_override_path(
-    destination: RuleSelector,
-    entry_index: usize,
-    leaf: DuplicateLeaf,
-) -> Result<InstancePath, InspectionError> {
-    let mut path = InstancePath::new();
-    let mut previous = 0;
-    for sid in [SCHC_ROOT_SID, RULE_LIST_SID] {
-        push_sid(&mut path, &mut previous, sid)?;
-    }
-    path.push_key(json!(destination.value));
-    path.push_key(json!(destination.bits));
-    push_sid(&mut path, &mut previous, RULE_ENTRY_LIST_SID)?;
-    path.push_key(json!(entry_index));
-    match leaf {
-        DuplicateLeaf::Target => {
-            push_sid(&mut path, &mut previous, TARGET_VALUE_LIST_SID)?;
-            path.push_key(json!(0));
-            push_sid(&mut path, &mut previous, TARGET_VALUE_VALUE_SID)?;
-        }
-        DuplicateLeaf::MatchingOperator => {
-            push_sid(&mut path, &mut previous, MATCHING_OPERATOR_SID)?;
-        }
-        DuplicateLeaf::Cda => {
-            push_sid(&mut path, &mut previous, CDA_SID)?;
-        }
-    }
-    Ok(path)
-}
-
-#[allow(clippy::too_many_lines)]
-fn duplicate_inner_payload(
-    model: &CompositeModel,
-    snapshot: &ContextSnapshot,
-    request: &RuleDuplicateRequest,
-) -> Result<Vec<u8>, InspectionError> {
-    find_tree_rule(snapshot.tree(), model, request.source)?.ok_or(
-        InspectionError::MissingRule {
-            value: request.source.value,
-            bits: request.source.bits,
-        },
-    )?;
-    let source_rule = snapshot
-        .rules()
-        .iter()
-        .find(|rule| rule.id() == request.source.rule_id())
-        .ok_or_else(|| invalid_duplicate("source rule is absent"))?;
-    if source_rule.nature() == RuleNature::Management
-        || snapshot
-            .protected_rules()
-            .contains(request.source.rule_id())
-    {
-        return Err(invalid_duplicate(
-            "source RuleID is protected or management",
-        ));
-    }
-    if snapshot
-        .protected_rules()
-        .contains(request.destination.rule_id())
-    {
-        return Err(invalid_duplicate("destination RuleID is protected"));
-    }
-    let detail = detail_from_rule(source_rule);
-    let mut output = Vec::new();
-    for override_ in &request.overrides {
-        let entry = detail
-            .entries
-            .iter()
-            .find(|entry| entry.entry_index == override_.entry_index)
-            .ok_or_else(|| {
-                invalid_duplicate(format!("unknown entry-index {}", override_.entry_index))
-            })?;
-        if override_.target_value.is_none()
-            && override_.matching_operator.is_none()
-            && override_.cda.is_none()
-        {
-            return Err(invalid_duplicate(format!(
-                "entry {} has no override leaves",
-                override_.entry_index
-            )));
-        }
-        let mut fields = Vec::new();
-        if let Some(target) = &override_.target_value {
-            let current = source_rule
-                .fields()
-                .iter()
-                .find(|field| field.entry_index == override_.entry_index)
-                .and_then(|field| match &field.target {
-                    TargetValue::Bytes(bytes) => Some(bytes.clone()),
-                    _ => None,
-                })
-                .ok_or_else(|| {
-                    invalid_duplicate("target override requires one binary source target")
-                })?;
-            let field_length = Value::Number(
-                (entry.length.parse::<u64>().map_err(|_| {
-                    invalid_duplicate("target override requires a fixed numeric field length")
-                })?)
-                .into(),
-            );
-            let bytes = binary_bytes(&numeric_target_value(target, &current, &field_length)?)?;
-            let path = duplicate_override_path(
-                request.destination,
-                override_.entry_index,
-                DuplicateLeaf::Target,
-            )?;
-            fields.push((path, CborValue::Bytes(bytes)));
-        }
-        if let Some(matching) = &override_.matching_operator {
-            let identity = duplicate_identity_sid(model, matching, true)?;
-            fields.push((
-                duplicate_override_path(
-                    request.destination,
-                    override_.entry_index,
-                    DuplicateLeaf::MatchingOperator,
-                )?,
-                CborValue::Integer(identity.into()),
-            ));
-        }
-        if let Some(cda) = &override_.cda {
-            let identity = duplicate_identity_sid(model, cda, false)?;
-            fields.push((
-                duplicate_override_path(
-                    request.destination,
-                    override_.entry_index,
-                    DuplicateLeaf::Cda,
-                )?,
-                CborValue::Integer(identity.into()),
-            ));
-        }
-        let entries = fields
-            .into_iter()
-            .map(|(path, value)| {
-                let key =
-                    coreconf_model::codec::json_to_cbor_value(model, &path.to_cbor_value(), 0)
-                        .map_err(|error| invalid_duplicate(error.to_string()))?;
-                Ok((key, value))
-            })
-            .collect::<Result<Vec<_>, InspectionError>>()?;
-        ciborium::ser::into_writer(&CborValue::Map(entries), &mut output)
-            .map_err(|error| invalid_duplicate(format!("override encoding failed: {error}")))?;
-    }
-    Ok(output)
-}
-
-fn duplicate_identity_sid(
-    model: &CompositeModel,
-    input: &str,
-    matching: bool,
-) -> Result<i64, InspectionError> {
-    let allowed = if matching {
-        [
-            "equal",
-            "ignore",
-            "match-mapping",
-            "mo-equal",
-            "mo-ignore",
-            "mo-match-mapping",
-        ]
-        .as_slice()
-    } else {
-        [
-            "not-sent",
-            "value-sent",
-            "mapping-sent",
-            "lsb",
-            "compute",
-            "deviid",
-            "appiid",
-            "cda-not-sent",
-            "cda-value-sent",
-            "cda-mapping-sent",
-            "cda-lsb",
-            "cda-compute",
-            "cda-deviid",
-            "cda-appiid",
-        ]
-        .as_slice()
-    };
-    if !allowed.contains(&input) {
-        return Err(invalid_duplicate(format!(
-            "invalid {} identity '{input}'",
-            if matching { "matching operator" } else { "CDA" }
-        )));
-    }
-    let canonical = if matching && !input.starts_with("mo-") {
-        format!("mo-{input}")
-    } else if !matching && !input.starts_with("cda-") {
-        format!("cda-{input}")
-    } else {
-        input.to_owned()
-    };
-    model
-        .identity_sid_for_value(&Value::String(canonical))
-        .map_err(|error| invalid_duplicate(error.to_string()))
-}
-
-fn encode_duplicate_rpc_payload(
-    model: &CoreconfModel,
-    request: &RuleDuplicateRequest,
-    inner: &[u8],
-) -> Result<Vec<u8>, InspectionError> {
-    validate_duplicate_model_shape(model.composite_model())?;
-    let integer = |value: i64| CborValue::Integer(value.into());
-    let uint = |value: u64| CborValue::Integer(value.into());
-    let source_bits = u64::try_from(request.source.bits)
-        .map_err(|_| invalid_duplicate("source RuleID length is too large"))?;
-    let destination_bits = u64::try_from(request.destination.bits)
-        .map_err(|_| invalid_duplicate("destination RuleID length is too large"))?;
-    if request.source.value > u64::from(u32::MAX) || request.destination.value > u64::from(u32::MAX)
-    {
-        return Err(invalid_duplicate(
-            "duplicate-rule RuleID values must fit the modeled uint32 selectors",
-        ));
-    }
-    let from = CborValue::Map(vec![
-        (integer(1), uint(source_bits)),
-        (integer(2), uint(request.source.value)),
-    ]);
-    let to = CborValue::Map(vec![
-        (integer(1), uint(destination_bits)),
-        (integer(2), uint(request.destination.value)),
-    ]);
-    let mut input_entries = vec![
-        (integer(1), from),
-        (integer(4), CborValue::Bytes(inner.to_vec())),
-        (integer(5), to),
-    ];
-    if inner.is_empty() {
-        input_entries.remove(1);
-    }
-    let value = CborValue::Map(vec![(integer(1), CborValue::Map(input_entries))]);
-    let root = CborValue::Map(vec![(integer(DUPLICATE_RULE_SID), value)]);
-    let mut payload = Vec::new();
-    ciborium::ser::into_writer(&root, &mut payload)
-        .map_err(|error| invalid_duplicate(format!("modeled RPC encoding failed: {error}")))?;
-    Ok(payload)
-}
-
-fn base64_encode(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut output = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let first = chunk[0];
-        let second = chunk.get(1).copied().unwrap_or(0);
-        let third = chunk.get(2).copied().unwrap_or(0);
-        output.push(ALPHABET[usize::from(first >> 2)] as char);
-        output.push(ALPHABET[usize::from((first & 0x03) << 4 | second >> 4)] as char);
-        output.push(if chunk.len() > 1 {
-            ALPHABET[usize::from((second & 0x0f) << 2 | third >> 6)] as char
-        } else {
-            '='
-        });
-        output.push(if chunk.len() > 2 {
-            ALPHABET[usize::from(third & 0x3f)] as char
-        } else {
-            '='
-        });
-    }
-    output
-}
-
-fn base64_decode(input: &str) -> Result<Vec<u8>, InspectionError> {
-    if !input.len().is_multiple_of(4) {
-        return Err(invalid_duplicate("ipatch-sequence is not canonical base64"));
-    }
-    let mut table = [255_u8; 256];
-    for (index, byte) in b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
-        .iter()
-        .enumerate()
-    {
-        table[usize::from(*byte)] = u8::try_from(index).expect("base64 alphabet index fits u8");
-    }
-    let bytes = input.as_bytes();
-    let mut output = Vec::with_capacity(input.len() / 4 * 3);
-    for chunk in bytes.chunks_exact(4) {
-        let a = table[usize::from(chunk[0])];
-        let b = table[usize::from(chunk[1])];
-        if a == 255 || b == 255 {
-            return Err(invalid_duplicate("ipatch-sequence contains invalid base64"));
-        }
-        let c = if chunk[2] == b'=' {
-            0
-        } else {
-            table[usize::from(chunk[2])]
-        };
-        let d = if chunk[3] == b'=' {
-            0
-        } else {
-            table[usize::from(chunk[3])]
-        };
-        if c == 255 || d == 255 || (chunk[2] == b'=' && chunk[3] != b'=') {
-            return Err(invalid_duplicate(
-                "ipatch-sequence contains invalid base64 padding",
-            ));
-        }
-        output.push((a << 2) | (b >> 4));
-        if chunk[2] != b'=' {
-            output.push((b << 4) | (c >> 2));
-        }
-        if chunk[3] != b'=' {
-            output.push((c << 6) | d);
-        }
-    }
-    if base64_encode(&output) != input {
-        return Err(invalid_duplicate("ipatch-sequence is not canonical base64"));
-    }
-    Ok(output)
-}
-
-fn decode_duplicate_operation(
-    model: &CoreconfModel,
-    payload: &[u8],
-) -> Result<DecodedDuplicateOperation, InspectionError> {
-    validate_duplicate_model_shape(model.composite_model())?;
-    let outer = strict_one_cbor_map(payload)?;
-    reject_duplicate_cbor_keys(&outer)?;
-    let instances =
-        decode_instances_with_model_to_identifier_at_path(model.composite_model(), payload, false)
-            .map_err(|error| invalid_duplicate(format!("RPC payload decode failed: {error}")))?;
-    if instances.len() != 1
-        || instances[0].path.components != vec![PathComponent::SidDelta(DUPLICATE_RULE_SID)]
-    {
-        return Err(invalid_duplicate(
-            "RPC payload must contain exactly one duplicate-rule instance",
-        ));
-    }
-    let value = instances[0]
-        .value
-        .clone()
-        .ok_or_else(|| invalid_duplicate("RPC input cannot be deleted"))?;
-    let operation = value
-        .as_object()
-        .ok_or_else(|| invalid_duplicate("RPC operation value is not an object"))?;
-    if operation.len() != 1 || !operation.contains_key("input") {
-        return Err(invalid_duplicate(
-            "RPC operation must contain exactly the input container",
-        ));
-    }
-    let input = operation
-        .get("input")
-        .and_then(Value::as_object)
-        .ok_or_else(|| invalid_duplicate("RPC input container is missing"))?;
-    if input
-        .keys()
-        .any(|key| !matches!(key.as_str(), "from" | "to" | "ipatch-sequence"))
-    {
-        return Err(invalid_duplicate("RPC input contains an unknown field"));
-    }
-    let from = input
-        .get("from")
-        .and_then(Value::as_object)
-        .ok_or_else(|| invalid_duplicate("RPC source selector is missing"))?;
-    let to = input
-        .get("to")
-        .and_then(Value::as_object)
-        .ok_or_else(|| invalid_duplicate("RPC destination selector is missing"))?;
-    let selector = |object: &serde_json::Map<String, Value>,
-                    label: &str|
-     -> Result<RuleSelector, InspectionError> {
-        if object.len() != 2
-            || !object.contains_key("rule-id-value")
-            || !object.contains_key("rule-id-length")
-        {
-            return Err(invalid_duplicate(format!(
-                "RPC {label} selector has unsupported fields"
-            )));
-        }
-        RuleSelector::new(
-            object["rule-id-value"]
-                .as_u64()
-                .ok_or_else(|| invalid_duplicate(format!("RPC {label} value is invalid")))?,
-            object["rule-id-length"]
-                .as_u64()
-                .and_then(|bits| usize::try_from(bits).ok())
-                .ok_or_else(|| invalid_duplicate(format!("RPC {label} length is invalid")))?,
-        )
-        .map_err(|error| invalid_duplicate(error.to_string()))
-    };
-    let source = selector(from, "source")?;
-    let destination = selector(to, "destination")?;
-    let inner = input
-        .get("ipatch-sequence")
-        .map(|value| match value {
-            Value::String(encoded) => base64_decode(encoded),
-            _ => binary_bytes(value),
-        })
-        .transpose()?
-        .unwrap_or_default();
-    let inner_instances = decode_duplicate_inner(model.composite_model(), &inner, destination)?;
-    let mut entries = BTreeSet::new();
-    for instance in &inner_instances {
-        let (entry, _) = duplicate_leaf_from_path(&instance.path, destination)?;
-        entries.insert(entry);
-    }
-    let overrides = entries
-        .into_iter()
-        .map(|entry_index| RuleDuplicateOverride {
-            entry_index,
-            target_value: None,
-            matching_operator: None,
-            cda: None,
-        })
-        .collect();
-    Ok(DecodedDuplicateOperation {
-        request: RuleDuplicateRequest {
-            source,
-            destination,
-            overrides,
-        },
-        instances: inner_instances,
-        inner_payload: inner,
-    })
-}
-
-/// Decodes the modeled duplicate RPC for read-only packet reporting.
-///
-/// This deliberately reuses the canonical duplicate decoder and never exposes
-/// mutation or publication operations.
-pub(crate) fn duplicate_rpc_cost(
-    sid_json: &str,
-    payload: &[u8],
-) -> Result<DuplicateRpcCost, InspectionError> {
-    let model = CoreconfModel::from_sid_str(sid_json)
-        .map_err(|error| InspectionError::Datastore(error.to_string()))?;
-    let operation = decode_duplicate_operation(&model, payload)?;
-    let fixed_request = RuleDuplicateRequest {
-        source: operation.request.source,
-        destination: operation.request.destination,
-        overrides: Vec::new(),
-    };
-    let fixed_payload = encode_duplicate_rpc_payload(&model, &fixed_request, &[])?;
-    let mut target_value_bytes = 0usize;
-    let mut descriptions = BTreeMap::<usize, DuplicateRpcOverride>::new();
-    let mut cursor = Cursor::new(operation.inner_payload.as_slice());
-    let mut instance_index = 0usize;
-    while usize::try_from(cursor.position())
-        .is_ok_and(|position| position < operation.inner_payload.len())
-    {
-        let value: CborValue = ciborium::de::from_reader(&mut cursor)
-            .map_err(|error| invalid_duplicate(format!("invalid override framing: {error}")))?;
-        let CborValue::Map(entries) = value else {
-            return Err(invalid_duplicate("override framing member is not a map"));
-        };
-        for (_, raw_value) in entries {
-            let instance = operation.instances.get(instance_index).ok_or_else(|| {
-                invalid_duplicate("override framing and decoded instances disagree")
-            })?;
-            instance_index += 1;
-            let (entry_index, leaf) =
-                duplicate_leaf_from_path(&instance.path, operation.request.destination)?;
-            let description =
-                descriptions
-                    .entry(entry_index)
-                    .or_insert_with(|| DuplicateRpcOverride {
-                        entry_index,
-                        target_value: None,
-                        matching_operator: None,
-                        cda: None,
-                    });
-            match leaf {
-                DuplicateLeaf::Target => {
-                    let CborValue::Bytes(bytes) = raw_value else {
-                        return Err(invalid_duplicate(
-                            "target override is not a CBOR byte string",
-                        ));
-                    };
-                    target_value_bytes = target_value_bytes
-                        .checked_add(bytes.len())
-                        .ok_or_else(|| invalid_duplicate("target-value byte cost overflow"))?;
-                    description.target_value = Some(target_bytes_label(&bytes));
-                }
-                DuplicateLeaf::MatchingOperator => {
-                    description.matching_operator = instance.value.as_ref().map(json_value_label);
-                }
-                DuplicateLeaf::Cda => {
-                    description.cda = instance.value.as_ref().map(json_value_label);
-                }
-            }
-        }
-    }
-    if instance_index != operation.instances.len() {
-        return Err(invalid_duplicate(
-            "decoded override instances were not fully accounted",
-        ));
-    }
-    let fixed_and_targets = fixed_payload
-        .len()
-        .checked_add(target_value_bytes)
-        .ok_or_else(|| invalid_duplicate("duplicate RPC byte cost overflow"))?;
-    let variable_framing_bytes = payload
-        .len()
-        .checked_sub(fixed_and_targets)
-        .ok_or_else(|| {
-            invalid_duplicate("duplicate RPC payload is smaller than fixed and target costs")
-        })?;
-    Ok(DuplicateRpcCost {
-        source: operation.request.source,
-        destination: operation.request.destination,
-        payload_bytes: payload.len(),
-        fixed_bytes: fixed_payload.len(),
-        variable_framing_bytes,
-        target_value_bytes,
-        overrides: descriptions.into_values().collect(),
-    })
-}
-
-fn json_value_label(value: &Value) -> String {
-    match value {
-        Value::String(value) => value.clone(),
-        _ => value.to_string(),
-    }
-}
-
-fn target_bytes_label(bytes: &[u8]) -> String {
-    if bytes.len() <= 8 {
-        let mut value = 0_u64;
-        for byte in bytes {
-            value = value.saturating_mul(256).saturating_add(u64::from(*byte));
-        }
-        value.to_string()
-    } else {
-        format!("{} B", bytes.len())
-    }
-}
-
-fn decode_duplicate_inner(
-    model: &CompositeModel,
-    bytes: &[u8],
-    destination: RuleSelector,
-) -> Result<Vec<Instance>, InspectionError> {
-    let mut cursor = Cursor::new(bytes);
-    let mut instances = Vec::new();
-    let mut groups = BTreeSet::new();
-    while usize::try_from(cursor.position()).is_ok_and(|position| position < bytes.len()) {
-        let start = usize::try_from(cursor.position())
-            .map_err(|_| invalid_duplicate("ipatch-sequence is too large"))?;
-        let value: CborValue = ciborium::de::from_reader(&mut cursor)
-            .map_err(|error| invalid_duplicate(format!("invalid ipatch-sequence CBOR: {error}")))?;
-        let end = usize::try_from(cursor.position())
-            .map_err(|_| invalid_duplicate("ipatch-sequence is too large"))?;
-        let CborValue::Map(entries) = &value else {
-            return Err(invalid_duplicate("ipatch-sequence members must be maps"));
-        };
-        if entries.is_empty() || entries.len() > 3 {
-            return Err(invalid_duplicate(
-                "each override map must contain one to three leaves",
-            ));
-        }
-        reject_duplicate_cbor_keys(&value)?;
-        let mut canonical = Vec::new();
-        ciborium::ser::into_writer(&value, &mut canonical)
-            .map_err(|error| invalid_duplicate(error.to_string()))?;
-        if canonical != bytes[start..end] {
-            return Err(invalid_duplicate("noncanonical ipatch-sequence map"));
-        }
-        let member = &bytes[start..end];
-        let decoded = decode_instances_with_model_to_identifier_at_path(model, member, false)
-            .map_err(|error| invalid_duplicate(format!("invalid override value: {error}")))?;
-        if decoded.len() != entries.len() {
-            return Err(invalid_duplicate("override map did not decode completely"));
-        }
-        let mut seen = BTreeSet::new();
-        let mut group_entries = BTreeSet::new();
-        for instance in decoded {
-            let (entry, leaf) = duplicate_leaf_from_path(&instance.path, destination)?;
-            if !seen.insert((entry, leaf)) {
-                return Err(invalid_duplicate("duplicate override leaf"));
-            }
-            group_entries.insert(entry);
-            instances.push(instance);
-        }
-        // One map is one override group. A second map for the same entry
-        // would make the entry-index override ambiguous rather than merging
-        // two independently ordered operations.
-        if group_entries.iter().any(|entry| groups.contains(entry)) {
-            return Err(invalid_duplicate("duplicate entry-index override group"));
-        }
-        groups.extend(group_entries);
-    }
-    Ok(instances)
-}
-
-fn strict_one_cbor_map(bytes: &[u8]) -> Result<CborValue, InspectionError> {
-    let mut cursor = Cursor::new(bytes);
-    let value: CborValue = ciborium::de::from_reader(&mut cursor)
-        .map_err(|error| invalid_duplicate(format!("invalid RPC CBOR: {error}")))?;
-    if cursor.position() != bytes.len() as u64 {
-        return Err(invalid_duplicate("trailing values after RPC instance"));
-    }
-    if !matches!(value, CborValue::Map(_)) {
-        return Err(invalid_duplicate("RPC payload root must be a map"));
-    }
-    let mut canonical = Vec::new();
-    ciborium::ser::into_writer(&value, &mut canonical)
-        .map_err(|error| invalid_duplicate(format!("RPC canonical encoding failed: {error}")))?;
-    if canonical != bytes {
-        return Err(invalid_duplicate("noncanonical RPC CBOR"));
-    }
-    Ok(value)
-}
-
-fn reject_duplicate_cbor_keys(value: &CborValue) -> Result<(), InspectionError> {
-    match value {
-        CborValue::Array(values) => values.iter().try_for_each(reject_duplicate_cbor_keys),
-        CborValue::Map(entries) => {
-            for (index, (key, value)) in entries.iter().enumerate() {
-                if entries[..index].iter().any(|(previous, _)| previous == key) {
-                    return Err(invalid_duplicate("duplicate CBOR map key"));
-                }
-                reject_duplicate_cbor_keys(key)?;
-                reject_duplicate_cbor_keys(value)?;
-            }
-            Ok(())
-        }
-        CborValue::Tag(_, value) => reject_duplicate_cbor_keys(value),
-        _ => Ok(()),
-    }
-}
-
 #[derive(Debug)]
 struct PatchFailure {
     code: ResponseCode,
@@ -3198,8 +2295,11 @@ struct TargetPatch {
     value: Value,
 }
 
-fn target_patch_from_instance(instance: &Instance) -> Result<TargetPatch, PatchFailure> {
-    let components = &instance.path.components;
+fn target_patch_from_instance(
+    instance: &Instance,
+    sids: ModelSids,
+) -> Result<TargetPatch, PatchFailure> {
+    let components = instance.path.components();
     if components.len() != 9 {
         return Err(PatchFailure::bad(
             "targeted iPATCH path must contain the complete rule, entry, and target-value keys",
@@ -3215,7 +2315,7 @@ fn target_patch_from_instance(instance: &Instance) -> Result<TargetPatch, PatchF
             "targeted iPATCH path is missing the rule list",
         ));
     };
-    if *root_delta != SCHC_ROOT_SID || *rule_delta != RULE_LIST_SID - SCHC_ROOT_SID {
+    if *root_delta != sids.root || *rule_delta != sids.rule - sids.root {
         return Err(PatchFailure::bad(
             "targeted iPATCH path is not rooted at the complete rule list",
         ));
@@ -3233,7 +2333,7 @@ fn target_patch_from_instance(instance: &Instance) -> Result<TargetPatch, PatchF
             "targeted iPATCH path is missing the entry list",
         ));
     };
-    if *entry_list_delta != RULE_ENTRY_LIST_SID - RULE_LIST_SID {
+    if *entry_list_delta != sids.entry - sids.rule {
         return Err(PatchFailure::bad(
             "targeted iPATCH path is missing the canonical entry list",
         ));
@@ -3244,7 +2344,7 @@ fn target_patch_from_instance(instance: &Instance) -> Result<TargetPatch, PatchF
             "targeted iPATCH path is missing the target-value list",
         ));
     };
-    if *target_list_delta != TARGET_VALUE_LIST_SID - RULE_ENTRY_LIST_SID {
+    if *target_list_delta != sids.target - sids.entry {
         return Err(PatchFailure::bad(
             "targeted iPATCH path is missing the canonical target-value list",
         ));
@@ -3255,12 +2355,12 @@ fn target_patch_from_instance(instance: &Instance) -> Result<TargetPatch, PatchF
             "targeted iPATCH path is missing the target-value leaf",
         ));
     };
-    if *target_leaf_delta != TARGET_VALUE_VALUE_SID - TARGET_VALUE_LIST_SID {
+    if *target_leaf_delta != sids.target_value - sids.target {
         return Err(PatchFailure::bad(
             "targeted iPATCH path names an unsupported leaf",
         ));
     }
-    let expected_path = target_value_path(selector, entry_index, target_value_index)
+    let expected_path = target_value_path(sids, selector, entry_index, target_value_index)
         .map_err(|error| PatchFailure::bad(error.to_string()))?;
     if instance.path != expected_path {
         return Err(PatchFailure::bad(
@@ -3294,14 +2394,6 @@ fn patch_key_u64(component: Option<&PathComponent>, name: &str) -> Result<u64, P
 fn patch_key_usize(component: Option<&PathComponent>, name: &str) -> Result<usize, PatchFailure> {
     usize::try_from(patch_key_u64(component, name)?)
         .map_err(|_| PatchFailure::bad(format!("targeted iPATCH {name} key is out of range")))
-}
-
-fn datagram_packet(
-    request: &coreconf_runtime::coap_types::Request,
-    original: &[u8],
-) -> Result<Packet, InspectionError> {
-    let _ = request;
-    Packet::from_bytes(original).map_err(|error| InspectionError::Coap(error.to_string()))
 }
 
 fn packet_without_content_format(
@@ -3343,34 +2435,13 @@ fn is_mutation(packet: &Packet) -> bool {
 ///
 /// Panics only if the fixed marker request cannot be serialized.
 #[must_use]
-pub fn context_check_request(tag: ContextTag, message_id: u16, token: &[u8]) -> Vec<u8> {
-    let mut packet = base_request(RequestType::Fetch, message_id, token);
+pub fn context_check_request(tag: ContextTag, message_id: u16) -> Vec<u8> {
+    let mut packet = base_request(RequestType::Fetch, message_id);
     packet.payload.push(CONTEXT_CHECK_MARKER);
     packet.payload.extend_from_slice(&tag.bytes());
     packet
         .to_bytes()
         .expect("context-check request is representable")
-}
-
-/// Parses a compact context-check CoAP response.
-///
-/// # Errors
-///
-/// Returns an error when the response is malformed, not 2.05 Content, or
-/// contains a marker or payload length that is not part of the compact format.
-pub fn context_check_response(
-    datagram: &[u8],
-    core_tag: ContextTag,
-) -> Result<ContextCheckResult, InspectionError> {
-    let packet =
-        Packet::from_bytes(datagram).map_err(|error| InspectionError::Coap(error.to_string()))?;
-    if packet.header.code != MessageClass::Response(ResponseType::Content) {
-        return Err(InspectionError::UnexpectedResponse(format!(
-            "expected 2.05 Content, got {:?}",
-            packet.header.code
-        )));
-    }
-    decode_context_check_payload(&packet.payload, core_tag)
 }
 
 /// Parses the compact context-check response payload returned by a validated
@@ -3431,6 +2502,7 @@ pub fn decode_rule_list_payload(
     payload: &[u8],
     model: &CoreconfModel,
 ) -> Result<Vec<RuleSummary>, InspectionError> {
+    let sids = ModelSids::resolve(model.composite_model())?;
     let instances = decode_instances_with_model(model.composite_model(), payload)
         .map_err(|error| InspectionError::UnexpectedResponse(error.to_string()))?;
     if instances.len() != 1 {
@@ -3440,7 +2512,7 @@ pub fn decode_rule_list_payload(
         )));
     }
     let instance = &instances[0];
-    validate_root_instance_path(&instance.path)?;
+    validate_root_instance_path(&instance.path, sids.root)?;
     let raw_root = instance.value.clone().ok_or_else(|| {
         InspectionError::UnexpectedResponse("rule-list response contained a deleted root".into())
     })?;
@@ -3531,6 +2603,7 @@ pub fn decode_rule_detail_payload(
     sid_json: &str,
     selector: RuleSelector,
 ) -> Result<RuleDetail, InspectionError> {
+    let sids = ModelSids::resolve(model.composite_model())?;
     let instances = decode_instances_with_model(model.composite_model(), payload)
         .map_err(|error| InspectionError::UnexpectedResponse(error.to_string()))?;
     if instances.len() != 1 {
@@ -3540,7 +2613,13 @@ pub fn decode_rule_detail_payload(
         )));
     }
     let instance = &instances[0];
-    validate_rule_instance_path(&instance.path, RULE_LIST_SID, Some(selector))?;
+    validate_rule_instance_path(
+        &instance.path,
+        sids.root,
+        sids.rule,
+        sids.rule,
+        Some(selector),
+    )?;
     let raw_value = instance.value.clone().ok_or_else(|| {
         InspectionError::UnexpectedResponse("rule-get response contained a deleted rule".into())
     })?;
@@ -3601,11 +2680,11 @@ pub fn decode_rule_detail_payload(
     Ok(detail_from_rule(&rules[0]))
 }
 
-fn validate_root_instance_path(path: &InstancePath) -> Result<(), InspectionError> {
-    if path.components.len() != 1
+fn validate_root_instance_path(path: &InstancePath, root_sid: i64) -> Result<(), InspectionError> {
+    if path.components().len() != 1
         || !matches!(
-            path.components.first(),
-            Some(PathComponent::SidDelta(SCHC_ROOT_SID))
+            path.components().first(),
+            Some(PathComponent::SidDelta(sid)) if *sid == root_sid
         )
     {
         return Err(InspectionError::UnexpectedResponse(
@@ -3616,13 +2695,18 @@ fn validate_root_instance_path(path: &InstancePath) -> Result<(), InspectionErro
 }
 
 fn management_instance_path(
+    root_sid: i64,
+    rule_sid: i64,
     selector: Option<RuleSelector>,
 ) -> Result<InstancePath, InspectionError> {
     let mut path = InstancePath::new();
-    path.push_delta(SCHC_ROOT_SID)
+    path.push_delta(root_sid)
         .map_err(|error| InspectionError::Datastore(error.to_string()))?;
     if let Some(selector) = selector {
-        path.push_delta(RULE_LIST_SID - SCHC_ROOT_SID)
+        let rule_delta = rule_sid
+            .checked_sub(root_sid)
+            .ok_or_else(|| InspectionError::Datastore("rule-list SID delta overflows".into()))?;
+        path.push_delta(rule_delta)
             .map_err(|error| InspectionError::Datastore(error.to_string()))?;
         path.push_key(json!(selector.value));
         path.push_key(json!(selector.bits));
@@ -3630,11 +2714,40 @@ fn management_instance_path(
     Ok(path)
 }
 
+fn model_request_sids(sid_json: &str) -> Result<(i64, i64), InspectionError> {
+    let model = CoreconfModel::from_sid_str(sid_json)
+        .map_err(|error| InspectionError::Datastore(error.to_string()))?;
+    let composite = model.composite_model();
+    let root = composite
+        .get_sid("/ietf-schc:schc")
+        .ok_or_else(|| invalid_target("SID model is missing identifier /ietf-schc:schc"))?;
+    let rule = composite
+        .get_sid("/ietf-schc:schc/rule")
+        .ok_or_else(|| invalid_target("SID model is missing identifier /ietf-schc:schc/rule"))?;
+    Ok((root, rule))
+}
+
+fn rule_request(
+    root_sid: i64,
+    rule_sid: i64,
+    selector: Option<RuleSelector>,
+    message_id: u16,
+) -> Result<Vec<u8>, InspectionError> {
+    let path = management_instance_path(root_sid, rule_sid, selector)?;
+    let mut packet = base_request(RequestType::Fetch, message_id);
+    packet.add_option(CoapOption::ContentFormat, vec![141]);
+    packet.payload = encode_identifiers(std::slice::from_ref(&path))
+        .map_err(|error| InspectionError::Datastore(error.to_string()))?;
+    packet
+        .to_bytes()
+        .map_err(|error| InspectionError::Coap(error.to_string()))
+}
+
 fn rule_key_values(
     path: &coreconf_model::instance_id::InstancePath,
 ) -> Result<[u64; 2], InspectionError> {
     let keys = path
-        .components
+        .components()
         .iter()
         .filter_map(|component| match component {
             PathComponent::KeyValue(value) => value.as_u64(),
@@ -3651,13 +2764,15 @@ fn rule_key_values(
 
 fn validate_rule_instance_path(
     path: &coreconf_model::instance_id::InstancePath,
+    root_sid: i64,
+    rule_sid: i64,
     leaf_sid: i64,
     selector: Option<RuleSelector>,
 ) -> Result<(), InspectionError> {
     let mut absolute = 0_i64;
     let mut sids = Vec::new();
     let mut key_count = 0;
-    for component in &path.components {
+    for component in path.components() {
         match component {
             PathComponent::SidDelta(delta) => {
                 absolute += delta;
@@ -3666,16 +2781,16 @@ fn validate_rule_instance_path(
             PathComponent::KeyValue(_) => key_count += 1,
         }
     }
-    let expected_sids = if leaf_sid == RULE_LIST_SID {
-        [2574, RULE_LIST_SID, 0]
+    let expected_sids = if leaf_sid == rule_sid {
+        [root_sid, rule_sid, 0]
     } else {
-        [2574, RULE_LIST_SID, leaf_sid]
+        [root_sid, rule_sid, leaf_sid]
     };
-    let expected_len = if leaf_sid == RULE_LIST_SID { 2 } else { 3 };
+    let expected_len = if leaf_sid == rule_sid { 2 } else { 3 };
     if sids.len() != expected_len
         || sids.first().copied() != Some(expected_sids[0])
         || sids.get(1).copied() != Some(expected_sids[1])
-        || (leaf_sid != RULE_LIST_SID && sids.get(2).copied() != Some(leaf_sid))
+        || (leaf_sid != rule_sid && sids.get(2).copied() != Some(leaf_sid))
         || key_count != 2
     {
         return Err(InspectionError::UnexpectedResponse(
@@ -3758,72 +2873,64 @@ fn encode_remote_rule(sid_json: &str, rule_value: &Value) -> Result<Vec<u8>, Ins
         .map_err(|error| InspectionError::UnexpectedResponse(error.to_string()))
 }
 
-/// Builds a normal CORECONF FETCH for the unambiguous SCHC root container.
-///
-/// The request carries exactly one root identifier and
-/// `application/yang-identifiers+cbor-seq` (141).
+/// Builds a CORECONF FETCH for the unambiguous SCHC root container.
 ///
 /// # Errors
 ///
 /// Returns an error if the fixed root path or CoAP datagram cannot be
 /// represented.
-pub fn rule_list_request(message_id: u16, token: &[u8]) -> Result<Vec<u8>, InspectionError> {
-    let path = management_instance_path(None)?;
-    let mut packet = base_request(RequestType::Fetch, message_id, token);
-    packet.add_option(CoapOption::ContentFormat, vec![141]);
-    packet.payload = encode_identifiers(std::slice::from_ref(&path))
-        .map_err(|error| InspectionError::Datastore(error.to_string()))?;
-    packet
-        .to_bytes()
-        .map_err(|error| InspectionError::Coap(error.to_string()))
+pub fn rule_list_request(sid_json: &str, message_id: u16) -> Result<Vec<u8>, InspectionError> {
+    let (root_sid, rule_sid) = model_request_sids(sid_json)?;
+    rule_request(root_sid, rule_sid, None, message_id)
 }
 
-/// Builds a normal CORECONF FETCH for exactly one keyed rule instance.
-///
-/// The request carries the canonical SCHC root, rule-list SID, and both
-/// `RuleID` value and width keys with format 141.
+/// Builds a keyed rule FETCH using the root and rule-list SIDs from `sid_json`.
 ///
 /// # Errors
 ///
-/// Returns an error if the fixed path or CoAP datagram cannot be represented.
+/// Returns an error if the SID document or resulting CoAP datagram is invalid.
 pub fn rule_get_request(
+    sid_json: &str,
     selector: RuleSelector,
     message_id: u16,
-    token: &[u8],
 ) -> Result<Vec<u8>, InspectionError> {
-    let path = management_instance_path(Some(selector))?;
-    let mut packet = base_request(RequestType::Fetch, message_id, token);
-    packet.add_option(CoapOption::ContentFormat, vec![141]);
-    packet.payload = encode_identifiers(std::slice::from_ref(&path))
-        .map_err(|error| InspectionError::Datastore(error.to_string()))?;
-    packet
-        .to_bytes()
-        .map_err(|error| InspectionError::Coap(error.to_string()))
+    let (root_sid, rule_sid) = model_request_sids(sid_json)?;
+    rule_request(root_sid, rule_sid, Some(selector), message_id)
 }
 
-fn base_request(method: RequestType, message_id: u16, _token: &[u8]) -> Packet {
+fn base_request(method: RequestType, message_id: u16) -> Packet {
     let mut packet = Packet::new();
     packet.header.message_id = message_id;
     packet.header.code = MessageClass::Request(method);
     packet.header.set_type(MessageType::Confirmable);
-    // Protected management uses a zero-length token; the endpoint and bounded
-    // CoAP MID provide the correlation key.
     packet.set_token(Vec::new());
     packet.add_option(CoapOption::UriPath, b"schc".to_vec());
     packet
 }
 
+fn apply_token_policy(
+    coap_datagram: &[u8],
+    token_policy: TokenPolicy,
+) -> Result<Vec<u8>, InspectionError> {
+    let mut packet = Packet::from_bytes(coap_datagram)
+        .map_err(|error| InspectionError::Coap(error.to_string()))?;
+    packet.set_token(token_policy.token().as_bytes().to_vec());
+    packet
+        .to_bytes()
+        .map_err(|error| InspectionError::Coap(error.to_string()))
+}
+
 /// An encoded protected management request awaiting transport and response
 /// validation.
 ///
-/// The value owns the exact SCHC frame and the request correlation packet, but
+/// The value owns the exact SCHC frame and the request correlation identity, but
 /// does not own any transport.  It can therefore be sent by a caller that
 /// also reads and routes unrelated raw link frames.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct PreparedManagementRequest {
     frame: SchcFrame,
     report: LinkReport,
-    request: Ipv6UdpCoapPacket,
+    exchange_id: ExchangeId,
 }
 
 impl PreparedManagementRequest {
@@ -3838,6 +2945,12 @@ impl PreparedManagementRequest {
     pub const fn report(&self) -> &LinkReport {
         &self.report
     }
+
+    /// Returns the CoAP identity required to correlate a response.
+    #[must_use]
+    pub const fn exchange_id(&self) -> &ExchangeId {
+        &self.exchange_id
+    }
 }
 
 /// Builds and SCHC-encodes one protected management request.
@@ -3849,7 +2962,9 @@ impl PreparedManagementRequest {
 ///
 /// This function performs no transport operations.  The returned value owns
 /// the exact frame and retains the request correlation information for
-/// [`validate_management_response`].
+/// [`validate_management_response`]. The selected token policy is applied to
+/// the serialized CoAP request before SCHC encoding. The current compact
+/// profile supports only [`TokenPolicy::Empty`].
 ///
 /// # Errors
 ///
@@ -3859,19 +2974,24 @@ impl PreparedManagementRequest {
 pub fn prepare_management_request(
     link: &SchcLink,
     coap_datagram: &[u8],
+    token_policy: TokenPolicy,
 ) -> Result<PreparedManagementRequest, InspectionError> {
+    if is_duplicate_rule_datagram(coap_datagram) {
+        return Err(InspectionError::UnexpectedResponse(
+            "duplicate-rule NON POST is one-way and is not prepared for response tracking".into(),
+        ));
+    }
+    let wire_datagram = apply_token_policy(coap_datagram, token_policy)?;
     let request = Ipv6UdpCoapPacket::new(
         CORE_LOGICAL_ADDRESS,
         DEVICE_LOGICAL_ADDRESS,
         MANAGEMENT_PORT,
         MANAGEMENT_PORT,
-        coap_datagram,
+        &wire_datagram,
     )
     .map_err(|error| InspectionError::Coap(error.to_string()))?;
     let encoded = link.encode(TrafficOrigin::Management, &request)?;
-    if encoded.report().traffic_class != crate::TrafficClass::ProtectedManagement
-        || is_duplicate_rule_datagram(coap_datagram)
-    {
+    if encoded.report().traffic_class != crate::TrafficClass::ProtectedManagement {
         return Err(InspectionError::UnexpectedResponse(format!(
             "management request selected unsupported protected RuleID {}/{}",
             encoded.report().rule_id.value(),
@@ -3880,18 +3000,19 @@ pub fn prepare_management_request(
     }
     let report = encoded.report().clone();
     let frame = encoded.into_frame();
+    let exchange_id = ExchangeId::from_message(request.coap_message())?;
     Ok(PreparedManagementRequest {
         frame,
         report,
-        request,
+        exchange_id,
     })
 }
 
 /// Validates one already decoded response against a prepared request.
 ///
 /// Validation requires protected-management route, the exact device-to-core
-/// logical orientation and management ports, and matching CoAP MID and token.
-/// No transport operation is performed.
+/// logical orientation and management ports, and a matching CoAP token with
+/// the message-type-specific MID rule. No transport operation is performed.
 ///
 /// # Errors
 ///
@@ -3918,16 +3039,31 @@ pub fn validate_management_response(
             "management response logical orientation is invalid".into(),
         ));
     }
-    let request_message = prepared.request.coap_message();
     let response_message = response.coap_message();
-    if request_message.message_id() != response_message.message_id()
-        || request_message.token() != response_message.token()
+    let code = response_message.code();
+    if !(2..=5).contains(&(code >> 5)) {
+        return Err(InspectionError::UnexpectedResponse(format!(
+            "management response has non-response CoAP code {code}"
+        )));
+    }
+    let response_exchange = ExchangeId::from_message(response_message)?;
+    let response_type = response.coap_message_type();
+    if !matches!(
+        response_type,
+        COAP_CONFIRMABLE | COAP_NON_CONFIRMABLE | COAP_ACKNOWLEDGEMENT
+    ) {
+        return Err(InspectionError::UnexpectedResponse(format!(
+            "management response has unsupported CoAP message type {response_type}"
+        )));
+    }
+    if !prepared
+        .exchange_id
+        .matches_response(&response_exchange, response_type)
     {
         return Err(InspectionError::Correlation(
             "CoAP message ID or token mismatch".into(),
         ));
     }
-    let code = response_message.code();
     Ok((
         code,
         ManagementExchange {
@@ -3936,63 +3072,6 @@ pub fn validate_management_response(
             response_report: decoded.report().clone(),
         },
     ))
-}
-
-/// Performs the protected management transport and returns the response code.
-///
-/// # Errors
-///
-/// Returns an error when SCHC rejects the packet, logical routing is invalid,
-/// or the response does not correlate.
-fn exchange_management_response(
-    link: &SchcLink,
-    raw_link: &RawUdpLink,
-    coap_datagram: &[u8],
-) -> Result<(u8, ManagementExchange), InspectionError> {
-    let prepared = prepare_management_request(link, coap_datagram)?;
-    raw_link.send_frame(prepared.frame())?;
-    let datagram = raw_link.recv()?;
-    let decoded = link.decode(datagram.bytes())?;
-    validate_management_response(&prepared, &decoded)
-}
-
-/// Performs one protected management exchange and requires 2.05 Content.
-///
-/// # Errors
-///
-/// Returns an error when SCHC rejects the packet, logical routing is invalid,
-/// the response does not correlate, or the response is not 2.05 Content.
-pub fn exchange_management(
-    link: &SchcLink,
-    raw_link: &RawUdpLink,
-    coap_datagram: &[u8],
-) -> Result<ManagementExchange, InspectionError> {
-    let (code, exchange) = exchange_management_response(link, raw_link, coap_datagram)?;
-    if code != 69 {
-        return Err(InspectionError::UnexpectedResponse(format!(
-            "expected CoAP 2.05 Content, got {code}"
-        )));
-    }
-    Ok(exchange)
-}
-
-/// Performs one protected management exchange and returns the validated CoAP
-/// response code for mutation callers.
-///
-/// Unlike [`exchange_management`], this accepts both successful and rejected
-/// device responses so the caller can distinguish a real 2.04 Changed
-/// acknowledgement from a device-side rejection.
-///
-/// # Errors
-///
-/// Returns an error when SCHC rejects the packet, logical routing is invalid,
-/// or the response does not correlate.
-pub fn exchange_management_update(
-    link: &SchcLink,
-    raw_link: &RawUdpLink,
-    coap_datagram: &[u8],
-) -> Result<(u8, ManagementExchange), InspectionError> {
-    exchange_management_response(link, raw_link, coap_datagram)
 }
 
 /// Formats summaries as stable scriptable lines.
@@ -4065,33 +3144,12 @@ fn invalid_target(message: impl Into<String>) -> InspectionError {
     InspectionError::InvalidTarget(message.into())
 }
 
-fn validate_update_model_shape(model: &CompositeModel) -> Result<(), InspectionError> {
-    for sid in [
-        SCHC_ROOT_SID,
-        RULE_LIST_SID,
-        RULE_ID_LENGTH_SID,
-        RULE_ID_VALUE_SID,
-        RULE_ENTRY_LIST_SID,
-        RULE_ENTRY_INDEX_SID,
-        FIELD_LENGTH_SID,
-        TARGET_VALUE_LIST_SID,
-        TARGET_VALUE_INDEX_SID,
-        TARGET_VALUE_VALUE_SID,
-    ] {
-        if model.get_identifier(sid).is_none() {
-            return Err(invalid_target(format!(
-                "SID model is missing identifier {sid}"
-            )));
-        }
-    }
-    require_list_keys(
-        model,
-        RULE_LIST_SID,
-        &[RULE_ID_VALUE_SID, RULE_ID_LENGTH_SID],
-    )?;
-    require_list_keys(model, RULE_ENTRY_LIST_SID, &[RULE_ENTRY_INDEX_SID])?;
-    require_list_keys(model, TARGET_VALUE_LIST_SID, &[TARGET_VALUE_INDEX_SID])?;
-    Ok(())
+fn validate_update_model_shape(model: &CompositeModel) -> Result<ModelSids, InspectionError> {
+    let sids = ModelSids::resolve(model)?;
+    require_list_keys(model, sids.rule, &[sids.rule_id_value, sids.rule_id_length])?;
+    require_list_keys(model, sids.entry, &[sids.entry_index])?;
+    require_list_keys(model, sids.target, &[sids.target_index])?;
+    Ok(sids)
 }
 
 fn require_list_keys(
@@ -4152,7 +3210,7 @@ fn serde_value_to_cbor(value: &Value) -> Result<CborValue, InspectionError> {
     }
 }
 
-fn binary_bytes(value: &Value) -> Result<Vec<u8>, InspectionError> {
+pub(crate) fn binary_bytes(value: &Value) -> Result<Vec<u8>, InspectionError> {
     let values = value
         .as_array()
         .ok_or_else(|| invalid_target("target-value/value is not a binary byte array"))?;
@@ -4190,7 +3248,7 @@ fn binary_fits_field_length(bytes: &[u8], field_length: u64) -> bool {
     bytes[whole_bytes] & (0xff_u8 << (8 - remaining_bits)) == 0
 }
 
-fn numeric_target_value(
+pub(crate) fn numeric_target_value(
     input: &str,
     current_bytes: &[u8],
     field_length: &Value,
@@ -4247,25 +3305,26 @@ fn numeric_target_value(
 }
 
 fn target_value_path(
+    sids: ModelSids,
     rule: RuleSelector,
     entry_index: usize,
     target_value_index: usize,
 ) -> Result<InstancePath, InspectionError> {
     let mut path = InstancePath::new();
     let mut previous_sid = 0;
-    push_sid(&mut path, &mut previous_sid, SCHC_ROOT_SID)?;
-    push_sid(&mut path, &mut previous_sid, RULE_LIST_SID)?;
+    push_sid(&mut path, &mut previous_sid, sids.root)?;
+    push_sid(&mut path, &mut previous_sid, sids.rule)?;
     path.push_key(json!(rule.value));
     path.push_key(json!(rule.bits));
-    push_sid(&mut path, &mut previous_sid, RULE_ENTRY_LIST_SID)?;
+    push_sid(&mut path, &mut previous_sid, sids.entry)?;
     path.push_key(json!(entry_index));
-    push_sid(&mut path, &mut previous_sid, TARGET_VALUE_LIST_SID)?;
+    push_sid(&mut path, &mut previous_sid, sids.target)?;
     path.push_key(json!(target_value_index));
-    push_sid(&mut path, &mut previous_sid, TARGET_VALUE_VALUE_SID)?;
+    push_sid(&mut path, &mut previous_sid, sids.target_value)?;
     Ok(path)
 }
 
-fn push_sid(
+pub(crate) fn push_sid(
     path: &mut InstancePath,
     previous_sid: &mut i64,
     sid: i64,
@@ -4290,7 +3349,7 @@ fn summaries_from_rules(rules: &[Rule]) -> Vec<RuleSummary> {
         .collect()
 }
 
-fn detail_from_rule(rule: &Rule) -> RuleDetail {
+pub(crate) fn detail_from_rule(rule: &Rule) -> RuleDetail {
     let mut entries = rule
         .fields()
         .iter()
@@ -4348,6 +3407,7 @@ fn length_name(length: &FieldLength) -> String {
         FieldLength::FixedBits(bits) => bits.to_string(),
         FieldLength::VariableBytes => "variable-bytes".into(),
         FieldLength::VariableBits => "variable-bits".into(),
+        FieldLength::Remaining => "remaining".into(),
         FieldLength::TokenLength => "token-length".into(),
         FieldLength::FromPreviousField { entry_index, unit } => format!(
             "from-entry-{entry_index}/{}",
@@ -4409,6 +3469,48 @@ fn cda_name(cda: Cda) -> String {
 mod tests {
     use super::*;
 
+    fn shifted_sid_json() -> String {
+        let mut document: Value = serde_json::from_str(include_str!(
+            "../../../fixtures/demo/ietf-schc@2026-09-22.sid"
+        ))
+        .expect("SID JSON");
+        let replacements = [
+            ("/ietf-schc:schc", 2815),
+            ("/ietf-schc:schc/rule", 2840),
+            ("/ietf-schc:duplicate-rule/input", 2918),
+            ("/ietf-schc:duplicate-rule/input/from", 2920),
+            ("/ietf-schc:duplicate-rule/input/from/rule-id-length", 2923),
+            ("/ietf-schc:duplicate-rule/input/from/rule-id-value", 2926),
+            ("/ietf-schc:duplicate-rule/input/ipatch-sequence", 2930),
+            ("/ietf-schc:duplicate-rule/input/to", 2934),
+            ("/ietf-schc:duplicate-rule/input/to/rule-id-length", 2937),
+            ("/ietf-schc:duplicate-rule/input/to/rule-id-value", 2940),
+        ];
+        let items = document
+            .get_mut("ietf-sid-file:sid-file")
+            .and_then(Value::as_object_mut)
+            .and_then(|sid| sid.get_mut("item"))
+            .and_then(Value::as_array_mut)
+            .expect("SID items");
+        for item in items {
+            let Some(identifier) = item.get("identifier").and_then(Value::as_str) else {
+                continue;
+            };
+            if let Some((_, sid)) = replacements.iter().find(|(path, _)| *path == identifier) {
+                item["sid"] = json!(*sid);
+            }
+        }
+        serde_json::to_string(&document).expect("shifted SID JSON")
+    }
+
+    fn map_value(entries: &[(CborValue, CborValue)], key: i64) -> &CborValue {
+        entries
+            .iter()
+            .find(|(candidate, _)| *candidate == CborValue::Integer(key.into()))
+            .map(|(_, value)| value)
+            .expect("CBOR map key")
+    }
+
     #[test]
     fn selector_parser_is_strict() {
         assert_eq!(
@@ -4427,6 +3529,139 @@ mod tests {
         assert_eq!(
             field_name(&FieldRef::CoapOption { number: 11 }),
             "coap-option(11)"
+        );
+    }
+
+    #[test]
+    fn duplicate_rpc_encoder_uses_model_relative_sids() {
+        let sid_json = shifted_sid_json();
+        let model = CoreconfModel::from_sid_str(&sid_json).expect("shifted model");
+        let request = RuleDuplicateRequest {
+            source: RuleSelector::new(20, 8).expect("source"),
+            destination: RuleSelector::new(22, 8).expect("destination"),
+            overrides: Vec::new(),
+        };
+        let payload = duplicate::encode_duplicate_rpc_payload(&model, &request, &[])
+            .expect("duplicate payload");
+        let CborValue::Map(root) =
+            ciborium::de::from_reader(std::io::Cursor::new(payload)).expect("CBOR")
+        else {
+            panic!("RPC root is not a map");
+        };
+        let CborValue::Map(operation) = map_value(&root, 2906) else {
+            panic!("RPC operation is not a map");
+        };
+        let CborValue::Map(input) = map_value(operation, 12) else {
+            panic!("RPC input is not a map");
+        };
+        let CborValue::Map(from) = map_value(input, 2) else {
+            panic!("RPC from is not a map");
+        };
+        let CborValue::Map(to) = map_value(input, 16) else {
+            panic!("RPC to is not a map");
+        };
+        let _ = map_value(from, 3);
+        let _ = map_value(from, 6);
+        let _ = map_value(to, 3);
+        let _ = map_value(to, 6);
+    }
+
+    #[test]
+    fn model_aware_rule_fetch_builders_use_shifted_sids() {
+        let sid_json = shifted_sid_json();
+        let list = Packet::from_bytes(&rule_list_request(&sid_json, 1).expect("rule list request"))
+            .expect("rule list packet");
+        assert_eq!(
+            InstancePath::decode_cbor(&list.payload)
+                .expect("rule list path")
+                .components(),
+            vec![PathComponent::SidDelta(2815)]
+        );
+
+        let get = Packet::from_bytes(
+            &rule_get_request(&sid_json, RuleSelector::new(20, 8).expect("selector"), 2)
+                .expect("rule get request"),
+        )
+        .expect("rule get packet");
+        assert_eq!(
+            InstancePath::decode_cbor(&get.payload)
+                .expect("rule get path")
+                .components(),
+            vec![
+                PathComponent::SidDelta(2815),
+                PathComponent::SidDelta(25),
+                PathComponent::SidDelta(20),
+                PathComponent::SidDelta(8),
+            ]
+        );
+    }
+
+    #[test]
+    fn token_policy_keeps_the_current_profile_empty_and_generates_valid_tokens() {
+        let empty = TokenPolicy::Empty.token();
+        assert!(empty.is_empty());
+
+        let first = TokenPolicy::Generated.token();
+        let second = TokenPolicy::Generated.token();
+        assert_eq!(first.as_bytes().len(), 8);
+        assert_eq!(second.as_bytes().len(), 8);
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn exchange_id_round_trips_a_supported_nonempty_token() {
+        let message = crate::CoapMessage::from_parts(
+            1,
+            COAP_CONFIRMABLE,
+            1,
+            0x1234,
+            vec![1, 2, 3, 4, 5, 6, 7, 8],
+            Vec::new(),
+            b"payload".to_vec(),
+        )
+        .expect("CoAP message");
+        let exchange = ExchangeId::from_message(&message).expect("exchange ID");
+        assert_eq!(exchange.message_id(), 0x1234);
+        assert_eq!(exchange.token().as_bytes(), &[1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(
+            exchange,
+            ExchangeId::new(0x1234, exchange.token().as_bytes()).expect("same exchange ID")
+        );
+    }
+
+    #[test]
+    fn exchange_id_rejects_wrong_tokens_and_applies_coap_mid_rules() {
+        assert!(matches!(
+            ExchangeId::new(0, [0; 9]),
+            Err(InspectionError::InvalidToken(_))
+        ));
+        let request = ExchangeId::new(7, [0xa1, 0xb2]).expect("request exchange ID");
+        let same = ExchangeId::new(7, [0xa1, 0xb2]).expect("same exchange ID");
+        let separate = ExchangeId::new(8, [0xa1, 0xb2]).expect("separate exchange ID");
+        let wrong_token = ExchangeId::new(7, [0xa1, 0xc3]).expect("wrong-token exchange ID");
+
+        assert!(request.matches_response(&same, COAP_ACKNOWLEDGEMENT));
+        assert!(!request.matches_response(&separate, COAP_ACKNOWLEDGEMENT));
+        assert!(request.matches_response(&separate, COAP_CONFIRMABLE));
+        assert!(request.matches_response(&separate, COAP_NON_CONFIRMABLE));
+        assert!(!request.matches_response(&wrong_token, COAP_CONFIRMABLE));
+        assert!(!request.matches_response(&same, 3));
+    }
+
+    #[test]
+    fn apply_token_policy_rewrites_the_coap_boundary_without_changing_request_shape() {
+        let request = base_request(RequestType::Fetch, 19)
+            .to_bytes()
+            .expect("request");
+        let rewritten = apply_token_policy(&request, TokenPolicy::Generated).expect("rewrite");
+        let packet = Packet::from_bytes(&rewritten).expect("rewritten packet");
+        assert_eq!(packet.header.message_id, 19);
+        assert_eq!(packet.get_token().len(), 8);
+        assert_eq!(
+            packet
+                .get_option(CoapOption::UriPath)
+                .and_then(|paths| paths.front()),
+            Some(&b"schc".to_vec())
         );
     }
 }

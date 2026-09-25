@@ -197,8 +197,8 @@ impl GenericDataService {
 
 /// A normal CoAP UDP client for a device-owned CORECONF datastore.
 ///
-/// rustconf owns discovery, root GET, root FETCH, and mutation packet
-/// construction through its public [`CoreconfClient`] implementation.
+/// rustconf owns discovery, root FETCH, and mutation packet construction
+/// through its public [`CoreconfClient`] implementation.
 pub struct DataClient {
     client: CoapLiteClient,
     endpoint: SocketAddr,
@@ -276,29 +276,8 @@ impl DataClient {
     /// # Errors
     ///
     /// Returns an error for transport, malformed CoAP, or non-success status.
-    pub fn discover(&mut self, query: Option<&str>) -> Result<String, ApplicationError> {
-        self.client
-            .discover(Some(query.unwrap_or("d=0")))
-            .map_err(ApplicationError::from)
-    }
-
-    /// Performs a root CoAP GET, validates the complete snapshot locally, and
-    /// selects one value from the requested path.
-    ///
-    /// A missing selected path is represented as `Ok(None)`.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error for transport, decoding, model validation, or another
-    /// response status.
-    pub fn get(&mut self, path: &str) -> Result<Option<Value>, ApplicationError> {
-        let path = canonical_path(path);
-        let snapshot = self
-            .client
-            .fetch_snapshot()
-            .map_err(ApplicationError::from)?;
-        let datastore = Datastore::from_json_with_model(self.model.clone(), &snapshot.to_string())?;
-        datastore.get_path(&path).map_err(ApplicationError::from)
+    pub fn discover(&mut self) -> Result<String, ApplicationError> {
+        self.client.discover(None).map_err(ApplicationError::from)
     }
 
     /// Performs a root CoAP FETCH using the public rustconf client and decodes
@@ -343,21 +322,12 @@ impl DataClient {
             .apply_patch(&[(path, None)])
             .map_err(ApplicationError::from)
     }
-
-    /// Performs a full remote GET and returns the refreshed snapshot.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error for transport, decoding, or a non-success response.
-    pub fn reload(&mut self) -> Result<Value, ApplicationError> {
-        self.client.fetch_snapshot().map_err(ApplicationError::from)
-    }
 }
 
 /// Returns sorted, human-readable schema entries from every SID file in a
 /// composed model.
 #[must_use]
-pub fn schema_lines(model: &CompositeModel, filter: Option<&str>) -> Vec<String> {
+pub(crate) fn schema_lines(model: &CompositeModel, filter: Option<&str>) -> Vec<String> {
     let mut entries: Vec<(String, i64)> = model
         .sids
         .iter()
@@ -674,7 +644,7 @@ mod tests {
         let mut client = DataClient::connect_bound(model, local_address, server_address, "c")
             .expect("bound client");
         assert_eq!(
-            client.get("/demo-data:config/count").expect("GET"),
+            client.fetch("/demo-data:config/count").expect("FETCH"),
             Some(Value::from(7))
         );
         assert_eq!(peer_receiver.recv().expect("peer"), local_address);
@@ -710,7 +680,7 @@ mod tests {
         let mut client = DataClient::connect(model, &endpoints[..], "c").expect("client");
         assert_eq!(client.endpoint(), server_address);
         assert_eq!(
-            client.get("/demo-data:config/count").expect("GET"),
+            client.fetch("/demo-data:config/count").expect("FETCH"),
             Some(Value::from(7))
         );
         server.join().expect("server");
@@ -753,7 +723,7 @@ mod tests {
             DataClient::connect_bound(model, local_address, &endpoints[..], "c").expect("client");
         assert_eq!(client.endpoint(), server_address);
         assert_eq!(
-            client.get("/demo-data:config/count").expect("GET"),
+            client.fetch("/demo-data:config/count").expect("FETCH"),
             Some(Value::from(7))
         );
         assert_eq!(peer_receiver.recv().expect("peer"), local_address);
@@ -774,7 +744,7 @@ mod tests {
                 GenericDataService::from_sid_contents(&[SID], DATA, "c").expect("service");
             let mut methods = Vec::new();
             let mut buffer = vec![0_u8; 65_535];
-            for _ in 0..8 {
+            for _ in 0..6 {
                 let (length, peer) = server_socket.recv_from(&mut buffer).expect("request");
                 let packet = Packet::from_bytes(&buffer[..length]).expect("request packet");
                 if let MessageClass::Request(method) = packet.header.code {
@@ -790,14 +760,7 @@ mod tests {
 
         let sid_contents = CompositeModel::from_sid_strings(&[SID]).expect("model");
         let mut client = DataClient::connect(sid_contents, server_address, "c").expect("client");
-        assert!(client
-            .discover(Some("d=0"))
-            .expect("discovery")
-            .contains("core.c.ds"));
-        assert_eq!(
-            client.get("/demo-data:config/count").expect("GET"),
-            Some(Value::from(7))
-        );
+        assert!(client.discover().expect("discovery").contains("core.c.ds"));
         assert_eq!(
             client.fetch("/demo-data:config/count").expect("FETCH"),
             Some(Value::from(7))
@@ -813,25 +776,22 @@ mod tests {
         );
         client.delete("/demo-data:config/name").expect("DELETE");
         assert_eq!(
-            client.get("/demo-data:config/name").expect("deleted GET"),
+            client
+                .fetch("/demo-data:config/name")
+                .expect("deleted FETCH"),
             None
         );
-        let snapshot = client.reload().expect("reload");
-        assert_eq!(snapshot["demo-data:config"]["count"], Value::from(30));
-        assert!(snapshot["demo-data:config"].get("name").is_none());
         server.join().expect("server");
 
         assert_eq!(
             methods_receiver.recv().expect("methods"),
             vec![
                 RequestType::Get,
-                RequestType::Get,
                 RequestType::Fetch,
                 RequestType::IPatch,
                 RequestType::Fetch,
                 RequestType::IPatch,
-                RequestType::Get,
-                RequestType::Get,
+                RequestType::Fetch,
             ]
         );
     }

@@ -1,12 +1,4 @@
 {
-  "protected_rule_ids": [
-    {"value": 28, "length": 5},
-    {"value": 29, "length": 5},
-    {"value": 60, "length": 6},
-    {"value": 61, "length": 6},
-    {"value": 62, "length": 6},
-    {"value": 63, "length": 6}
-  ],
   "dynamic_rule_ids": {
     "prefix": {"value": 0, "length": 1},
     "allowed_lengths": [4]

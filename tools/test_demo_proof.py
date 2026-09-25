@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+from pathlib import Path
+import subprocess
 import unittest
 
 from demo_proof import derive_proof, parse_reports
@@ -32,11 +34,22 @@ def valid_logs(before_bits=149, after_bits=101, after_padded=13):
         + "OK duplicate  local=installed  response=none\n"
     )
     server = "RX APP   73 B\nRX APP   73 B\n"
-    client = "7\n42\nnot found\nOK set\nOK delete\nOK reload\n"
+    client = "7\n42\nnot found\nOK set\nOK delete\n"
     return core, device, server, client
 
 
 class DemoProofTests(unittest.TestCase):
+    def test_retired_interactive_option_is_rejected(self):
+        script = Path(__file__).with_name("run_demo.sh")
+        result = subprocess.run(
+            ["bash", str(script), "--interactive"],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("unknown argument --interactive", result.stderr)
+
     def test_parse_reports_keeps_direction_sizes_code_and_mid(self):
         reports = parse_reports(report("TX", "APP", "25/8", 73, 19, 149, 5))
         self.assertEqual(len(reports), 1)

@@ -1,0 +1,1655 @@
+{
+  "Context": {
+    "GuardPeriod": {
+      "TicksDuration": 20,
+      "TicksNumbers": 10
+    }
+  },
+  "SoR": [
+    {
+      "RuleID": 28,
+      "RuleIDLength": 5,
+      "RuleNature": "Management",
+      "Compression": [
+        {
+          "FID": "IPV6.VER",
+          "FL": 4,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "equal",
+          "CDA": "not-sent",
+          "EntryIndex": 0,
+          "TV": 6
+        },
+        {
+          "FID": "IPV6.TC",
+          "FL": 8,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "equal",
+          "CDA": "not-sent",
+          "EntryIndex": 1,
+          "TV": 0
+        },
+        {
+          "FID": "IPV6.FL",
+          "FL": 20,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "equal",
+          "CDA": "not-sent",
+          "EntryIndex": 2,
+          "TV": 0
+        },
+        {
+          "FID": "IPV6.LEN",
+          "FL": 16,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "ignore",
+          "CDA": "compute-length",
+          "EntryIndex": 3
+        },
+        {
+          "FID": "IPV6.NXT",
+          "FL": 8,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "equal",
+          "CDA": "not-sent",
+          "EntryIndex": 4,
+          "TV": 17
+        },
+        {
+          "FID": "IPV6.HOP_LMT",
+          "FL": 8,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "equal",
+          "CDA": "not-sent",
+          "EntryIndex": 5,
+          "TV": 64
+        },
+        {
+          "FID": "IPV6.DEV_PREFIX",
+          "FL": 64,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "equal",
+          "CDA": "not-sent",
+          "EntryIndex": 6,
+          "TV": "2001:db8::/64"
+        },
+        {
+          "FID": "IPV6.DEV_IID",
+          "FL": 64,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "equal",
+          "CDA": "not-sent",
+          "EntryIndex": 7,
+          "TV": "::1"
+        },
+        {
+          "FID": "IPV6.APP_PREFIX",
+          "FL": 64,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "equal",
+          "CDA": "not-sent",
+          "EntryIndex": 8,
+          "TV": "2001:db8::/64"
+        },
+        {
+          "FID": "IPV6.APP_IID",
+          "FL": 64,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "equal",
+          "CDA": "not-sent",
+          "EntryIndex": 9,
+          "TV": "::2"
+        },
+        {
+          "FID": "UDP.DEV_PORT",
+          "FL": 16,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "equal",
+          "CDA": "not-sent",
+          "EntryIndex": 10,
+          "TV": 8724
+        },
+        {
+          "FID": "UDP.APP_PORT",
+          "FL": 16,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "equal",
+          "CDA": "not-sent",
+          "EntryIndex": 11,
+          "TV": 8724
+        },
+        {
+          "FID": "UDP.LEN",
+          "FL": 16,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "ignore",
+          "CDA": "compute-length",
+          "EntryIndex": 12
+        },
+        {
+          "FID": "UDP.CKSUM",
+          "FL": 16,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "ignore",
+          "CDA": "compute-checksum",
+          "EntryIndex": 13
+        },
+        {
+          "FID": "COAP.VER",
+          "FL": 2,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "equal",
+          "CDA": "not-sent",
+          "EntryIndex": 14,
+          "TV": 1
+        },
+        {
+          "FID": "COAP.TYPE",
+          "FL": 2,
+          "FP": 1,
+          "DI": "DW",
+          "MO": "equal",
+          "CDA": "not-sent",
+          "EntryIndex": 15,
+          "TV": 0
+        },
+        {
+          "FID": "COAP.TKL",
+          "FL": 4,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "equal",
+          "CDA": "not-sent",
+          "EntryIndex": 16,
+          "TV": 0
+        },
+        {
+          "FID": "COAP.CODE",
+          "FL": 8,
+          "FP": 1,
+          "DI": "DW",
+          "MO": "equal",
+          "CDA": "not-sent",
+          "EntryIndex": 17,
+          "TV": 5
+        },
+        {
+          "FID": "COAP.MID",
+          "FL": 16,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "msb",
+          "CDA": "lsb",
+          "EntryIndex": 18,
+          "MO.VAL": 9,
+          "TV": 0
+        },
+        {
+          "FID": "COAP.OPTION(11)",
+          "FL": 32,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "equal",
+          "CDA": "not-sent",
+          "EntryIndex": 19,
+          "TV": "schc"
+        },
+        {
+          "FID": "PAYLOAD",
+          "FL": "fl-remaining",
+          "FP": 1,
+          "DI": "BI",
+          "MO": "ignore",
+          "CDA": "value-sent",
+          "EntryIndex": 20,
+          "TV": ""
+        }
+      ]
+    },
+    {
+      "RuleID": 29,
+      "RuleIDLength": 5,
+      "RuleNature": "Management",
+      "Compression": [
+        {
+          "FID": "IPV6.VER",
+          "FL": 4,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "equal",
+          "CDA": "not-sent",
+          "EntryIndex": 0,
+          "TV": 6
+        },
+        {
+          "FID": "IPV6.TC",
+          "FL": 8,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "equal",
+          "CDA": "not-sent",
+          "EntryIndex": 1,
+          "TV": 0
+        },
+        {
+          "FID": "IPV6.FL",
+          "FL": 20,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "equal",
+          "CDA": "not-sent",
+          "EntryIndex": 2,
+          "TV": 0
+        },
+        {
+          "FID": "IPV6.LEN",
+          "FL": 16,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "ignore",
+          "CDA": "compute-length",
+          "EntryIndex": 3
+        },
+        {
+          "FID": "IPV6.NXT",
+          "FL": 8,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "equal",
+          "CDA": "not-sent",
+          "EntryIndex": 4,
+          "TV": 17
+        },
+        {
+          "FID": "IPV6.HOP_LMT",
+          "FL": 8,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "equal",
+          "CDA": "not-sent",
+          "EntryIndex": 5,
+          "TV": 64
+        },
+        {
+          "FID": "IPV6.DEV_PREFIX",
+          "FL": 64,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "equal",
+          "CDA": "not-sent",
+          "EntryIndex": 6,
+          "TV": "2001:db8::/64"
+        },
+        {
+          "FID": "IPV6.DEV_IID",
+          "FL": 64,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "equal",
+          "CDA": "not-sent",
+          "EntryIndex": 7,
+          "TV": "::1"
+        },
+        {
+          "FID": "IPV6.APP_PREFIX",
+          "FL": 64,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "equal",
+          "CDA": "not-sent",
+          "EntryIndex": 8,
+          "TV": "2001:db8::/64"
+        },
+        {
+          "FID": "IPV6.APP_IID",
+          "FL": 64,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "equal",
+          "CDA": "not-sent",
+          "EntryIndex": 9,
+          "TV": "::2"
+        },
+        {
+          "FID": "UDP.DEV_PORT",
+          "FL": 16,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "equal",
+          "CDA": "not-sent",
+          "EntryIndex": 10,
+          "TV": 8724
+        },
+        {
+          "FID": "UDP.APP_PORT",
+          "FL": 16,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "equal",
+          "CDA": "not-sent",
+          "EntryIndex": 11,
+          "TV": 8724
+        },
+        {
+          "FID": "UDP.LEN",
+          "FL": 16,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "ignore",
+          "CDA": "compute-length",
+          "EntryIndex": 12
+        },
+        {
+          "FID": "UDP.CKSUM",
+          "FL": 16,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "ignore",
+          "CDA": "compute-checksum",
+          "EntryIndex": 13
+        },
+        {
+          "FID": "COAP.VER",
+          "FL": 2,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "equal",
+          "CDA": "not-sent",
+          "EntryIndex": 14,
+          "TV": 1
+        },
+        {
+          "FID": "COAP.TYPE",
+          "FL": 2,
+          "FP": 1,
+          "DI": "UP",
+          "MO": "equal",
+          "CDA": "not-sent",
+          "EntryIndex": 15,
+          "TV": 2
+        },
+        {
+          "FID": "COAP.TKL",
+          "FL": 4,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "equal",
+          "CDA": "not-sent",
+          "EntryIndex": 16,
+          "TV": 0
+        },
+        {
+          "FID": "COAP.CODE",
+          "FL": 8,
+          "FP": 1,
+          "DI": "UP",
+          "MO": "match-mapping",
+          "CDA": "mapping-sent",
+          "EntryIndex": 17,
+          "TV": [
+            65,
+            66,
+            68,
+            69,
+            128,
+            129,
+            130,
+            132,
+            133,
+            136,
+            137,
+            140,
+            141,
+            143,
+            160
+          ]
+        },
+        {
+          "FID": "COAP.MID",
+          "FL": 16,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "msb",
+          "CDA": "lsb",
+          "EntryIndex": 18,
+          "MO.VAL": 9,
+          "TV": 0
+        },
+        {
+          "FID": "PAYLOAD",
+          "FL": "fl-remaining",
+          "FP": 1,
+          "DI": "BI",
+          "MO": "ignore",
+          "CDA": "value-sent",
+          "EntryIndex": 19,
+          "TV": ""
+        }
+      ]
+    },
+    {
+      "RuleID": 2,
+      "RuleIDLength": 2,
+      "Compression": [
+        {
+          "FID": "IPV6.VER",
+          "FL": 4,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "equal",
+          "CDA": "not-sent",
+          "EntryIndex": 0,
+          "TV": 6
+        },
+        {
+          "FID": "IPV6.TC",
+          "FL": 8,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "equal",
+          "CDA": "not-sent",
+          "EntryIndex": 1,
+          "TV": 0
+        },
+        {
+          "FID": "IPV6.FL",
+          "FL": 20,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "equal",
+          "CDA": "not-sent",
+          "EntryIndex": 2,
+          "TV": 1
+        },
+        {
+          "FID": "IPV6.LEN",
+          "FL": 16,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "ignore",
+          "CDA": "compute-length",
+          "EntryIndex": 3
+        },
+        {
+          "FID": "IPV6.NXT",
+          "FL": 8,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "equal",
+          "CDA": "not-sent",
+          "EntryIndex": 4,
+          "TV": 17
+        },
+        {
+          "FID": "IPV6.HOP_LMT",
+          "FL": 8,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "match-mapping",
+          "CDA": "mapping-sent",
+          "EntryIndex": 5,
+          "TV": [
+            63,
+            64
+          ]
+        },
+        {
+          "FID": "IPV6.DEV_PREFIX",
+          "FL": 64,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "equal",
+          "CDA": "not-sent",
+          "EntryIndex": 6,
+          "TV": "2001:db8::/64"
+        },
+        {
+          "FID": "IPV6.DEV_IID",
+          "FL": 64,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "equal",
+          "CDA": "not-sent",
+          "EntryIndex": 7,
+          "TV": "::9"
+        },
+        {
+          "FID": "IPV6.APP_PREFIX",
+          "FL": 64,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "equal",
+          "CDA": "not-sent",
+          "EntryIndex": 8,
+          "TV": "2001:db8::/64"
+        },
+        {
+          "FID": "IPV6.APP_IID",
+          "FL": 64,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "equal",
+          "CDA": "not-sent",
+          "EntryIndex": 9,
+          "TV": "::9"
+        },
+        {
+          "FID": "UDP.DEV_PORT",
+          "FL": 16,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "equal",
+          "CDA": "not-sent",
+          "EntryIndex": 10,
+          "TV": 5684
+        },
+        {
+          "FID": "UDP.APP_PORT",
+          "FL": 16,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "equal",
+          "CDA": "not-sent",
+          "EntryIndex": 11,
+          "TV": 5684
+        },
+        {
+          "FID": "UDP.LEN",
+          "FL": 16,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "ignore",
+          "CDA": "compute-length",
+          "EntryIndex": 12
+        },
+        {
+          "FID": "UDP.CKSUM",
+          "FL": 16,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "ignore",
+          "CDA": "compute-checksum",
+          "EntryIndex": 13
+        },
+        {
+          "FID": "PAYLOAD",
+          "FL": "fl-remaining",
+          "FP": 1,
+          "DI": "BI",
+          "MO": "ignore",
+          "CDA": "value-sent",
+          "EntryIndex": 14,
+          "TV": ""
+        }
+      ]
+    },
+    {
+      "RuleID": 6,
+      "RuleIDLength": 3,
+      "Compression": [
+        {
+          "FID": "IPV6.VER",
+          "FL": 4,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "equal",
+          "CDA": "not-sent",
+          "EntryIndex": 0,
+          "TV": 6
+        },
+        {
+          "FID": "IPV6.TC",
+          "FL": 8,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "ignore",
+          "CDA": "value-sent",
+          "EntryIndex": 1
+        },
+        {
+          "FID": "IPV6.FL",
+          "FL": 20,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "ignore",
+          "CDA": "value-sent",
+          "EntryIndex": 2
+        },
+        {
+          "FID": "IPV6.LEN",
+          "FL": 16,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "ignore",
+          "CDA": "compute-length",
+          "EntryIndex": 3
+        },
+        {
+          "FID": "IPV6.NXT",
+          "FL": 8,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "equal",
+          "CDA": "not-sent",
+          "EntryIndex": 4,
+          "TV": 17
+        },
+        {
+          "FID": "IPV6.HOP_LMT",
+          "FL": 8,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "ignore",
+          "CDA": "value-sent",
+          "EntryIndex": 5
+        },
+        {
+          "FID": "IPV6.DEV_PREFIX",
+          "FL": 64,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "ignore",
+          "CDA": "value-sent",
+          "EntryIndex": 6
+        },
+        {
+          "FID": "IPV6.DEV_IID",
+          "FL": 64,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "ignore",
+          "CDA": "value-sent",
+          "EntryIndex": 7
+        },
+        {
+          "FID": "IPV6.APP_PREFIX",
+          "FL": 64,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "ignore",
+          "CDA": "value-sent",
+          "EntryIndex": 8
+        },
+        {
+          "FID": "IPV6.APP_IID",
+          "FL": 64,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "ignore",
+          "CDA": "value-sent",
+          "EntryIndex": 9
+        },
+        {
+          "FID": "UDP.DEV_PORT",
+          "FL": 16,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "ignore",
+          "CDA": "value-sent",
+          "EntryIndex": 10
+        },
+        {
+          "FID": "UDP.APP_PORT",
+          "FL": 16,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "ignore",
+          "CDA": "value-sent",
+          "EntryIndex": 11
+        },
+        {
+          "FID": "UDP.LEN",
+          "FL": 16,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "ignore",
+          "CDA": "compute-length",
+          "EntryIndex": 12
+        },
+        {
+          "FID": "UDP.CKSUM",
+          "FL": 16,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "ignore",
+          "CDA": "compute-checksum",
+          "EntryIndex": 13
+        },
+        {
+          "FID": "PAYLOAD",
+          "FL": "fl-remaining",
+          "FP": 1,
+          "DI": "BI",
+          "MO": "ignore",
+          "CDA": "value-sent",
+          "EntryIndex": 14,
+          "TV": ""
+        }
+      ]
+    },
+    {
+      "RuleID": 60,
+      "RuleIDLength": 6,
+      "RuleNature": "Management",
+      "Compression": [
+        {
+          "FID": "IPV6.VER",
+          "FL": 4,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "equal",
+          "CDA": "not-sent",
+          "EntryIndex": 0,
+          "TV": 6
+        },
+        {
+          "FID": "IPV6.TC",
+          "FL": 8,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "equal",
+          "CDA": "not-sent",
+          "EntryIndex": 1,
+          "TV": 0
+        },
+        {
+          "FID": "IPV6.FL",
+          "FL": 20,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "equal",
+          "CDA": "not-sent",
+          "EntryIndex": 2,
+          "TV": 0
+        },
+        {
+          "FID": "IPV6.LEN",
+          "FL": 16,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "ignore",
+          "CDA": "compute-length",
+          "EntryIndex": 3
+        },
+        {
+          "FID": "IPV6.NXT",
+          "FL": 8,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "equal",
+          "CDA": "not-sent",
+          "EntryIndex": 4,
+          "TV": 17
+        },
+        {
+          "FID": "IPV6.HOP_LMT",
+          "FL": 8,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "equal",
+          "CDA": "not-sent",
+          "EntryIndex": 5,
+          "TV": 64
+        },
+        {
+          "FID": "IPV6.DEV_PREFIX",
+          "FL": 64,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "equal",
+          "CDA": "not-sent",
+          "EntryIndex": 6,
+          "TV": "2001:db8::/64"
+        },
+        {
+          "FID": "IPV6.DEV_IID",
+          "FL": 64,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "equal",
+          "CDA": "not-sent",
+          "EntryIndex": 7,
+          "TV": "::1"
+        },
+        {
+          "FID": "IPV6.APP_PREFIX",
+          "FL": 64,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "equal",
+          "CDA": "not-sent",
+          "EntryIndex": 8,
+          "TV": "2001:db8::/64"
+        },
+        {
+          "FID": "IPV6.APP_IID",
+          "FL": 64,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "equal",
+          "CDA": "not-sent",
+          "EntryIndex": 9,
+          "TV": "::2"
+        },
+        {
+          "FID": "UDP.DEV_PORT",
+          "FL": 16,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "equal",
+          "CDA": "not-sent",
+          "EntryIndex": 10,
+          "TV": 8724
+        },
+        {
+          "FID": "UDP.APP_PORT",
+          "FL": 16,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "equal",
+          "CDA": "not-sent",
+          "EntryIndex": 11,
+          "TV": 8724
+        },
+        {
+          "FID": "UDP.LEN",
+          "FL": 16,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "ignore",
+          "CDA": "compute-length",
+          "EntryIndex": 12
+        },
+        {
+          "FID": "UDP.CKSUM",
+          "FL": 16,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "ignore",
+          "CDA": "compute-checksum",
+          "EntryIndex": 13
+        },
+        {
+          "FID": "COAP.VER",
+          "FL": 2,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "equal",
+          "CDA": "not-sent",
+          "EntryIndex": 14,
+          "TV": 1
+        },
+        {
+          "FID": "COAP.TYPE",
+          "FL": 2,
+          "FP": 1,
+          "DI": "DW",
+          "MO": "equal",
+          "CDA": "not-sent",
+          "EntryIndex": 15,
+          "TV": 0
+        },
+        {
+          "FID": "COAP.TKL",
+          "FL": 4,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "equal",
+          "CDA": "not-sent",
+          "EntryIndex": 16,
+          "TV": 0
+        },
+        {
+          "FID": "COAP.CODE",
+          "FL": 8,
+          "FP": 1,
+          "DI": "DW",
+          "MO": "equal",
+          "CDA": "not-sent",
+          "EntryIndex": 17,
+          "TV": 5
+        },
+        {
+          "FID": "COAP.MID",
+          "FL": 16,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "msb",
+          "CDA": "lsb",
+          "EntryIndex": 18,
+          "MO.VAL": 9,
+          "TV": 0
+        },
+        {
+          "FID": "COAP.OPTION(11)",
+          "FL": 32,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "equal",
+          "CDA": "not-sent",
+          "EntryIndex": 19,
+          "TV": "schc"
+        },
+        {
+          "FID": "COAP.OPTION(12)",
+          "FL": 8,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "equal",
+          "CDA": "not-sent",
+          "EntryIndex": 20,
+          "TV": 141
+        },
+        {
+          "FID": "PAYLOAD",
+          "FL": "fl-remaining",
+          "FP": 1,
+          "DI": "BI",
+          "MO": "ignore",
+          "CDA": "value-sent",
+          "EntryIndex": 21,
+          "TV": ""
+        }
+      ]
+    },
+    {
+      "RuleID": 61,
+      "RuleIDLength": 6,
+      "RuleNature": "Management",
+      "Compression": [
+        {
+          "FID": "IPV6.VER",
+          "FL": 4,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "equal",
+          "CDA": "not-sent",
+          "EntryIndex": 0,
+          "TV": 6
+        },
+        {
+          "FID": "IPV6.TC",
+          "FL": 8,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "equal",
+          "CDA": "not-sent",
+          "EntryIndex": 1,
+          "TV": 0
+        },
+        {
+          "FID": "IPV6.FL",
+          "FL": 20,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "equal",
+          "CDA": "not-sent",
+          "EntryIndex": 2,
+          "TV": 0
+        },
+        {
+          "FID": "IPV6.LEN",
+          "FL": 16,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "ignore",
+          "CDA": "compute-length",
+          "EntryIndex": 3
+        },
+        {
+          "FID": "IPV6.NXT",
+          "FL": 8,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "equal",
+          "CDA": "not-sent",
+          "EntryIndex": 4,
+          "TV": 17
+        },
+        {
+          "FID": "IPV6.HOP_LMT",
+          "FL": 8,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "equal",
+          "CDA": "not-sent",
+          "EntryIndex": 5,
+          "TV": 64
+        },
+        {
+          "FID": "IPV6.DEV_PREFIX",
+          "FL": 64,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "equal",
+          "CDA": "not-sent",
+          "EntryIndex": 6,
+          "TV": "2001:db8::/64"
+        },
+        {
+          "FID": "IPV6.DEV_IID",
+          "FL": 64,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "equal",
+          "CDA": "not-sent",
+          "EntryIndex": 7,
+          "TV": "::1"
+        },
+        {
+          "FID": "IPV6.APP_PREFIX",
+          "FL": 64,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "equal",
+          "CDA": "not-sent",
+          "EntryIndex": 8,
+          "TV": "2001:db8::/64"
+        },
+        {
+          "FID": "IPV6.APP_IID",
+          "FL": 64,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "equal",
+          "CDA": "not-sent",
+          "EntryIndex": 9,
+          "TV": "::2"
+        },
+        {
+          "FID": "UDP.DEV_PORT",
+          "FL": 16,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "equal",
+          "CDA": "not-sent",
+          "EntryIndex": 10,
+          "TV": 8724
+        },
+        {
+          "FID": "UDP.APP_PORT",
+          "FL": 16,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "equal",
+          "CDA": "not-sent",
+          "EntryIndex": 11,
+          "TV": 8724
+        },
+        {
+          "FID": "UDP.LEN",
+          "FL": 16,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "ignore",
+          "CDA": "compute-length",
+          "EntryIndex": 12
+        },
+        {
+          "FID": "UDP.CKSUM",
+          "FL": 16,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "ignore",
+          "CDA": "compute-checksum",
+          "EntryIndex": 13
+        },
+        {
+          "FID": "COAP.VER",
+          "FL": 2,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "equal",
+          "CDA": "not-sent",
+          "EntryIndex": 14,
+          "TV": 1
+        },
+        {
+          "FID": "COAP.TYPE",
+          "FL": 2,
+          "FP": 1,
+          "DI": "DW",
+          "MO": "equal",
+          "CDA": "not-sent",
+          "EntryIndex": 15,
+          "TV": 0
+        },
+        {
+          "FID": "COAP.TKL",
+          "FL": 4,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "equal",
+          "CDA": "not-sent",
+          "EntryIndex": 16,
+          "TV": 0
+        },
+        {
+          "FID": "COAP.CODE",
+          "FL": 8,
+          "FP": 1,
+          "DI": "DW",
+          "MO": "equal",
+          "CDA": "not-sent",
+          "EntryIndex": 17,
+          "TV": 7
+        },
+        {
+          "FID": "COAP.MID",
+          "FL": 16,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "msb",
+          "CDA": "lsb",
+          "EntryIndex": 18,
+          "MO.VAL": 9,
+          "TV": 0
+        },
+        {
+          "FID": "COAP.OPTION(11)",
+          "FL": 32,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "equal",
+          "CDA": "not-sent",
+          "EntryIndex": 19,
+          "TV": "schc"
+        },
+        {
+          "FID": "COAP.OPTION(12)",
+          "FL": 8,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "equal",
+          "CDA": "not-sent",
+          "EntryIndex": 20,
+          "TV": 142
+        },
+        {
+          "FID": "PAYLOAD",
+          "FL": "fl-remaining",
+          "FP": 1,
+          "DI": "BI",
+          "MO": "ignore",
+          "CDA": "value-sent",
+          "EntryIndex": 21,
+          "TV": ""
+        }
+      ]
+    },
+    {
+      "RuleID": 62,
+      "RuleIDLength": 6,
+      "RuleNature": "Management",
+      "Compression": [
+        {
+          "FID": "IPV6.VER",
+          "FL": 4,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "equal",
+          "CDA": "not-sent",
+          "EntryIndex": 0,
+          "TV": 6
+        },
+        {
+          "FID": "IPV6.TC",
+          "FL": 8,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "equal",
+          "CDA": "not-sent",
+          "EntryIndex": 1,
+          "TV": 0
+        },
+        {
+          "FID": "IPV6.FL",
+          "FL": 20,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "equal",
+          "CDA": "not-sent",
+          "EntryIndex": 2,
+          "TV": 0
+        },
+        {
+          "FID": "IPV6.LEN",
+          "FL": 16,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "ignore",
+          "CDA": "compute-length",
+          "EntryIndex": 3
+        },
+        {
+          "FID": "IPV6.NXT",
+          "FL": 8,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "equal",
+          "CDA": "not-sent",
+          "EntryIndex": 4,
+          "TV": 17
+        },
+        {
+          "FID": "IPV6.HOP_LMT",
+          "FL": 8,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "equal",
+          "CDA": "not-sent",
+          "EntryIndex": 5,
+          "TV": 64
+        },
+        {
+          "FID": "IPV6.DEV_PREFIX",
+          "FL": 64,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "equal",
+          "CDA": "not-sent",
+          "EntryIndex": 6,
+          "TV": "2001:db8::/64"
+        },
+        {
+          "FID": "IPV6.DEV_IID",
+          "FL": 64,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "equal",
+          "CDA": "not-sent",
+          "EntryIndex": 7,
+          "TV": "::1"
+        },
+        {
+          "FID": "IPV6.APP_PREFIX",
+          "FL": 64,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "equal",
+          "CDA": "not-sent",
+          "EntryIndex": 8,
+          "TV": "2001:db8::/64"
+        },
+        {
+          "FID": "IPV6.APP_IID",
+          "FL": 64,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "equal",
+          "CDA": "not-sent",
+          "EntryIndex": 9,
+          "TV": "::2"
+        },
+        {
+          "FID": "UDP.DEV_PORT",
+          "FL": 16,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "equal",
+          "CDA": "not-sent",
+          "EntryIndex": 10,
+          "TV": 8724
+        },
+        {
+          "FID": "UDP.APP_PORT",
+          "FL": 16,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "equal",
+          "CDA": "not-sent",
+          "EntryIndex": 11,
+          "TV": 8724
+        },
+        {
+          "FID": "UDP.LEN",
+          "FL": 16,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "ignore",
+          "CDA": "compute-length",
+          "EntryIndex": 12
+        },
+        {
+          "FID": "UDP.CKSUM",
+          "FL": 16,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "ignore",
+          "CDA": "compute-checksum",
+          "EntryIndex": 13
+        },
+        {
+          "FID": "COAP.VER",
+          "FL": 2,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "equal",
+          "CDA": "not-sent",
+          "EntryIndex": 14,
+          "TV": 1
+        },
+        {
+          "FID": "COAP.TYPE",
+          "FL": 2,
+          "FP": 1,
+          "DI": "DW",
+          "MO": "equal",
+          "CDA": "not-sent",
+          "EntryIndex": 15,
+          "TV": 0
+        },
+        {
+          "FID": "COAP.TKL",
+          "FL": 4,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "equal",
+          "CDA": "not-sent",
+          "EntryIndex": 16,
+          "TV": 0
+        },
+        {
+          "FID": "COAP.CODE",
+          "FL": 8,
+          "FP": 1,
+          "DI": "DW",
+          "MO": "equal",
+          "CDA": "not-sent",
+          "EntryIndex": 17,
+          "TV": 7
+        },
+        {
+          "FID": "COAP.MID",
+          "FL": 16,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "msb",
+          "CDA": "lsb",
+          "EntryIndex": 18,
+          "MO.VAL": 9,
+          "TV": 0
+        },
+        {
+          "FID": "COAP.OPTION(1)",
+          "FL": 64,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "ignore",
+          "CDA": "value-sent",
+          "EntryIndex": 19
+        },
+        {
+          "FID": "COAP.OPTION(11)",
+          "FL": 32,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "equal",
+          "CDA": "not-sent",
+          "EntryIndex": 20,
+          "TV": "schc"
+        },
+        {
+          "FID": "COAP.OPTION(12)",
+          "FL": 8,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "equal",
+          "CDA": "not-sent",
+          "EntryIndex": 21,
+          "TV": 142
+        },
+        {
+          "FID": "PAYLOAD",
+          "FL": "fl-remaining",
+          "FP": 1,
+          "DI": "BI",
+          "MO": "ignore",
+          "CDA": "value-sent",
+          "EntryIndex": 22,
+          "TV": ""
+        }
+      ]
+    },
+    {
+      "RuleID": 63,
+      "RuleIDLength": 6,
+      "RuleNature": "Management",
+      "Compression": [
+        {
+          "FID": "IPV6.VER",
+          "FL": 4,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "equal",
+          "CDA": "not-sent",
+          "EntryIndex": 0,
+          "TV": 6
+        },
+        {
+          "FID": "IPV6.TC",
+          "FL": 8,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "equal",
+          "CDA": "not-sent",
+          "EntryIndex": 1,
+          "TV": 0
+        },
+        {
+          "FID": "IPV6.FL",
+          "FL": 20,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "equal",
+          "CDA": "not-sent",
+          "EntryIndex": 2,
+          "TV": 0
+        },
+        {
+          "FID": "IPV6.LEN",
+          "FL": 16,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "ignore",
+          "CDA": "compute-length",
+          "EntryIndex": 3
+        },
+        {
+          "FID": "IPV6.NXT",
+          "FL": 8,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "equal",
+          "CDA": "not-sent",
+          "EntryIndex": 4,
+          "TV": 17
+        },
+        {
+          "FID": "IPV6.HOP_LMT",
+          "FL": 8,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "equal",
+          "CDA": "not-sent",
+          "EntryIndex": 5,
+          "TV": 64
+        },
+        {
+          "FID": "IPV6.DEV_PREFIX",
+          "FL": 64,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "equal",
+          "CDA": "not-sent",
+          "EntryIndex": 6,
+          "TV": "2001:db8::/64"
+        },
+        {
+          "FID": "IPV6.DEV_IID",
+          "FL": 64,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "equal",
+          "CDA": "not-sent",
+          "EntryIndex": 7,
+          "TV": "::1"
+        },
+        {
+          "FID": "IPV6.APP_PREFIX",
+          "FL": 64,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "equal",
+          "CDA": "not-sent",
+          "EntryIndex": 8,
+          "TV": "2001:db8::/64"
+        },
+        {
+          "FID": "IPV6.APP_IID",
+          "FL": 64,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "equal",
+          "CDA": "not-sent",
+          "EntryIndex": 9,
+          "TV": "::2"
+        },
+        {
+          "FID": "UDP.DEV_PORT",
+          "FL": 16,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "equal",
+          "CDA": "not-sent",
+          "EntryIndex": 10,
+          "TV": 8724
+        },
+        {
+          "FID": "UDP.APP_PORT",
+          "FL": 16,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "equal",
+          "CDA": "not-sent",
+          "EntryIndex": 11,
+          "TV": 8724
+        },
+        {
+          "FID": "UDP.LEN",
+          "FL": 16,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "ignore",
+          "CDA": "compute-length",
+          "EntryIndex": 12
+        },
+        {
+          "FID": "UDP.CKSUM",
+          "FL": 16,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "ignore",
+          "CDA": "compute-checksum",
+          "EntryIndex": 13
+        },
+        {
+          "FID": "COAP.VER",
+          "FL": 2,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "equal",
+          "CDA": "not-sent",
+          "EntryIndex": 14,
+          "TV": 1
+        },
+        {
+          "FID": "COAP.TYPE",
+          "FL": 2,
+          "FP": 1,
+          "DI": "DW",
+          "MO": "equal",
+          "CDA": "not-sent",
+          "EntryIndex": 15,
+          "TV": 1
+        },
+        {
+          "FID": "COAP.TKL",
+          "FL": 4,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "equal",
+          "CDA": "not-sent",
+          "EntryIndex": 16,
+          "TV": 0
+        },
+        {
+          "FID": "COAP.CODE",
+          "FL": 8,
+          "FP": 1,
+          "DI": "DW",
+          "MO": "equal",
+          "CDA": "not-sent",
+          "EntryIndex": 17,
+          "TV": 2
+        },
+        {
+          "FID": "COAP.MID",
+          "FL": 16,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "msb",
+          "CDA": "lsb",
+          "EntryIndex": 18,
+          "MO.VAL": 9,
+          "TV": 0
+        },
+        {
+          "FID": "COAP.OPTION(11)",
+          "FL": 32,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "equal",
+          "CDA": "not-sent",
+          "EntryIndex": 19,
+          "TV": "schc"
+        },
+        {
+          "FID": "COAP.OPTION(12)",
+          "FL": 8,
+          "FP": 1,
+          "DI": "BI",
+          "MO": "equal",
+          "CDA": "not-sent",
+          "EntryIndex": 20,
+          "TV": 142
+        },
+        {
+          "FID": "PAYLOAD",
+          "FL": "fl-remaining",
+          "FP": 1,
+          "DI": "BI",
+          "MO": "ignore",
+          "CDA": "value-sent",
+          "EntryIndex": 21,
+          "TV": ""
+        }
+      ]
+    }
+  ]
+}

@@ -7,12 +7,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use schc_coreconf::{
-    format_report, protected_management_rule_ids, ActiveContext, LinkReport, PreparedContext,
-    ProtectionPolicy, RawUdpLink, ReportDirection,
+    format_report, ActiveContext, LinkReport, PreparedContext, RawUdpLink, ReportDirection,
 };
 use schc_runtime::{DeviceId, DeviceProfile};
 
-const DEFAULT_SID: &str = include_str!("../../../../../fixtures/demo/ietf-schc@2026-05-07.sid");
+const DEFAULT_SID: &str = include_str!("../../../../../fixtures/demo/ietf-schc@2026-09-22.sid");
 const DEFAULT_SOR: &[u8] = include_bytes!("../../../../../fixtures/demo/initial.sor");
 
 pub(crate) struct Args {
@@ -98,14 +97,8 @@ impl Args {
         let sid = load_text(self.sid.as_deref(), DEFAULT_SID)?;
         let sor = load_bytes(self.sor.as_deref(), DEFAULT_SOR)?;
         let device_id = DeviceId::new(self.device_id.clone()).map_err(|error| error.to_string())?;
-        let prepared = PreparedContext::from_sor_with_policy(
-            &sid,
-            &sor,
-            device_id,
-            DeviceProfile::default(),
-            ProtectionPolicy::from_rule_ids(protected_management_rule_ids()),
-        )
-        .map_err(|error| error.to_string())?;
+        let prepared = PreparedContext::from_sor(&sid, &sor, device_id, DeviceProfile::default())
+            .map_err(|error| error.to_string())?;
         Ok(Arc::new(ActiveContext::new(prepared)))
     }
 }
@@ -187,4 +180,31 @@ fn parse_addr(value: &str, flag: &str) -> Result<SocketAddr, String> {
     value
         .parse()
         .map_err(|error| format!("invalid {flag} address {value}: {error}"))
+}
+
+#[cfg(test)]
+pub(crate) fn ordinary_response(
+    request: &schc_coreconf::Ipv6UdpCoapPacket,
+) -> Result<schc_coreconf::Ipv6UdpCoapPacket, schc_coreconf::PacketError> {
+    let request_message = request.coap_message();
+    let content_format =
+        schc_coreconf::CoapOption::new(12, vec![142]).map_err(schc_coreconf::PacketError::Coap)?;
+    let response = schc_coreconf::CoapMessage::from_parts(
+        1,
+        2,
+        69,
+        request_message.message_id(),
+        request_message.token().to_vec(),
+        vec![content_format],
+        Vec::new(),
+    )
+    .map_err(schc_coreconf::PacketError::Coap)?
+    .to_vec();
+    schc_coreconf::Ipv6UdpCoapPacket::new(
+        request.destination(),
+        request.source(),
+        request.destination_port(),
+        request.source_port(),
+        &response,
+    )
 }

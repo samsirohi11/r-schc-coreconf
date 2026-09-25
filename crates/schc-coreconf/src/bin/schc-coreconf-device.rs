@@ -6,10 +6,9 @@ use std::io::{self, Write};
 
 use thiserror::Error;
 
-use coap_lite::Packet;
 use common::{bind_raw_link, print_report, Args};
 use schc_coreconf::{
-    is_duplicate_rule_request, InspectionService, Ipv6UdpCoapPacket, LinkError, LinkRole,
+    is_duplicate_rule_datagram, InspectionService, Ipv6UdpCoapPacket, LinkError, LinkRole,
     PacketError, PacketEventLoop, PacketPoll, SchcLink, TrafficOrigin, TrafficRoute,
     APPLICATION_PORT, CORE_LOGICAL_ADDRESS, DEVICE_LOGICAL_ADDRESS, MANAGEMENT_PORT,
 };
@@ -178,10 +177,7 @@ fn receive_device_frame<D: PacketDevice>(
                     "drop unsupported management orientation".to_owned(),
                 ));
             }
-            let management = Packet::from_bytes(request.coap_datagram()).map_err(|error| {
-                DevicePacketError::Drop(format!("drop malformed management request: {error}"))
-            })?;
-            if is_duplicate_rule_request(decoded.rule_id(), &management) {
+            if is_duplicate_rule_datagram(request.coap_datagram()) {
                 let before = inspection.status().generation;
                 match inspection.handle_datagram_no_response(request.coap_datagram()) {
                     Ok(None) => {
@@ -222,11 +218,6 @@ fn receive_device_frame<D: PacketDevice>(
                 .map_err(|error| {
                     DevicePacketError::Drop(format!("encode management response: {error}"))
                 })?;
-            if encoded.report().rule_id != schc_core::RuleId::new(17, 8) {
-                return Err(DevicePacketError::Drop(
-                    "management response did not select RuleID 17/8".to_owned(),
-                ));
-            }
             print_report(schc_coreconf::ReportDirection::Tx, encoded.report(), debug)
                 .map_err(DevicePacketError::Fatal)?;
             raw_link.send_frame(encoded.frame()).map_err(|error| {
@@ -261,9 +252,8 @@ mod tests {
 
     use schc_core::RuleId;
     use schc_coreconf::{
-        context_check_request, protected_management_rule_ids, temporary_ordinary_response,
-        validate_management_response, ActiveContext, InspectionService, Ipv6UdpCoapPacket,
-        LinkOperation, LinkRole, PacketError, PacketEventLoop, PreparedContext, ProtectionPolicy,
+        context_check_request, validate_management_response, ActiveContext, InspectionService,
+        Ipv6UdpCoapPacket, LinkOperation, LinkRole, PacketError, PacketEventLoop, PreparedContext,
         RawUdpLink, SchcLink, TrafficOrigin, TrafficRoute, APPLICATION_PORT, CORE_LOGICAL_ADDRESS,
         DEVICE_LOGICAL_ADDRESS,
     };
@@ -274,18 +264,18 @@ mod tests {
         classify_tun_packet_error, receive_device_frame, send_device_tun_response,
         DevicePacketError,
     };
+    use crate::common::ordinary_response;
 
-    const SID: &str = include_str!("../../../../fixtures/demo/ietf-schc@2026-05-07.sid");
+    const SID: &str = include_str!("../../../../fixtures/demo/ietf-schc@2026-09-22.sid");
     const SOR: &[u8] = include_bytes!("../../../../fixtures/demo/initial.sor");
 
     fn active(device: &str) -> Arc<ActiveContext> {
         Arc::new(ActiveContext::new(
-            PreparedContext::from_sor_with_policy(
+            PreparedContext::from_sor(
                 SID,
                 SOR,
                 DeviceId::new(device).expect("device"),
                 DeviceProfile::default(),
-                ProtectionPolicy::from_rule_ids(protected_management_rule_ids()),
             )
             .expect("prepared context"),
         ))
@@ -376,7 +366,7 @@ mod tests {
     }
 
     fn response_for(request: &Ipv6UdpCoapPacket) -> Ipv6UdpCoapPacket {
-        temporary_ordinary_response(request).expect("ordinary response")
+        ordinary_response(request).expect("ordinary response")
     }
 
     #[test]
@@ -429,9 +419,13 @@ mod tests {
         let device_context = active("device-management");
         let core_link = SchcLink::new(Arc::clone(&core_context), LinkRole::Core);
         let device = SchcLink::new(Arc::clone(&device_context), LinkRole::Device);
-        let request_datagram = context_check_request(core_context.snapshot().tag(), 3, &[]);
-        let prepared = schc_coreconf::prepare_management_request(&core_link, &request_datagram)
-            .expect("prepare management request");
+        let request_datagram = context_check_request(core_context.snapshot().tag(), 3);
+        let prepared = schc_coreconf::prepare_management_request(
+            &core_link,
+            &request_datagram,
+            schc_coreconf::TokenPolicy::Empty,
+        )
+        .expect("prepare management request");
         let (raw, peer) = loopback_pair();
         let (fake, writes) = fake_device();
         let mut packet_loop = PacketEventLoop::new(fake);

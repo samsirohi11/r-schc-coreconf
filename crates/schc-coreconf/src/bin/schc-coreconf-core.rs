@@ -13,9 +13,9 @@ use schc_coreconf::{
     context_check_request, decode_context_check_payload, decode_rule_detail_payload,
     decode_rule_list_payload, format_rule_detail, format_rule_list, parse_rule_duplicate_command,
     parse_rule_selector, parse_rule_update_command, rule_get_request, rule_list_request,
-    ActiveContext, ContextStatus, DuplicateRuleResult, InspectionService, Ipv6UdpCoapPacket,
-    LinkRole, PacketError, PacketEventLoop, PacketPoll, SchcLink, TrafficOrigin, TrafficRoute,
-    APPLICATION_PORT, CORE_LOGICAL_ADDRESS, DEVICE_LOGICAL_ADDRESS,
+    ActiveContext, ContextStatus, DuplicateRuleResult, GuardPeriod, InspectionService,
+    Ipv6UdpCoapPacket, LinkRole, PacketError, PacketEventLoop, PacketPoll, SchcLink, TrafficOrigin,
+    TrafficRoute, APPLICATION_PORT, CORE_LOGICAL_ADDRESS, DEVICE_LOGICAL_ADDRESS,
 };
 #[cfg(target_os = "linux")]
 use schc_runtime::linux_tun::{LinuxTunConfig, LinuxTunDevice};
@@ -25,6 +25,13 @@ use thiserror::Error;
 const RAW_POLL: Duration = Duration::from_millis(50);
 const OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
 const MANAGEMENT_MID_MODULUS: u16 = 128;
+
+fn guard_period_text(guard_period: Option<GuardPeriod>) -> String {
+    guard_period.map_or_else(
+        || "none".to_owned(),
+        |period| format!("{}x{}", period.ticks_duration, period.ticks_numbers),
+    )
+}
 
 /// Allocates one MID from the stateless seven-bit reconstruction window.
 ///
@@ -75,7 +82,7 @@ fn run() -> Result<(), String> {
     );
     let interactive = io::stdin().is_terminal() && io::stdout().is_terminal();
     if interactive {
-        println!("Type 'help' for commands");
+        print_console_help();
         print_prompt()?;
     } else {
         io::stdout()
@@ -386,8 +393,12 @@ fn exchange_management_routed<D: PacketDevice>(
     datagram: &[u8],
     debug: bool,
 ) -> Result<(u8, schc_coreconf::ManagementExchange), String> {
-    let prepared = schc_coreconf::prepare_management_request(link, datagram)
-        .map_err(|error| error.to_string())?;
+    let prepared = schc_coreconf::prepare_management_request(
+        link,
+        datagram,
+        schc_coreconf::TokenPolicy::Empty,
+    )
+    .map_err(|error| error.to_string())?;
     print_report(schc_coreconf::ReportDirection::Tx, prepared.report(), debug)?;
     wait_management_response(
         link,
@@ -441,13 +452,6 @@ fn handle_command<D: PacketDevice>(
                 let encoded = link
                     .encode(TrafficOrigin::Management, &request)
                     .map_err(|error| error.to_string())?;
-                if encoded.report().rule_id != schc_core::RuleId::new(29, 8) {
-                    return Err(format!(
-                        "duplicate-rule selected {}/{} instead of 29/8",
-                        encoded.report().rule_id.value(),
-                        encoded.report().rule_id.bit_len()
-                    ));
-                }
                 print_report(schc_coreconf::ReportDirection::Tx, encoded.report(), debug)?;
                 raw_link
                     .send_frame(encoded.frame())
@@ -489,18 +493,20 @@ fn handle_command<D: PacketDevice>(
         let snapshot = active.snapshot();
         let status = ContextStatus::from_snapshot(&snapshot);
         println!(
-            "CONTEXT generation={}  rules={}",
-            status.generation, status.rule_count
+            "CONTEXT generation={}  rules={}  guard-period={}",
+            status.generation,
+            status.rule_count,
+            guard_period_text(status.guard_period)
         );
         if debug {
-            println!("  tag={}  digest={}", status.tag, hex_digest(status.digest));
+            println!("  tag={}", status.tag);
         }
         return Ok(CommandResult::Successful);
     }
     if command == "context check" {
         let tag = active.snapshot().tag();
         let message_id = next_management_message_id(next_message_id);
-        let coap = context_check_request(tag, message_id, &[]);
+        let coap = context_check_request(tag, message_id);
         let (_, exchange) = exchange_management_routed(link, raw_link, packet_loop, &coap, debug)
             .map_err(|error| format!("context check failed: {error}"))?;
         let result = decode_context_check_payload(&exchange.payload, tag)
@@ -535,7 +541,7 @@ fn handle_command<D: PacketDevice>(
             return Ok(CommandResult::Successful);
         }
         let message_id = next_management_message_id(next_message_id);
-        let coap = rule_list_request(message_id, &[])
+        let coap = rule_list_request(inspection.sid_json(), message_id)
             .map_err(|error| format!("device rule list request failed: {error}"))?;
         let (_, exchange) = exchange_management_routed(link, raw_link, packet_loop, &coap, debug)
             .map_err(|error| format!("device rule list failed: {error}"))?;
@@ -556,7 +562,7 @@ fn handle_command<D: PacketDevice>(
         }
         if side == "device" {
             let message_id = next_management_message_id(next_message_id);
-            let coap = rule_get_request(selector, message_id, &[])
+            let coap = rule_get_request(inspection.sid_json(), selector, message_id)
                 .map_err(|error| format!("device rule get request failed: {error}"))?;
             let (_, exchange) =
                 exchange_management_routed(link, raw_link, packet_loop, &coap, debug)
@@ -701,7 +707,7 @@ where
     let base_tag = request.if_match.then_some(snapshot.tag());
     let message_id = next_management_message_id(next_message_id);
     let datagram = update
-        .ipatch_datagram(message_id, &[], base_tag)
+        .ipatch_datagram(message_id, base_tag)
         .map_err(|error| {
             format!(
                 "rule update {}/{} entry={} rejected: {error}; device=not-sent; local=unchanged",
@@ -793,15 +799,6 @@ fn format_coap_code(code: u8) -> String {
     format!("{}.{:02}", code >> 5, code & 0x1f)
 }
 
-fn hex_digest(digest: [u8; 32]) -> String {
-    use std::fmt::Write as _;
-    let mut output = String::with_capacity(64);
-    for byte in digest {
-        write!(&mut output, "{byte:02x}").expect("writing to String cannot fail");
-    }
-    output
-}
-
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
@@ -814,30 +811,42 @@ mod tests {
     use coap_lite::{MessageClass, MessageType, Packet, RequestType, ResponseType};
     use schc_core::RuleId;
     use schc_coreconf::{
-        context_check_request, protected_management_rule_ids, temporary_ordinary_response,
-        ActiveContext, InspectionService, Ipv6UdpCoapPacket, LinkOperation, LinkRole, PacketError,
-        PacketEventLoop, PreparedContext, ProtectionPolicy, RawUdpLink, SchcLink, TrafficOrigin,
-        TrafficRoute, APPLICATION_PORT, CORE_LOGICAL_ADDRESS, DEVICE_LOGICAL_ADDRESS,
+        context_check_request, ActiveContext, InspectionService, Ipv6UdpCoapPacket, LinkOperation,
+        LinkRole, PacketError, PacketEventLoop, PreparedContext, RawUdpLink, SchcLink,
+        TrafficOrigin, TrafficRoute, APPLICATION_PORT, CORE_LOGICAL_ADDRESS,
+        DEVICE_LOGICAL_ADDRESS,
     };
     use schc_runtime::packet::{PacketDevice, PacketDeviceError};
     use schc_runtime::{DeviceId, DeviceProfile};
 
     use super::{
-        classify_tun_packet_error, execute_rule_update, process_core_raw_frame,
+        classify_tun_packet_error, execute_rule_update, guard_period_text, process_core_raw_frame,
         process_core_tun_packet, validate_changed_response, wait_management_response,
         CommandResult, CoreFrameResult, CorePacketError,
     };
+    use crate::common::ordinary_response;
 
-    const SID: &str = include_str!("../../../../fixtures/demo/ietf-schc@2026-05-07.sid");
+    const SID: &str = include_str!("../../../../fixtures/demo/ietf-schc@2026-09-22.sid");
     const SOR: &[u8] = include_bytes!("../../../../fixtures/demo/initial.sor");
 
+    #[test]
+    fn status_guard_period_text_is_concise_and_stable() {
+        assert_eq!(guard_period_text(None), "none");
+        assert_eq!(
+            guard_period_text(Some(schc_coreconf::GuardPeriod {
+                ticks_duration: 3,
+                ticks_numbers: 7,
+            })),
+            "3x7"
+        );
+    }
+
     fn active(device: &str) -> Arc<ActiveContext> {
-        let prepared = PreparedContext::from_sor_with_policy(
+        let prepared = PreparedContext::from_sor(
             SID,
             SOR,
             DeviceId::new(device).expect("device"),
             DeviceProfile::default(),
-            ProtectionPolicy::from_rule_ids(protected_management_rule_ids()),
         )
         .expect("prepared");
         Arc::new(ActiveContext::new(prepared))
@@ -972,9 +981,13 @@ mod tests {
     fn management_wait_has_a_testable_bounded_deadline_and_sends_once() {
         let active = active("core-timeout");
         let link = SchcLink::new(Arc::clone(&active), LinkRole::Core);
-        let request = context_check_request(active.snapshot().tag(), 1, &[]);
-        let prepared = schc_coreconf::prepare_management_request(&link, &request)
-            .expect("prepare management request");
+        let request = context_check_request(active.snapshot().tag(), 1);
+        let prepared = schc_coreconf::prepare_management_request(
+            &link,
+            &request,
+            schc_coreconf::TokenPolicy::Empty,
+        )
+        .expect("prepare management request");
         let receiver = UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).expect("receiver");
         let receiver_address = receiver.local_addr().expect("receiver address");
         let sender = UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).expect("sender");
@@ -1082,7 +1095,8 @@ mod tests {
         assert_eq!(core_after.generation(), 2);
         assert_eq!(device_after.generation(), 2);
         assert_eq!(
-            core_after.tree()["ietf-schc:schc"]["rule"][2]["entry"][9]["target-value"][0]["value"],
+            core_after.tree()["ietf-schc:schc"]["rule"][2]["entry-universal"][9]["target-value"][0]
+                ["value"],
             "AAAAAAAAAAY="
         );
     }
@@ -1199,7 +1213,7 @@ mod tests {
         let core = SchcLink::new(active("core-raw-response"), LinkRole::Core);
         let device = SchcLink::new(active("device-raw-response"), LinkRole::Device);
         let request = application_request(0x1202);
-        let response = temporary_ordinary_response(&request).expect("response");
+        let response = ordinary_response(&request).expect("response");
         let frame = device
             .encode(TrafficOrigin::Application, &response)
             .expect("encode response");
@@ -1223,9 +1237,13 @@ mod tests {
         let device_context = active("device-management-isolation");
         let core = SchcLink::new(Arc::clone(&core_context), LinkRole::Core);
         let device = SchcLink::new(Arc::clone(&device_context), LinkRole::Device);
-        let request_datagram = context_check_request(core_context.snapshot().tag(), 7, &[]);
-        let prepared = schc_coreconf::prepare_management_request(&core, &request_datagram)
-            .expect("prepare request");
+        let request_datagram = context_check_request(core_context.snapshot().tag(), 7);
+        let prepared = schc_coreconf::prepare_management_request(
+            &core,
+            &request_datagram,
+            schc_coreconf::TokenPolicy::Empty,
+        )
+        .expect("prepare request");
         let mut service = InspectionService::new(Arc::clone(&device_context)).expect("service");
         let response = management_response(
             &Ipv6UdpCoapPacket::parse(&prepared.report().packet_bytes).expect("request packet"),
@@ -1262,9 +1280,13 @@ mod tests {
         let device_context = active("device-interleave");
         let core = SchcLink::new(Arc::clone(&core_context), LinkRole::Core);
         let device = SchcLink::new(Arc::clone(&device_context), LinkRole::Device);
-        let request_datagram = context_check_request(core_context.snapshot().tag(), 8, &[]);
-        let prepared = schc_coreconf::prepare_management_request(&core, &request_datagram)
-            .expect("prepare request");
+        let request_datagram = context_check_request(core_context.snapshot().tag(), 8);
+        let prepared = schc_coreconf::prepare_management_request(
+            &core,
+            &request_datagram,
+            schc_coreconf::TokenPolicy::Empty,
+        )
+        .expect("prepare request");
         let request_packet = application_request(0x1203);
         let (raw, peer) = loopback_pair();
         let (fake, writes) = fake_device(vec![Ok(request_packet.to_vec())]);
@@ -1287,8 +1309,8 @@ mod tests {
                 decoded_request.packet().as_bytes(),
                 expected_request.as_bytes()
             );
-            let response = temporary_ordinary_response(decoded_request.packet())
-                .expect("application response");
+            let response =
+                ordinary_response(decoded_request.packet()).expect("application response");
             let response_frame = device
                 .encode(TrafficOrigin::Application, &response)
                 .expect("encode application response");
@@ -1317,7 +1339,7 @@ mod tests {
         assert_eq!(exchange.0, 69);
         assert_eq!(
             writes.lock().expect("writes lock").as_slice(),
-            &[temporary_ordinary_response(&request_packet)
+            &[ordinary_response(&request_packet)
                 .expect("response")
                 .to_vec()]
         );
@@ -1330,9 +1352,13 @@ mod tests {
         let device_context = active("device-wrong-management-response");
         let core = SchcLink::new(Arc::clone(&core_context), LinkRole::Core);
         let device = SchcLink::new(Arc::clone(&device_context), LinkRole::Device);
-        let request_datagram = context_check_request(core_context.snapshot().tag(), 9, &[]);
-        let prepared = schc_coreconf::prepare_management_request(&core, &request_datagram)
-            .expect("prepare request");
+        let request_datagram = context_check_request(core_context.snapshot().tag(), 9);
+        let prepared = schc_coreconf::prepare_management_request(
+            &core,
+            &request_datagram,
+            schc_coreconf::TokenPolicy::Empty,
+        )
+        .expect("prepare request");
         let request_packet =
             Ipv6UdpCoapPacket::parse(&prepared.report().packet_bytes).expect("request packet");
         let mut service = InspectionService::new(Arc::clone(&device_context)).expect("service");
@@ -1430,7 +1456,7 @@ mod tests {
     fn core_raw_frame_short_tun_write_is_a_contextual_fatal_error() {
         let core = SchcLink::new(active("core-short-write"), LinkRole::Core);
         let device = SchcLink::new(active("device-short-write"), LinkRole::Device);
-        let response = temporary_ordinary_response(&application_request(0x1205)).expect("response");
+        let response = ordinary_response(&application_request(0x1205)).expect("response");
         let frame = device
             .encode(TrafficOrigin::Application, &response)
             .expect("frame");

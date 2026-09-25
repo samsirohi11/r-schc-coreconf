@@ -1,71 +1,61 @@
 # Composition and demo boundaries
 
-## Dependency direction
+## Dependency and ownership boundaries
 
-The intended dependency graph is one-way:
+The dependency direction is one-way:
 
 ```text
-r-schc-coreconf
-  |-> r-schc
-  `-> rustconf
+r-schc-coreconf -> r-schc
+r-schc-coreconf -> rustconf
 ```
 
-The two lower repositories remain independent.
-`r-schc` must not depend on CORECONF, application datastore behavior, or this integration repository.
-`rustconf` must not depend on SCHC, SCHC rules, or this integration repository.
-`r-schc-coreconf` owns only the behavior that combines the two libraries.
+The lower repositories stay independent. `r-schc` owns IPv6/UDP/CoAP packet
+construction and parsing, SCHC rules and codecs, frames, and endpoint runtime.
+`rustconf` owns CORECONF/YANG/SID model handling, generic request semantics,
+operation dispatch, and datastores. The root crate composes these APIs for
+managed SCHC contexts, management protection and synchronization, and the
+demonstration. Its `packet.rs` only re-exports `schc-core` packet types;
+`link.rs` connects logical packets to SCHC frames and rule-derived routes.
 
-The current checkout uses source submodules and path dependencies while the library APIs are stabilized.
-The submodule Gitlinks and `Cargo.lock` are the source of truth for this transitional development composition.
-Hand-maintained abbreviated commit comments are intentionally avoided because they become stale independently of Gitlinks.
+The root workspace excludes the source submodules and uses path dependencies
+under `deps/`. Gitlinks identify the recorded submodule commits; local changes
+inside either submodule also affect builds from a dirty checkout.
 
-The release composition must use versioned crate dependencies and must not commit dependency source trees.
-Each integration release will record a dependency tuple containing the `schc-core`, `schc-runtime`, `coreconf-model`, and `coreconf-runtime` crate versions.
-A release is valid only when that tuple passes the integration test suite and the real-process demonstration.
+## Management boundary
 
-## Ownership by repository
+The loaded SoR's `nature-management` marks protected management rules. The
+matched RuleID, including its bit length, determines the traffic class and
+route; packet addresses, ports, or CoAP shape alone do not authorize
+management. Loaded RuleID values are capped at uint32. The model permits an
+implicit length-0 RuleID, but this prototype intentionally supports only
+explicit lengths 1..=32.
+Protected rules cannot be changed or removed from a candidate context.
+Management entries use the model's ordered universal-entry structure; the
+guard period belongs to the whole context.
 
-| Repository | Owns | Does not own |
-| --- | --- | --- |
-| `r-schc` | SCHC packets, rules, compression, decompression, frames, endpoint roles, and transport plugin boundaries. | CORECONF semantics, generic datastores, and application models. |
-| `rustconf` | CORECONF model handling, request semantics, datastore boundaries, operation bindings, and CoAP integration. | SCHC compression, SCHC RuleIDs, and SCHC context synchronization. |
-| `r-schc-coreconf` | Managed SCHC contexts, protected management routing, context synchronization, and the executable demonstration. | Forked copies of generic SCHC or CORECONF functionality. |
+The root management handler supports reads, explicit context checks, one
+targeted iPATCH shape, and the `duplicate-rule` operation. A targeted iPATCH
+replaces one target value in an existing ordinary rule. The device validates
+and publishes a detached candidate before replying `2.04 Changed`. The core then applies the same request
+locally and checks that it published once. `context check` separately compares
+the core and device ContextTags. Other generic create, delete, or iPATCH shapes
+are not part of this root management profile.
 
-The integration crate must reuse the public packet and CORECONF client, server, and datastore boundaries from the independent repositories.
-Duplicate packet builders, generic request codecs, and generic datastore clients are migration targets and must not become new public APIs here.
+The duplicate-rule profile is a local policy: Rule `29/8` carries a CoAP NON
+POST, the device applies it atomically without a response, and the core applies
+the same deterministic operation locally. It copies only ordinary rules;
+identical replays are no-op success. This one-way exchange is not an
+acknowledged synchronization step. The four-process topology, fixed demo
+endpoints, and zero application flow labels are also demonstration policy,
+not general SCHC requirements.
 
-## Demonstration process topology
+The management exchange API supports empty or generated opaque CoAP tokens.
+Current management Rules encode zero-length tokens, so the running profile
+uses empty tokens.
 
-The executable demonstration has four independently replaceable roles:
+## Demonstration packet invariant
 
-| Role | Responsibility |
-| --- | --- |
-| Application client | Sends ordinary application CORECONF requests and verifies logical responses. |
-| SCHC core | Compresses outbound application traffic, decompresses replies, initiates protected context management, and maintains the synchronized core-side context. |
-| SCHC device | Decompresses ordinary traffic, forwards reconstructed packets to the application server, compresses replies, handles protected management commands, and maintains the device-side context. |
-| Application CORECONF server and datastore | Serves an application SID and datastore without depending on SCHC or SCHC management. |
-
-The application client and server are demonstration consumers of `rustconf`.
-The SCHC core and device are the reusable managed-endpoint contribution of this repository.
-The boundaries permit replacement of the application SID, SCHC SID registry, SoR, datastore backend, and link transport without editing protocol internals.
-
-## Management invariants
-
-Protected management authorization is based on an exact RuleID and RuleID width, not only on a URI, port, or rule value.
-An update is prepared and validated against a detached context before either active context is published.
-The device acknowledgment must identify the expected old and new context tags before the core publishes the prepared context for synchronous iPATCH updates.
-The duplicate-rule prototype is the deliberate exception: Rule `29/8` carries a CoAP NON POST, the device applies it atomically without sending a response, and the core applies the same deterministic request locally without treating local publication as remote acknowledgment.
-A successful update must leave the core and device with the same canonical context tag.
-
-Ordinary application packet bytes must remain identical when a context update changes only the selected SCHC representation.
-The demonstration must compare sender and receiver packet bytes, selected RuleIDs, meaningful SCHC bit lengths, and raw padded link frames.
-
-## Rule lifecycle profile
-
-Generic create, update, and delete operations use CORECONF iPATCH against the SCHC rule datastore.
-The SCHC `duplicate-rule` operation is modeled as a POST RPC because it has operation semantics beyond a generic datastore edit.
-The existing SID-modeled `from`, `to`, and binary `ipatch-sequence` input is retained.
-The binary sequence uses deterministic CORECONF instance maps whose paths contain the destination RuleID and stable `entry-index`, without repeating FID, FP, or DI.
-An optional patch applied during duplication addresses list entries by their explicit `entry-index` key rather than by vector position.
-The operation copies only ordinary rules, validates the complete candidate through rustconf and r-schc, publishes once for a new destination, and treats identical replays as no-op success.
-Custom create-rule and delete-rule RPCs are not part of the initial profile because they would duplicate standard datastore mutation semantics.
+When a context change only changes the selected SCHC representation, the
+reconstructed application packet remains byte-identical. Link tests compare
+packet and frame bytes. The demo correlates endpoint reports and prints
+selected RuleIDs, meaningful SCHC bit lengths, and padded byte counts.

@@ -4,19 +4,14 @@ use schc_core::RuleId;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::ProtectionPolicy;
-
-/// The mechanism profile that owns protected and dynamically allocated
-/// `RuleID` identities for a managed context.
+/// The mechanism profile that owns dynamically allocated `RuleID` identities
+/// for a managed context.
 ///
 /// The SCHC `SoR` remains authoritative for rule definitions and all
 /// pre-provisioned identities. This small sidecar profile only describes the
-/// policy-owned roles that cannot be inferred safely from unused branches.
+/// dynamic namespace that cannot be inferred safely from unused branches.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ContextProfile {
-    /// Rule identities reserved for CORECONF management traffic.
-    #[serde(default)]
-    pub protected_rule_ids: Vec<RuleIdSpec>,
     /// Explicit dynamic namespace, when automatic rule creation is enabled.
     #[serde(default)]
     pub dynamic_rule_ids: Option<DynamicRuleIdNamespace>,
@@ -36,42 +31,27 @@ impl ContextProfile {
     ///
     /// # Errors
     ///
-    /// Returns an error when a protected identity or dynamic namespace is
-    /// not a valid RFC 9363 `(RuleID value, RuleID length)` pair, or when the
-    /// dynamic namespace has no valid configured leaf depth.
+    /// Returns an error when the dynamic namespace has no valid configured
+    /// leaf depth.
     ///
     /// The current SCHC codec supports only explicit `RuleIDs` with lengths
     /// 1..=32. RFC 9363 also defines length 0 for an implicit `RuleID`, but the
     /// codec does not currently implement that representation.
     pub fn validate(&self) -> Result<Self, RuleIdTreeError> {
-        let mut protected_rule_ids = Vec::with_capacity(self.protected_rule_ids.len());
-        for id in &self.protected_rule_ids {
-            protected_rule_ids.push(RuleIdSpec::new(id.value, id.length)?);
-        }
-        protected_rule_ids.sort_by_key(|id| (id.length, id.value));
-        protected_rule_ids.dedup();
         let dynamic_rule_ids = self
             .dynamic_rule_ids
             .as_ref()
             .map(DynamicRuleIdNamespace::validate)
             .transpose()?;
-        Ok(Self {
-            protected_rule_ids,
-            dynamic_rule_ids,
-        })
-    }
-
-    /// Converts the profile's protected identities into the internal policy.
-    pub(crate) fn protection_policy(&self) -> ProtectionPolicy {
-        ProtectionPolicy::from_rule_ids(self.protected_rule_ids.iter().map(|id| id.rule_id()))
+        Ok(Self { dynamic_rule_ids })
     }
 }
 
 /// A `RuleID` value and its encoded bit length, as defined by RFC 9363.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RuleIdSpec {
-    /// Numeric value of the `RuleID` bits.
-    pub value: u64,
+    /// uint32 numeric value of the `RuleID` bits.
+    pub value: u32,
     /// Number of encoded `RuleID` bits.
     #[serde(alias = "bit_len")]
     pub length: usize,
@@ -86,14 +66,18 @@ impl RuleIdSpec {
     ///
     /// # Errors
     ///
-    /// Returns an error when the value does not fit in the requested length.
+    /// Returns an error when the value is outside uint32 or does not fit in
+    /// the requested length.
     pub fn new(value: u64, length: usize) -> Result<Self, RuleIdTreeError> {
         if !(1..=32).contains(&length) {
             return Err(RuleIdTreeError::Invalid(format!(
-                "explicit RuleID length must be between 1 and 32, got {length}"
+                "explicit RuleID length must be 1..=32; length {length} is unsupported by this codec"
             )));
         }
-        if value >= (1_u64 << length) {
+        let value = u32::try_from(value).map_err(|_| {
+            RuleIdTreeError::Invalid(format!("RuleID value {value} exceeds the uint32 range"))
+        })?;
+        if u64::from(value) >= (1_u64 << length) {
             return Err(RuleIdTreeError::Invalid(format!(
                 "RuleID value {value} does not fit in {length} bits"
             )));
@@ -104,7 +88,7 @@ impl RuleIdSpec {
     /// Converts this specification to the codec's `(value, length)` type.
     #[must_use]
     pub fn rule_id(self) -> RuleId {
-        RuleId::new(self.value, self.length)
+        RuleId::new(u64::from(self.value), self.length)
     }
 }
 
@@ -129,7 +113,7 @@ impl DynamicRuleIdNamespace {
     ///
     /// Returns an error when the prefix or one of the leaf depths is invalid.
     pub fn validate(&self) -> Result<Self, RuleIdTreeError> {
-        let prefix = RuleIdSpec::new(self.prefix.value, self.prefix.length)?;
+        let prefix = RuleIdSpec::new(u64::from(self.prefix.value), self.prefix.length)?;
         let mut allowed_lengths = self.allowed_lengths.clone();
         allowed_lengths.sort_unstable();
         allowed_lengths.dedup();
@@ -163,43 +147,29 @@ impl DynamicRuleIdNamespace {
         I: IntoIterator<Item = RuleId>,
     {
         let namespace = self.validate()?;
-        let occupied: Vec<_> = occupied.into_iter().collect();
+        let occupied: Vec<_> = occupied
+            .into_iter()
+            .map(|id| {
+                RuleIdSpec::new(id.value(), id.bit_len())?;
+                Ok(id)
+            })
+            .collect::<Result<_, RuleIdTreeError>>()?;
+        let prefix = namespace.prefix.rule_id();
         if occupied
             .iter()
-            .any(|id| overlaps(*id, namespace.prefix.rule_id()) && !namespace.accepts(*id))
+            .any(|id| overlaps(*id, prefix) && !accepts_normalized(&namespace, *id))
         {
             return Err(RuleIdTreeError::Collision {
-                value: namespace.prefix.value,
+                value: namespace.prefix.value.into(),
                 length: namespace.prefix.length,
             });
         }
 
-        for length in namespace.allowed_lengths {
-            let suffix_bits = length - namespace.prefix.length;
-            let suffix_count = if suffix_bits == 64 {
-                u64::MAX
-            } else {
-                1_u64 << suffix_bits
-            };
-            let prefix_value = if suffix_bits == 64 {
-                0
-            } else {
-                namespace
-                    .prefix
-                    .value
-                    .checked_shl(u32::try_from(suffix_bits).map_err(|_| {
-                        RuleIdTreeError::Invalid("dynamic RuleID prefix overflows".into())
-                    })?)
-                    .ok_or_else(|| {
-                        RuleIdTreeError::Invalid("dynamic RuleID prefix overflows".into())
-                    })?
-            };
-            for suffix in 0..suffix_count {
-                let value = prefix_value | suffix;
-                let candidate = RuleId::new(value, length);
-                if occupied.iter().all(|id| !overlaps(*id, candidate)) {
-                    return Ok(candidate);
-                }
+        for &length in &namespace.allowed_lengths {
+            let range = candidate_range(namespace.prefix, length);
+            let blocked = blocked_intervals(range, &occupied, length);
+            if let Some(value) = first_free(range, &blocked) {
+                return Ok(RuleId::new(value, length));
             }
         }
         Err(RuleIdTreeError::Exhausted)
@@ -208,10 +178,8 @@ impl DynamicRuleIdNamespace {
     /// Returns whether a `RuleID` belongs to this namespace at a permitted leaf depth.
     #[must_use]
     pub fn accepts(&self, id: RuleId) -> bool {
-        self.validate().is_ok_and(|namespace| {
-            namespace.allowed_lengths.contains(&id.bit_len())
-                && is_prefix(namespace.prefix.rule_id(), id)
-        })
+        self.validate()
+            .is_ok_and(|namespace| accepts_normalized(&namespace, id))
     }
 
     /// Returns the normalized prefix and permitted depths.
@@ -219,6 +187,63 @@ impl DynamicRuleIdNamespace {
     pub fn prefix(&self) -> RuleIdSpec {
         self.prefix
     }
+}
+
+fn accepts_normalized(namespace: &DynamicRuleIdNamespace, id: RuleId) -> bool {
+    namespace.allowed_lengths.contains(&id.bit_len()) && is_prefix(namespace.prefix.rule_id(), id)
+}
+
+fn candidate_range(prefix: RuleIdSpec, length: usize) -> (u64, u64) {
+    let suffix_bits = length - prefix.length;
+    let start = u64::from(prefix.value) << suffix_bits;
+    (start, start + (1_u64 << suffix_bits))
+}
+
+fn blocked_intervals(range: (u64, u64), occupied: &[RuleId], length: usize) -> Vec<(u64, u64)> {
+    let mut intervals = Vec::with_capacity(occupied.len());
+    for id in occupied {
+        let (start, end) = if id.bit_len() <= length {
+            let shift = length - id.bit_len();
+            let start = id.value() << shift;
+            (start, start + (1_u64 << shift))
+        } else {
+            let start = id.value() >> (id.bit_len() - length);
+            (start, start + 1)
+        };
+        if end > range.0 && start < range.1 {
+            intervals.push((start.max(range.0), end.min(range.1)));
+        }
+    }
+
+    intervals.sort_unstable();
+    let mut merged: Vec<(u64, u64)> = Vec::with_capacity(intervals.len());
+    for (start, end) in intervals {
+        if let Some(last) = merged.last_mut() {
+            if start <= last.1 {
+                last.1 = last.1.max(end);
+                continue;
+            }
+        }
+        merged.push((start, end));
+    }
+    merged
+}
+
+fn first_free(range: (u64, u64), blocked: &[(u64, u64)]) -> Option<u64> {
+    let mut candidate = range.0;
+    for &(start, end) in blocked {
+        if end <= candidate {
+            continue;
+        }
+        if start > candidate {
+            break;
+        }
+        candidate = end;
+        if candidate >= range.1 {
+            return None;
+        }
+    }
+    (candidate < range.1).then_some(candidate)
 }
 
 /// Errors raised while validating or allocating a `RuleID` tree.
@@ -251,9 +276,6 @@ fn is_prefix(prefix: RuleId, value: RuleId) -> bool {
         return false;
     }
     let suffix = value.bit_len() - prefix.bit_len();
-    if suffix == 64 {
-        return prefix.value() == 0;
-    }
     value.value() >> suffix == prefix.value()
 }
 
@@ -318,10 +340,9 @@ mod tests {
     }
 
     #[test]
-    fn profile_parses_explicit_protection_and_dynamic_namespace() {
+    fn profile_parses_dynamic_namespace() {
         let profile = ContextProfile::from_json_str(
             r#"{
-                "protected_rule_ids": [{"value": 63, "length": 6}],
                 "dynamic_rule_ids": {
                     "prefix": {"value": 0, "length": 1},
                     "allowed_lengths": [4]
@@ -330,7 +351,6 @@ mod tests {
         )
         .expect("profile JSON");
         let profile = profile.validate().expect("valid profile");
-        assert_eq!(profile.protected_rule_ids[0].rule_id(), RuleId::new(63, 6));
         assert!(profile
             .dynamic_rule_ids
             .as_ref()
@@ -342,15 +362,75 @@ mod tests {
     fn rejects_implicit_rule_id_length() {
         assert!(matches!(
             RuleIdSpec::new(0, 0),
-            Err(RuleIdTreeError::Invalid(message)) if message.contains("between 1 and 32")
+            Err(RuleIdTreeError::Invalid(message)) if message.contains("unsupported by this codec")
         ));
     }
 
     #[test]
-    fn rejects_rule_id_length_above_rfc9363_range() {
+    fn rejects_rule_id_length_above_codec_range() {
         assert!(matches!(
             RuleIdSpec::new(0, 33),
-            Err(RuleIdTreeError::Invalid(message)) if message.contains("between 1 and 32")
+            Err(RuleIdTreeError::Invalid(message)) if message.contains("1..=32")
+        ));
+    }
+
+    #[test]
+    fn rejects_rule_id_value_above_uint32() {
+        assert!(matches!(
+            RuleIdSpec::new(u64::from(u32::MAX) + 1, 32),
+            Err(RuleIdTreeError::Invalid(message)) if message.contains("uint32")
+        ));
+    }
+
+    #[test]
+    fn rejects_rule_id_value_above_uint32_in_json() {
+        assert!(ContextProfile::from_json_str(
+            r#"{
+                "dynamic_rule_ids": {
+                    "prefix": {"value": 4294967296, "length": 32},
+                    "allowed_lengths": [32]
+                }
+            }"#
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn accepts_maximum_width_rule_id() {
+        assert_eq!(
+            RuleIdSpec::new(u64::from(u32::MAX), 32)
+                .expect("maximum uint32 RuleID")
+                .rule_id(),
+            RuleId::new(u64::from(u32::MAX), 32)
+        );
+    }
+
+    #[test]
+    fn allocates_lowest_free_leaf_independent_of_occupied_order() {
+        let tree = namespace(&[8]);
+        assert_eq!(
+            tree.allocate([RuleId::new(5, 8), RuleId::new(1, 8), RuleId::new(0, 8),])
+                .unwrap(),
+            RuleId::new(2, 8)
+        );
+    }
+
+    #[test]
+    fn longer_occupied_leaves_block_shorter_depth_before_next_depth() {
+        let tree = namespace(&[2, 4]);
+        assert_eq!(
+            tree.allocate([RuleId::new(0, 4), RuleId::new(4, 4)])
+                .unwrap(),
+            RuleId::new(1, 4)
+        );
+    }
+
+    #[test]
+    fn sparse_max_width_namespace_finishes_from_occupied_subtrees() {
+        let tree = namespace(&[2, 32]);
+        assert!(matches!(
+            tree.allocate([RuleId::new(0, 2), RuleId::new(1, 2)]),
+            Err(RuleIdTreeError::Exhausted)
         ));
     }
 

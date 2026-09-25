@@ -45,7 +45,7 @@ fn run() -> Result<(), String> {
     }
     let interactive = io::stdin().is_terminal() && io::stdout().is_terminal();
     if interactive {
-        println!("Type 'help' for commands");
+        print_command_help();
         print_prompt()?;
     } else {
         io::stdout()
@@ -88,19 +88,13 @@ fn execute_command(client: &mut DataClient, line: &str) -> Result<bool, String> 
     let command = words.next().unwrap_or_default();
     let rest = words.next().map(str::trim).unwrap_or_default();
     match command {
-        "discover" => {
-            let query = (!rest.is_empty()).then_some(rest);
-            print_result(client.discover(query));
-        }
+        "discover" if rest.is_empty() => print_result(client.discover()),
+        "discover" => println!("ERROR usage: discover"),
         "schema" => {
             let filter = (!rest.is_empty()).then_some(rest);
             for entry in client.schema(filter) {
                 println!("{entry}");
             }
-        }
-        "get" => {
-            let path = required_argument(rest, "get <path>")?;
-            print_json_result(client.get(path));
         }
         "fetch" => {
             let path = required_argument(rest, "fetch <path>")?;
@@ -124,7 +118,6 @@ fn execute_command(client: &mut DataClient, line: &str) -> Result<bool, String> 
             let path = required_argument(rest, "delete <path>")?;
             print_delete(client.delete(path));
         }
-        "reload" => print_reload(client.reload()),
         "help" => print_command_help(),
         "quit" => return Ok(true),
         other => println!("ERROR unknown command '{other}'; use help"),
@@ -152,13 +145,6 @@ fn print_delete(result: Result<(), schc_coreconf::ApplicationError>) {
         Err(schc_coreconf::ApplicationError::Remote { code, .. }) if code == "4.04" => {
             println!("OK delete  not-found");
         }
-        Err(error) => println!("ERROR {error}"),
-    }
-}
-
-fn print_reload(result: Result<Value, schc_coreconf::ApplicationError>) {
-    match result {
-        Ok(_) => println!("OK reload"),
         Err(error) => println!("ERROR {error}"),
     }
 }
@@ -269,13 +255,11 @@ fn usage() -> &'static str {
 
 fn print_command_help() {
     println!("Data client commands:");
-    println!("  discover [query]");
+    println!("  discover");
     println!("  schema [filter]");
-    println!("  get <path>");
     println!("  fetch <path>");
     println!("  set <path> <json-value>");
     println!("  delete <path>");
-    println!("  reload");
     println!("  help");
     println!("  quit");
 }

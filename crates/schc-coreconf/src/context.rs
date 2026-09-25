@@ -13,11 +13,20 @@ use serde_json::Value;
 use crate::codec::{
     digest_context, encode_tree, ensure_schc_root, normalize_tree, strict_cbor_value,
 };
-use crate::policy::{ProtectedRules, ProtectionPolicy};
+use crate::policy::ProtectedRules;
 use crate::{ContextError, ContextProfile, DynamicRuleIdNamespace, Result};
 
 /// Number of bytes in a compact context tag.
 pub const CONTEXT_TAG_LEN: usize = 8;
+
+/// The context-level management guard period retained from the SCHC model.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct GuardPeriod {
+    /// Duration of one guard-period tick.
+    pub ticks_duration: u8,
+    /// Number of ticks in the guard period.
+    pub ticks_numbers: u16,
+}
 
 /// A compact stable identifier for one canonical SCHC context.
 #[derive(Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -79,6 +88,7 @@ pub struct LoadedContext {
     tree: Value,
     sor: Vec<u8>,
     protected: ProtectedRules,
+    guard_period: Option<GuardPeriod>,
 }
 
 impl LoadedContext {
@@ -90,45 +100,28 @@ impl LoadedContext {
     /// input is not complete strict CBOR, or when SCHC semantic validation
     /// fails.
     pub fn from_sor(sid_json: &str, sor: &[u8]) -> Result<Self> {
-        Self::from_sor_with_policy(sid_json, sor, ProtectionPolicy::default())
-    }
-
-    /// Loads a complete context with explicit and automatic protected rules.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when either model rejects the SID/SoR input, when the
-    /// input is not complete strict CBOR, when SCHC semantic validation fails,
-    /// or when an explicit protected rule is absent.
-    #[allow(clippy::needless_pass_by_value)]
-    pub fn from_sor_with_policy(
-        sid_json: &str,
-        sor: &[u8],
-        policy: ProtectionPolicy,
-    ) -> Result<Self> {
         let model = CoreconfModel::from_sid_str(sid_json)
             .map_err(|error| ContextError::Model(error.to_string()))?;
         let sid_registry = SidRegistry::from_json_str(sid_json)
             .map_err(|error| ContextError::Schc(error.to_string()))?;
         let value = strict_cbor_value(sor)?;
-        ensure_schc_root(&value)?;
-        let rustconf_sor = rustconf_compatible_sor(&value)?;
-
-        // Use rustconf's model conversion, then normalize all ordered SCHC
-        // lists before emitting the canonical complete SoR. The accepted
-        // rustconf codec resolves identityrefs from their numeric SID values
-        // and deliberately rejects the SCHC identityref tag, so only its
-        // private conversion view removes tag 45. The canonical wire value
-        // remains tagged through encode_tree's restoration step.
+        let root_sid = model
+            .composite_model()
+            .get_sid("/ietf-schc:schc")
+            .ok_or_else(|| {
+                ContextError::Model("SID model is missing /ietf-schc:schc".to_owned())
+            })?;
+        ensure_schc_root(&value, root_sid)?;
+        // Use rustconf's model conversion directly, then normalize all
+        // ordered SCHC lists before emitting the canonical complete SoR.
         let initial_tree = model
-            .to_value(&rustconf_sor)
+            .to_value(sor)
             .map_err(|error| ContextError::Model(error.to_string()))?;
         let initial_tree = normalize_tree(initial_tree)?;
         let canonical_sor = encode_tree(&model, &initial_tree)?;
-        let canonical_value = strict_cbor_value(&canonical_sor)?;
-        let canonical_rustconf_sor = rustconf_compatible_sor(&canonical_value)?;
+        strict_cbor_value(&canonical_sor)?;
         let canonical_tree = model
-            .to_value(&canonical_rustconf_sor)
+            .to_value(&canonical_sor)
             .map_err(|error| ContextError::Model(error.to_string()))?;
         let canonical_tree = normalize_tree(canonical_tree)?;
         if canonical_tree != initial_tree {
@@ -139,7 +132,8 @@ impl LoadedContext {
 
         let rule_context = RuleContext::from_cbor_slice(&canonical_sor, sid_registry.clone())
             .map_err(|error| ContextError::Schc(error.to_string()))?;
-        let protected = ProtectedRules::derive(&rule_context, &policy)?;
+        let protected = ProtectedRules::derive(&rule_context)?;
+        let guard_period = guard_period_from_tree(&canonical_tree)?;
         Ok(Self {
             model,
             sid_registry,
@@ -147,6 +141,7 @@ impl LoadedContext {
             tree: canonical_tree,
             sor: canonical_sor,
             protected,
+            guard_period,
         })
     }
 
@@ -185,31 +180,202 @@ impl LoadedContext {
     pub const fn protected_rules(&self) -> &ProtectedRules {
         &self.protected
     }
+
+    /// Returns the configured guard period when its optional tick count is
+    /// present. An omitted tick duration uses the YANG default of 20.
+    #[must_use]
+    pub const fn guard_period(&self) -> Option<GuardPeriod> {
+        self.guard_period
+    }
 }
 
-fn rustconf_compatible_sor(value: &CborValue) -> Result<Vec<u8>> {
-    let value = strip_identityref_tags(value.clone());
-    let mut bytes = Vec::new();
-    ciborium::ser::into_writer(&value, &mut bytes)
-        .map_err(|error| ContextError::Cbor(error.to_string()))?;
-    let _ = strict_cbor_value(&bytes)?;
-    Ok(bytes)
+fn guard_period_from_tree(tree: &Value) -> Result<Option<GuardPeriod>> {
+    let Some(context) = tree
+        .get("ietf-schc:context")
+        .or_else(|| tree.get("context"))
+    else {
+        return Ok(None);
+    };
+    let Some(period) = context.get("guard-period") else {
+        return Ok(None);
+    };
+    let Some(period) = period.as_object() else {
+        return Err(ContextError::Model(
+            "guard-period is not an object".to_owned(),
+        ));
+    };
+    let duration = match period.get("ticks-duration") {
+        None => 20,
+        Some(value) => value
+            .as_u64()
+            .and_then(|value| u8::try_from(value).ok())
+            .ok_or_else(|| {
+                ContextError::Model("guard-period/ticks-duration is not uint8".to_owned())
+            })?,
+    };
+    let Some(numbers_value) = period.get("ticks-numbers") else {
+        // The YANG leaf is optional and has no default. Keep the existing
+        // public API's concrete GuardPeriod shape without inventing zero.
+        return Ok(None);
+    };
+    let numbers = numbers_value
+        .as_u64()
+        .and_then(|value| u16::try_from(value).ok())
+        .ok_or_else(|| {
+            ContextError::Model("guard-period/ticks-numbers is not uint16".to_owned())
+        })?;
+    Ok(Some(GuardPeriod {
+        ticks_duration: duration,
+        ticks_numbers: numbers,
+    }))
 }
 
-fn strip_identityref_tags(value: CborValue) -> CborValue {
-    match value {
-        CborValue::Array(values) => {
-            CborValue::Array(values.into_iter().map(strip_identityref_tags).collect())
+#[cfg(test)]
+mod guard_period_tests {
+    use super::{cbor_i64, guard_period_from_tree, GuardPeriod, LoadedContext};
+    use ciborium::value::Value as CborValue;
+    use serde_json::json;
+
+    const SID: &str = include_str!("../../../fixtures/demo/ietf-schc@2026-09-22.sid");
+    const SOR: &[u8] = include_bytes!("../../../fixtures/demo/initial.sor");
+
+    #[test]
+    fn guard_period_accepts_schema_boundaries() {
+        assert_eq!(
+            guard_period_from_tree(&json!({
+                "ietf-schc:context": {
+                    "guard-period": {
+                        "ticks-duration": 255,
+                        "ticks-numbers": 65535
+                    }
+                }
+            }))
+            .expect("guard period"),
+            Some(GuardPeriod {
+                ticks_duration: 255,
+                ticks_numbers: 65535
+            })
+        );
+    }
+
+    #[test]
+    fn guard_period_rejects_ticks_duration_above_uint8() {
+        let error = guard_period_from_tree(&json!({
+            "ietf-schc:context": {
+                "guard-period": {
+                    "ticks-duration": 256,
+                    "ticks-numbers": 0
+                }
+            }
+        }))
+        .expect_err("ticks-duration 256 must be rejected");
+        assert!(error.to_string().contains("ticks-duration is not uint8"));
+    }
+
+    #[test]
+    fn guard_period_rejects_malformed_present_leaves() {
+        let cases = [
+            (
+                json!({"ticks-duration": null, "ticks-numbers": 0}),
+                "ticks-duration",
+            ),
+            (
+                json!({"ticks-duration": "20", "ticks-numbers": 0}),
+                "ticks-duration",
+            ),
+            (
+                json!({"ticks-duration": -1, "ticks-numbers": 0}),
+                "ticks-duration",
+            ),
+            (
+                json!({"ticks-duration": 20, "ticks-numbers": null}),
+                "ticks-numbers",
+            ),
+            (
+                json!({"ticks-duration": 20, "ticks-numbers": "0"}),
+                "ticks-numbers",
+            ),
+            (
+                json!({"ticks-duration": 20, "ticks-numbers": -1}),
+                "ticks-numbers",
+            ),
+            (
+                json!({"ticks-duration": 20, "ticks-numbers": 65536}),
+                "ticks-numbers",
+            ),
+        ];
+        for (period, leaf) in cases {
+            let error = guard_period_from_tree(&json!({
+                "ietf-schc:context": {"guard-period": period}
+            }))
+            .expect_err("malformed guard-period leaf must be rejected");
+            assert!(error.to_string().contains(&format!("{leaf} is not")));
         }
-        CborValue::Map(entries) => CborValue::Map(
-            entries
-                .into_iter()
-                .map(|(key, value)| (strip_identityref_tags(key), strip_identityref_tags(value)))
-                .collect(),
-        ),
-        CborValue::Tag(45, value) => strip_identityref_tags(*value),
-        CborValue::Tag(tag, value) => CborValue::Tag(tag, Box::new(strip_identityref_tags(*value))),
-        other => other,
+    }
+
+    #[test]
+    fn guard_period_rejects_non_object_container() {
+        let error = guard_period_from_tree(&json!({
+            "ietf-schc:context": {"guard-period": []}
+        }))
+        .expect_err("non-object guard-period must be rejected");
+        assert!(error.to_string().contains("guard-period is not an object"));
+    }
+
+    #[test]
+    fn guard_period_without_tick_count_is_not_materialized() {
+        assert_eq!(
+            guard_period_from_tree(&json!({
+                "ietf-schc:context": {
+                    "guard-period": {
+                        "ticks-duration": 20
+                    }
+                }
+            }))
+            .expect("guard period"),
+            None
+        );
+    }
+
+    #[test]
+    fn loaded_context_uses_default_duration_when_guard_duration_is_omitted() {
+        let mut sor: CborValue =
+            ciborium::de::from_reader(std::io::Cursor::new(SOR)).expect("demo SoR");
+        let CborValue::Map(root) = &mut sor else {
+            panic!("demo SoR root is not a map");
+        };
+        let context = root
+            .iter_mut()
+            .find_map(|(key, value)| (cbor_i64(key) == Some(2801)).then_some(value))
+            .expect("demo context");
+        let CborValue::Map(context) = context else {
+            panic!("demo context is not a map");
+        };
+        let guard_period = context
+            .iter_mut()
+            .find_map(|(key, value)| (cbor_i64(key) == Some(1)).then_some(value))
+            .expect("demo guard period");
+        let CborValue::Map(guard_period) = guard_period else {
+            panic!("demo guard period is not a map");
+        };
+        guard_period.retain(|(key, _)| cbor_i64(key) != Some(1));
+
+        let mut partial_sor = Vec::new();
+        ciborium::ser::into_writer(&sor, &mut partial_sor).expect("partial demo SoR");
+        let loaded = LoadedContext::from_sor(SID, &partial_sor).expect("default duration");
+        assert_eq!(
+            loaded.guard_period(),
+            Some(GuardPeriod {
+                ticks_duration: 20,
+                ticks_numbers: 10,
+            })
+        );
+        assert!(loaded
+            .tree()
+            .get("ietf-schc:context")
+            .and_then(|context| context.get("guard-period"))
+            .and_then(|period| period.get("ticks-duration"))
+            .is_none());
     }
 }
 
@@ -219,25 +385,83 @@ pub(crate) struct ContextRecipe {
     pub(crate) sid_json: Arc<str>,
     pub(crate) device_id: DeviceId,
     pub(crate) profile: DeviceProfile,
-    pub(crate) policy: ProtectionPolicy,
     pub(crate) dynamic_rule_ids: Option<DynamicRuleIdNamespace>,
     pub(crate) context_profile: Option<ContextProfile>,
 }
 
-/// A prepared context bound to one canonical tree, `SoR`, runtime, and digest.
+enum ContextSource<'a> {
+    Sor(&'a [u8]),
+    Tree(Value),
+}
+
+impl ContextSource<'_> {
+    fn load(self, sid_json: &str) -> Result<LoadedContext> {
+        match self {
+            Self::Sor(sor) => LoadedContext::from_sor(sid_json, sor),
+            Self::Tree(tree) => {
+                let model = CoreconfModel::from_sid_str(sid_json)
+                    .map_err(|error| ContextError::Model(error.to_string()))?;
+                let canonical_tree = normalize_tree(tree.clone())?;
+                if canonical_tree != tree {
+                    return Err(ContextError::NonCanonicalCandidate);
+                }
+                let sor = encode_tree(&model, &canonical_tree)?;
+                let loaded = LoadedContext::from_sor(sid_json, &sor)?;
+                if loaded.tree() != &canonical_tree {
+                    return Err(ContextError::NonCanonicalCandidate);
+                }
+                Ok(loaded)
+            }
+        }
+    }
+}
+
+fn context_recipe(
+    sid_json: &str,
+    device_id: DeviceId,
+    profile: DeviceProfile,
+    dynamic_rule_ids: Option<DynamicRuleIdNamespace>,
+    context_profile: Option<ContextProfile>,
+) -> ContextRecipe {
+    ContextRecipe {
+        sid_json: Arc::from(sid_json),
+        device_id,
+        profile,
+        dynamic_rule_ids,
+        context_profile,
+    }
+}
+
+struct ContextData {
+    tree: Arc<Value>,
+    sor: Arc<[u8]>,
+    // The full runtime serves protected management traffic; application
+    // traffic uses the filtered runtime below.
+    runtime: Arc<Runtime>,
+    application_runtime: Arc<Runtime>,
+    application_rule_ids: Arc<[RuleId]>,
+    protected: ProtectedRules,
+    guard_period: Option<GuardPeriod>,
+    rule_ids: Arc<[RuleId]>,
+    rules: Arc<[Rule]>,
+    digest: [u8; 32],
+    tag: ContextTag,
+}
+
+impl fmt::Debug for ContextData {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ContextData")
+            .field("tag", &self.tag)
+            .finish_non_exhaustive()
+    }
+}
+
+/// A prepared context bound to one canonical tree, `SoR`, runtime, and context identity.
 #[derive(Debug, Clone)]
 pub struct PreparedContext {
     pub(crate) recipe: ContextRecipe,
-    pub(crate) tree: Arc<Value>,
-    pub(crate) sor: Arc<[u8]>,
-    runtime: Arc<Runtime>,
-    application_runtime: Arc<Runtime>,
-    pub(crate) application_rule_ids: Arc<[RuleId]>,
-    pub(crate) protected: ProtectedRules,
-    pub(crate) rule_ids: Arc<[RuleId]>,
-    pub(crate) rules: Arc<[Rule]>,
-    digest: [u8; 32],
-    tag: ContextTag,
+    data: Arc<ContextData>,
 }
 
 impl PreparedContext {
@@ -253,77 +477,16 @@ impl PreparedContext {
         device_id: DeviceId,
         profile: DeviceProfile,
     ) -> Result<Self> {
-        Self::from_sor_with_policy(
-            sid_json,
-            sor,
-            device_id,
-            profile,
-            ProtectionPolicy::default(),
-        )
-    }
-
-    /// Builds an initial prepared context with explicit protected `RuleIDs`.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when SID/SoR loading, SCHC validation, explicit
-    /// protected-rule derivation, or runtime construction fails.
-    pub fn from_sor_with_policy(
-        sid_json: &str,
-        sor: &[u8],
-        device_id: DeviceId,
-        profile: DeviceProfile,
-        policy: ProtectionPolicy,
-    ) -> Result<Self> {
-        let loaded = LoadedContext::from_sor_with_policy(sid_json, sor, policy.clone())?;
-        Self::from_loaded(
-            ContextRecipe {
-                sid_json: Arc::from(sid_json),
-                device_id,
-                profile,
-                policy,
-                dynamic_rule_ids: None,
-                context_profile: None,
-            },
-            loaded,
-        )
-    }
-
-    /// Builds an initial prepared context with an explicit dynamic `RuleID` tree.
-    ///
-    /// The namespace is retained in every candidate context so automatic
-    /// management can allocate without receiving a `RuleID` from its caller.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the SID, `SoR`, or dynamic namespace is invalid.
-    pub fn from_sor_with_policy_and_allocation(
-        sid_json: &str,
-        sor: &[u8],
-        device_id: DeviceId,
-        profile: DeviceProfile,
-        policy: ProtectionPolicy,
-        dynamic_rule_ids: DynamicRuleIdNamespace,
-    ) -> Result<Self> {
-        let loaded = LoadedContext::from_sor_with_policy(sid_json, sor, policy.clone())?;
-        Self::from_loaded(
-            ContextRecipe {
-                sid_json: Arc::from(sid_json),
-                device_id,
-                profile,
-                policy,
-                dynamic_rule_ids: Some(dynamic_rule_ids),
-                context_profile: None,
-            },
-            loaded,
+        Self::from_source(
+            context_recipe(sid_json, device_id, profile, None, None),
+            ContextSource::Sor(sor),
         )
     }
 
     /// Builds an initial context from a mechanism-owned context profile.
     ///
-    /// The profile supplies protected management identities and the explicit
-    /// dynamic `RuleID` namespace. D-IPT callers therefore do not select
-    /// either `RuleID` values or lengths.
+    /// The profile supplies the explicit dynamic `RuleID` namespace. D-IPT
+    /// callers therefore do not select either `RuleID` values or lengths.
     ///
     /// # Errors
     ///
@@ -338,18 +501,15 @@ impl PreparedContext {
         context_profile: ContextProfile,
     ) -> Result<Self> {
         let context_profile = context_profile.validate()?;
-        let policy = context_profile.protection_policy();
-        let loaded = LoadedContext::from_sor_with_policy(sid_json, sor, policy.clone())?;
-        Self::from_loaded(
-            ContextRecipe {
-                sid_json: Arc::from(sid_json),
+        Self::from_source(
+            context_recipe(
+                sid_json,
                 device_id,
                 profile,
-                policy,
-                dynamic_rule_ids: context_profile.dynamic_rule_ids.clone(),
-                context_profile: Some(context_profile),
-            },
-            loaded,
+                context_profile.dynamic_rule_ids.clone(),
+                Some(context_profile),
+            ),
+            ContextSource::Sor(sor),
         )
     }
 
@@ -369,145 +529,27 @@ impl PreparedContext {
         tree: Value,
         device_id: DeviceId,
         profile: DeviceProfile,
-        policy: ProtectionPolicy,
     ) -> Result<Self> {
-        let model = CoreconfModel::from_sid_str(sid_json)
-            .map_err(|error| ContextError::Model(error.to_string()))?;
-        let canonical_tree = normalize_tree(tree.clone())?;
-        if canonical_tree != tree {
-            return Err(ContextError::NonCanonicalCandidate);
-        }
-        let sor = encode_tree(&model, &canonical_tree)?;
-        let loaded = LoadedContext::from_sor_with_policy(sid_json, &sor, policy.clone())?;
-        if loaded.tree != canonical_tree {
-            return Err(ContextError::NonCanonicalCandidate);
-        }
-        Self::from_loaded(
-            ContextRecipe {
-                sid_json: Arc::from(sid_json),
-                device_id,
-                profile,
-                policy,
-                dynamic_rule_ids: None,
-                context_profile: None,
-            },
-            loaded,
-        )
-    }
-
-    /// Builds a candidate context with an explicit dynamic `RuleID` tree.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the candidate is not canonical or the context
-    /// parameters are invalid.
-    #[allow(clippy::needless_pass_by_value)]
-    pub fn from_tree_with_policy_and_allocation(
-        sid_json: &str,
-        tree: Value,
-        device_id: DeviceId,
-        profile: DeviceProfile,
-        policy: ProtectionPolicy,
-        dynamic_rule_ids: DynamicRuleIdNamespace,
-    ) -> Result<Self> {
-        let model = CoreconfModel::from_sid_str(sid_json)
-            .map_err(|error| ContextError::Model(error.to_string()))?;
-        let canonical_tree = normalize_tree(tree.clone())?;
-        if canonical_tree != tree {
-            return Err(ContextError::NonCanonicalCandidate);
-        }
-        let sor = encode_tree(&model, &canonical_tree)?;
-        let loaded = LoadedContext::from_sor_with_policy(sid_json, &sor, policy.clone())?;
-        if loaded.tree != canonical_tree {
-            return Err(ContextError::NonCanonicalCandidate);
-        }
-        Self::from_loaded(
-            ContextRecipe {
-                sid_json: Arc::from(sid_json),
-                device_id,
-                profile,
-                policy,
-                dynamic_rule_ids: Some(dynamic_rule_ids),
-                context_profile: None,
-            },
-            loaded,
-        )
-    }
-
-    /// Builds a candidate context from a mechanism-owned context profile.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the profile, candidate tree, or runtime is
-    /// invalid.
-    #[allow(clippy::needless_pass_by_value)]
-    pub fn from_tree_with_context_profile(
-        sid_json: &str,
-        tree: Value,
-        device_id: DeviceId,
-        profile: DeviceProfile,
-        context_profile: ContextProfile,
-    ) -> Result<Self> {
-        let context_profile = context_profile.validate()?;
-        let policy = context_profile.protection_policy();
-        let model = CoreconfModel::from_sid_str(sid_json)
-            .map_err(|error| ContextError::Model(error.to_string()))?;
-        let canonical_tree = normalize_tree(tree.clone())?;
-        if canonical_tree != tree {
-            return Err(ContextError::NonCanonicalCandidate);
-        }
-        let sor = encode_tree(&model, &canonical_tree)?;
-        let loaded = LoadedContext::from_sor_with_policy(sid_json, &sor, policy.clone())?;
-        if loaded.tree != canonical_tree {
-            return Err(ContextError::NonCanonicalCandidate);
-        }
-        Self::from_loaded(
-            ContextRecipe {
-                sid_json: Arc::from(sid_json),
-                device_id,
-                profile,
-                policy,
-                dynamic_rule_ids: context_profile.dynamic_rule_ids.clone(),
-                context_profile: Some(context_profile),
-            },
-            loaded,
+        Self::from_source(
+            context_recipe(sid_json, device_id, profile, None, None),
+            ContextSource::Tree(tree),
         )
     }
 
     pub(crate) fn from_tree_for_recipe(recipe: &ContextRecipe, tree: Value) -> Result<Self> {
-        if let Some(context_profile) = &recipe.context_profile {
-            return Self::from_tree_with_context_profile(
-                recipe.sid_json.as_ref(),
-                tree,
-                recipe.device_id.clone(),
-                recipe.profile.clone(),
-                context_profile.clone(),
-            );
-        }
-        if let Some(dynamic_rule_ids) = &recipe.dynamic_rule_ids {
-            return Self::from_tree_with_policy_and_allocation(
-                recipe.sid_json.as_ref(),
-                tree,
-                recipe.device_id.clone(),
-                recipe.profile.clone(),
-                recipe.policy.clone(),
-                dynamic_rule_ids.clone(),
-            );
-        }
-        Self::from_tree(
-            recipe.sid_json.as_ref(),
-            tree,
-            recipe.device_id.clone(),
-            recipe.profile.clone(),
-            recipe.policy.clone(),
-        )
+        Self::from_source(recipe.clone(), ContextSource::Tree(tree))
+    }
+
+    fn from_source(recipe: ContextRecipe, source: ContextSource<'_>) -> Result<Self> {
+        let loaded = source.load(recipe.sid_json.as_ref())?;
+        Self::from_loaded(recipe, loaded)
     }
 
     fn from_loaded(mut recipe: ContextRecipe, loaded: LoadedContext) -> Result<Self> {
         if let Some(dynamic_rule_ids) = &mut recipe.dynamic_rule_ids {
             *dynamic_rule_ids = dynamic_rule_ids.validate()?;
             for rule in loaded.rule_context.rules().rules() {
-                if crate::rule_ids_overlap(rule.id(), dynamic_rule_ids.prefix().rule_id())
+                if crate::allocation::overlaps(rule.id(), dynamic_rule_ids.prefix().rule_id())
                     && !dynamic_rule_ids.accepts(rule.id())
                 {
                     return Err(ContextError::RuleIdTree(
@@ -527,6 +569,7 @@ impl PreparedContext {
         .map_err(|error| ContextError::Runtime(error.to_string()))?;
         let (application_runtime, application_rule_ids) = application_runtime(
             &loaded.sor,
+            &loaded.model,
             &loaded.sid_registry,
             &loaded.protected,
             loaded.rule_context.clone(),
@@ -537,67 +580,76 @@ impl PreparedContext {
         let tag = crate::codec::context_tag(digest);
         let rules: Arc<[Rule]> = Arc::from(loaded.rule_context.rules().rules().to_vec());
         let rule_ids = Arc::from(rules.iter().map(Rule::id).collect::<Vec<_>>());
-        Ok(Self {
-            recipe,
+        let data = ContextData {
             tree: Arc::new(loaded.tree),
             sor: Arc::from(loaded.sor),
             runtime: Arc::new(runtime),
             application_runtime: Arc::new(application_runtime),
             application_rule_ids,
             protected: loaded.protected,
+            guard_period: loaded.guard_period,
             rule_ids,
             rules,
             digest,
             tag,
+        };
+        Ok(Self {
+            recipe,
+            data: Arc::new(data),
         })
     }
 
     /// Returns the canonical datastore tree without exposing mutable storage.
     #[must_use]
     pub fn tree(&self) -> &Value {
-        self.tree.as_ref()
+        self.data.tree.as_ref()
     }
 
     /// Returns canonical complete `SoR` bytes.
     #[must_use]
     pub fn sor(&self) -> &[u8] {
-        self.sor.as_ref()
+        self.data.sor.as_ref()
     }
 
     /// Returns the fully built schc-runtime runtime.
     #[must_use]
     pub fn runtime(&self) -> &Runtime {
-        self.runtime.as_ref()
+        self.data.runtime.as_ref()
     }
 
     /// Returns the runtime as an immutable shared allocation.
     #[must_use]
     pub fn runtime_arc(&self) -> Arc<Runtime> {
-        Arc::clone(&self.runtime)
+        Arc::clone(&self.data.runtime)
     }
 
-    /// Returns the deterministic domain-separated SHA-256 digest.
-    #[must_use]
-    pub const fn digest(&self) -> [u8; 32] {
-        self.digest
+    fn digest(&self) -> [u8; 32] {
+        self.data.digest
     }
 
     /// Returns the compact eight-byte context tag.
     #[must_use]
-    pub const fn tag(&self) -> ContextTag {
-        self.tag
+    pub fn tag(&self) -> ContextTag {
+        self.data.tag
     }
 
     /// Returns protected rules captured by this preparation.
     #[must_use]
-    pub const fn protected_rules(&self) -> &ProtectedRules {
-        &self.protected
+    pub fn protected_rules(&self) -> &ProtectedRules {
+        &self.data.protected
+    }
+
+    /// Returns the configured guard period when its optional tick count is
+    /// present. An omitted tick duration uses the YANG default of 20.
+    #[must_use]
+    pub fn guard_period(&self) -> Option<GuardPeriod> {
+        self.data.guard_period
     }
 
     /// Returns protected `RuleIDs` captured by this preparation.
     #[must_use]
     pub fn protected_rule_ids(&self) -> Vec<RuleId> {
-        self.protected.ids()
+        self.data.protected.ids()
     }
 
     /// Returns the explicit dynamic `RuleID` namespace, when configured.
@@ -611,27 +663,11 @@ impl PreparedContext {
     pub fn context_profile(&self) -> Option<&ContextProfile> {
         self.recipe.context_profile.as_ref()
     }
-
-    /// Returns a copy of the digest as a hexadecimal string.
-    #[must_use]
-    pub fn digest_hex(&self) -> String {
-        use std::fmt::Write as _;
-
-        let mut output = String::with_capacity(self.digest.len() * 2);
-        for byte in self.digest {
-            write!(&mut output, "{byte:02x}").expect("writing to String cannot fail");
-        }
-        output
-    }
 }
-
-const SCHC_ROOT_SID: i64 = 2574;
-const RULE_LIST_SID: i64 = 23;
-const RULE_ID_LENGTH_SID: i64 = 1;
-const RULE_ID_VALUE_SID: i64 = 2;
 
 fn application_runtime(
     sor: &[u8],
+    model: &CoreconfModel,
     sid_registry: &SidRegistry,
     protected: &ProtectedRules,
     rule_context: RuleContext,
@@ -653,20 +689,41 @@ fn application_runtime(
     }
     let mut filtered: CborValue = ciborium::de::from_reader(Cursor::new(sor))
         .map_err(|error| ContextError::Cbor(error.to_string()))?;
-    let Some(root) = cbor_map_value_mut(&mut filtered, SCHC_ROOT_SID) else {
+    let composite = model.composite_model();
+    let root_sid = composite
+        .get_sid("/ietf-schc:schc")
+        .ok_or_else(|| ContextError::Model("SID model is missing /ietf-schc:schc".to_owned()))?;
+    let rule_sid = composite.get_sid("/ietf-schc:schc/rule").ok_or_else(|| {
+        ContextError::Model("SID model is missing /ietf-schc:schc/rule".to_owned())
+    })?;
+    let rule_id_length_sid = composite
+        .get_sid("/ietf-schc:schc/rule/rule-id-length")
+        .ok_or_else(|| ContextError::Model("SID model is missing rule-id-length".to_owned()))?;
+    let rule_id_value_sid = composite
+        .get_sid("/ietf-schc:schc/rule/rule-id-value")
+        .ok_or_else(|| ContextError::Model("SID model is missing rule-id-value".to_owned()))?;
+    let rule_delta = rule_sid
+        .checked_sub(root_sid)
+        .ok_or_else(|| ContextError::Model("rule SID precedes the SCHC root SID".to_owned()))?;
+    let rule_id_length_delta = rule_id_length_sid.checked_sub(rule_sid).ok_or_else(|| {
+        ContextError::Model("rule-id-length SID precedes the rule SID".to_owned())
+    })?;
+    let rule_id_value_delta = rule_id_value_sid
+        .checked_sub(rule_sid)
+        .ok_or_else(|| ContextError::Model("rule-id-value SID precedes the rule SID".to_owned()))?;
+    let Some(root) = cbor_map_value_mut(&mut filtered, root_sid) else {
         return Err(ContextError::Cbor(
             "missing SCHC root in canonical SoR".to_owned(),
         ));
     };
-    let Some(rules) = cbor_map_value_mut(root, RULE_LIST_SID).and_then(CborValue::as_array_mut)
-    else {
+    let Some(rules) = cbor_map_value_mut(root, rule_delta).and_then(CborValue::as_array_mut) else {
         return Err(ContextError::Cbor(
             "missing rule list in canonical SoR".to_owned(),
         ));
     };
     rules.retain(|rule| {
-        let value = cbor_map_value(rule, RULE_ID_VALUE_SID).and_then(cbor_u64);
-        let length = cbor_map_value(rule, RULE_ID_LENGTH_SID).and_then(cbor_u64);
+        let value = cbor_map_value(rule, rule_id_value_delta).and_then(cbor_u64);
+        let length = cbor_map_value(rule, rule_id_length_delta).and_then(cbor_u64);
         match (value, length.and_then(|bits| usize::try_from(bits).ok())) {
             (Some(value), Some(bits)) => !protected.contains(RuleId::new(value, bits)),
             _ => true,
@@ -725,17 +782,8 @@ fn cbor_u64(value: &CborValue) -> Option<u64> {
 /// The immutable tuple published by [`ActiveContext`].
 #[derive(Debug)]
 pub struct ContextSnapshot {
-    tree: Arc<Value>,
-    sor: Arc<[u8]>,
-    runtime: Arc<Runtime>,
-    application_runtime: Arc<Runtime>,
-    application_rule_ids: Arc<[RuleId]>,
+    data: Arc<ContextData>,
     generation: u64,
-    digest: [u8; 32],
-    protected: ProtectedRules,
-    rule_ids: Arc<[RuleId]>,
-    rules: Arc<[Rule]>,
-    tag: ContextTag,
     dynamic_rule_ids: Option<DynamicRuleIdNamespace>,
     context_profile: Option<ContextProfile>,
 }
@@ -743,17 +791,8 @@ pub struct ContextSnapshot {
 impl ContextSnapshot {
     pub(crate) fn from_prepared(prepared: &PreparedContext, generation: u64) -> Self {
         Self {
-            tree: Arc::clone(&prepared.tree),
-            sor: Arc::clone(&prepared.sor),
-            runtime: Arc::clone(&prepared.runtime),
-            application_runtime: Arc::clone(&prepared.application_runtime),
-            application_rule_ids: Arc::clone(&prepared.application_rule_ids),
+            data: Arc::clone(&prepared.data),
             generation,
-            digest: prepared.digest,
-            protected: prepared.protected.clone(),
-            rule_ids: Arc::clone(&prepared.rule_ids),
-            rules: Arc::clone(&prepared.rules),
-            tag: prepared.tag,
             dynamic_rule_ids: prepared.recipe.dynamic_rule_ids.clone(),
             context_profile: prepared.recipe.context_profile.clone(),
         }
@@ -762,33 +801,33 @@ impl ContextSnapshot {
     /// Returns the canonical datastore tree.
     #[must_use]
     pub fn tree(&self) -> &Value {
-        self.tree.as_ref()
+        self.data.tree.as_ref()
     }
 
     /// Returns canonical complete `SoR` bytes.
     #[must_use]
     pub fn sor(&self) -> &[u8] {
-        self.sor.as_ref()
+        self.data.sor.as_ref()
     }
 
     /// Returns the fully built schc-runtime runtime.
     #[must_use]
     pub fn runtime(&self) -> &Runtime {
-        self.runtime.as_ref()
+        self.data.runtime.as_ref()
     }
 
     /// Returns the shared runtime allocation.
     #[must_use]
     pub fn runtime_arc(&self) -> Arc<Runtime> {
-        Arc::clone(&self.runtime)
+        Arc::clone(&self.data.runtime)
     }
 
     pub(crate) fn application_runtime(&self) -> &Runtime {
-        self.application_runtime.as_ref()
+        self.data.application_runtime.as_ref()
     }
 
     pub(crate) fn contains_application_rule_id(&self, id: RuleId) -> bool {
-        self.application_rule_ids.contains(&id)
+        self.data.application_rule_ids.contains(&id)
     }
 
     /// Returns the monotonic publication generation.
@@ -797,34 +836,39 @@ impl ContextSnapshot {
         self.generation
     }
 
-    /// Returns the deterministic context digest.
-    #[must_use]
-    pub const fn digest(&self) -> [u8; 32] {
-        self.digest
+    fn digest(&self) -> [u8; 32] {
+        self.data.digest
     }
 
     /// Returns the compact eight-byte context tag.
     #[must_use]
-    pub const fn tag(&self) -> ContextTag {
-        self.tag
+    pub fn tag(&self) -> ContextTag {
+        self.data.tag
     }
 
     /// Returns all rules in deterministic canonical order.
     #[must_use]
     pub fn rules(&self) -> &[Rule] {
-        &self.rules
+        &self.data.rules
     }
 
     /// Returns protected rules in this snapshot.
     #[must_use]
-    pub const fn protected_rules(&self) -> &ProtectedRules {
-        &self.protected
+    pub fn protected_rules(&self) -> &ProtectedRules {
+        &self.data.protected
+    }
+
+    /// Returns the configured guard period when its optional tick count is
+    /// present. An omitted tick duration uses the YANG default of 20.
+    #[must_use]
+    pub fn guard_period(&self) -> Option<GuardPeriod> {
+        self.data.guard_period
     }
 
     /// Returns whether this snapshot contains the exact `RuleID`.
     #[must_use]
     pub fn contains_rule_id(&self, id: RuleId) -> bool {
-        self.rule_ids.contains(&id)
+        self.data.rule_ids.contains(&id)
     }
 
     /// Returns the explicit dynamic `RuleID` namespace, when configured.
@@ -857,7 +901,7 @@ impl fmt::Debug for ActiveContext {
         formatter
             .debug_struct("ActiveContext")
             .field("generation", &self.snapshot.load().generation())
-            .field("digest", &self.snapshot.load().digest())
+            .field("tag", &self.snapshot.load().tag())
             .finish_non_exhaustive()
     }
 }
@@ -888,9 +932,7 @@ impl ActiveContext {
         self.snapshot.load().generation()
     }
 
-    /// Returns the current digest.
-    #[must_use]
-    pub fn digest(&self) -> [u8; 32] {
+    fn digest(&self) -> [u8; 32] {
         self.snapshot.load().digest()
     }
 
@@ -898,6 +940,13 @@ impl ActiveContext {
     #[must_use]
     pub fn tag(&self) -> ContextTag {
         self.snapshot.load().tag()
+    }
+
+    /// Returns the current configured guard period when its optional tick count
+    /// is present. An omitted tick duration uses the YANG default of 20.
+    #[must_use]
+    pub fn guard_period(&self) -> Option<GuardPeriod> {
+        self.snapshot.load().guard_period()
     }
 
     /// Returns the current canonical tree as a detached value.
@@ -950,7 +999,6 @@ impl ActiveContext {
         if prepared.recipe.sid_json != self.recipe.sid_json
             || prepared.recipe.device_id != self.recipe.device_id
             || prepared.recipe.profile != self.recipe.profile
-            || prepared.recipe.policy != self.recipe.policy
             || prepared.recipe.dynamic_rule_ids != self.recipe.dynamic_rule_ids
             || prepared.recipe.context_profile != self.recipe.context_profile
         {

@@ -1,37 +1,37 @@
 //! Coverage for the real raw UDP SCHC link and rule-derived routing.
 
+mod support;
+
 use std::net::{Ipv6Addr, SocketAddr, UdpSocket};
 use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
 use coreconf_model::instance_id::{encode_identifiers, InstancePath};
-use schc_core::{RuleId, SidRegistry};
+use schc_core::RuleId;
 use schc_coreconf::{
-    context_check_request, management_bit_breakdown, protected_management_rule_ids,
-    rule_get_request, rule_list_request, temporary_ordinary_response, ActiveContext,
-    ContextProfile, FlowChange, FlowDirection, GenericDataService, InspectionService,
-    Ipv6UdpCoapPacket, Ipv6UdpPacket, LinkRole, PacketMetadata, PreparedContext, ProtectionPolicy,
+    context_check_request, management_bit_breakdown, rule_get_request, rule_list_request,
+    ActiveContext, ContextProfile, FlowChange, FlowDirection, GenericDataService,
+    InspectionService, Ipv6UdpCoapPacket, Ipv6UdpPacket, LinkRole, PacketMetadata, PreparedContext,
     RawUdpLink, RuleSelector, SchcLink, TrafficClass, TrafficOrigin, TrafficRoute,
     APPLICATION_PORT, CORE_LOGICAL_ADDRESS, DEVICE_LOGICAL_ADDRESS, MANAGEMENT_PORT,
 };
 use schc_runtime::{DeviceId, DeviceProfile};
 
-const SID: &str = include_str!("../../../fixtures/demo/ietf-schc@2026-05-07.sid");
+const SID: &str = include_str!("../../../fixtures/demo/ietf-schc@2026-09-22.sid");
 const SOR: &[u8] = include_bytes!("../../../fixtures/demo/initial.sor");
 const GENERIC_SID: &str =
-    include_str!("../../../fixtures/generic-ipv6-udp/ietf-schc@2026-05-07.sid");
+    include_str!("../../../fixtures/generic-ipv6-udp/ietf-schc@2026-09-22.sid");
 const GENERIC_SOR: &[u8] = include_bytes!("../../../fixtures/generic-ipv6-udp/initial.sor");
 const GENERIC_PROFILE: &str = include_str!("../../../fixtures/generic-ipv6-udp/profile.json");
 
 fn active(name: &str) -> Arc<ActiveContext> {
     Arc::new(ActiveContext::new(
-        PreparedContext::from_sor_with_policy(
+        PreparedContext::from_sor(
             SID,
             SOR,
             DeviceId::new(name).expect("device ID"),
             DeviceProfile::default(),
-            ProtectionPolicy::from_rule_ids(protected_management_rule_ids()),
         )
         .expect("initial context"),
     ))
@@ -133,7 +133,7 @@ fn ordinary_request_and_response_reconstruct_exactly_with_reports() {
     assert_eq!(decoded.report().traffic_class, TrafficClass::Ordinary);
     assert_eq!(decoded.report().schc_bit_len, encoded.report().schc_bit_len);
 
-    let response = temporary_ordinary_response(decoded.packet()).expect("response");
+    let response = support::ordinary_response(decoded.packet()).expect("response");
     assert_eq!(response.source(), request.destination());
     assert_eq!(response.destination(), request.source());
     assert_eq!(response.source_port(), request.destination_port());
@@ -276,7 +276,7 @@ fn flow_change_plans_real_generic_udp_duplicate_without_caller_rule_id() {
         panic!("changed flow must require a duplicate rule");
     };
     assert_eq!(parent, request.source);
-    assert_eq!(request.overrides.len(), 7);
+    assert_eq!(request.overrides.len(), 5);
     assert_ne!(request.destination, request.source);
     assert_eq!(
         request
@@ -286,9 +286,7 @@ fn flow_change_plans_real_generic_udp_duplicate_without_caller_rule_id() {
             .collect::<Vec<_>>(),
         vec![
             (2, Some("0")),
-            (6, Some("2306139568115548160")),
             (7, Some("1")),
-            (8, Some("2306139568115548160")),
             (9, Some("2")),
             (10, Some("5683")),
             (11, Some("5683")),
@@ -299,8 +297,8 @@ fn flow_change_plans_real_generic_udp_duplicate_without_caller_rule_id() {
     let matching_service = InspectionService::new(matching).expect("matching inspection service");
     let matching_packet = Ipv6UdpPacket::new(
         PacketMetadata::new(
-            "2001:db9::9".parse().expect("generic application address"),
-            "2001:db9::9".parse().expect("generic device address"),
+            "2001:db8::9".parse().expect("generic application address"),
+            "2001:db8::9".parse().expect("generic device address"),
             5684,
             5684,
             0,
@@ -314,6 +312,113 @@ fn flow_change_plans_real_generic_udp_duplicate_without_caller_rule_id() {
         .flow_change(&matching_packet, FlowDirection::Downlink)
         .expect("matching flow change");
     assert!(matches!(matching_change, FlowChange::AlreadyMatches { .. }));
+}
+
+#[test]
+fn generic_flow_changes_apply_and_round_trip_after_each_duplicate() {
+    let core_active = generic_ipv6_udp_active("steady-core");
+    let device_active = generic_ipv6_udp_active("steady-device");
+    let mut core_service = InspectionService::new(Arc::clone(&core_active)).expect("core service");
+    let mut device_service =
+        InspectionService::new(Arc::clone(&device_active)).expect("device service");
+    let core_link = SchcLink::new(Arc::clone(&core_active), LinkRole::Core);
+    let device_link = SchcLink::new(Arc::clone(&device_active), LinkRole::Device);
+
+    let first_packet = Ipv6UdpPacket::new(
+        PacketMetadata::new(
+            CORE_LOGICAL_ADDRESS,
+            DEVICE_LOGICAL_ADDRESS,
+            APPLICATION_PORT,
+            APPLICATION_PORT,
+            0,
+            0,
+            64,
+        ),
+        b"payload",
+    )
+    .expect("first logical packet");
+    let FlowChange::Duplicate { request, .. } = core_service
+        .flow_change(&first_packet, FlowDirection::Downlink)
+        .expect("first flow change")
+    else {
+        panic!("first flow must require a duplicate rule");
+    };
+    let datagram = core_service
+        .duplicate_rule_datagram(&request, 1)
+        .expect("first duplicate datagram");
+    assert!(core_service
+        .handle_datagram_no_response(&datagram)
+        .expect("core applies first duplicate")
+        .is_none());
+    assert!(device_service
+        .handle_datagram_no_response(&datagram)
+        .expect("device applies first duplicate")
+        .is_none());
+
+    let first_frame = core_link
+        .encode_bytes(TrafficOrigin::Application, first_packet.as_bytes())
+        .expect("first application frame");
+    let first_decoded = device_link
+        .decode_bytes(first_frame.frame().bytes())
+        .expect("first application decode");
+    assert_eq!(first_decoded.packet(), first_packet.as_bytes());
+    assert_eq!(first_decoded.report().rule_id, first_frame.report().rule_id);
+
+    let changed_packet = Ipv6UdpPacket::new(
+        PacketMetadata::new(
+            CORE_LOGICAL_ADDRESS,
+            DEVICE_LOGICAL_ADDRESS,
+            APPLICATION_PORT,
+            APPLICATION_PORT,
+            0,
+            2,
+            64,
+        ),
+        b"payload",
+    )
+    .expect("changed logical packet");
+    let FlowChange::Duplicate { request, .. } = core_service
+        .flow_change(&changed_packet, FlowDirection::Downlink)
+        .expect("changed flow change")
+    else {
+        panic!("changed flow must require a duplicate rule");
+    };
+    let datagram = core_service
+        .duplicate_rule_datagram(&request, 2)
+        .expect("changed duplicate datagram");
+    assert!(core_service
+        .handle_datagram_no_response(&datagram)
+        .expect("core applies changed duplicate")
+        .is_none());
+    assert!(device_service
+        .handle_datagram_no_response(&datagram)
+        .expect("device applies changed duplicate")
+        .is_none());
+
+    let repeated_frame = core_link
+        .encode_bytes(TrafficOrigin::Application, first_packet.as_bytes())
+        .expect("repeated application frame");
+    let repeated_decoded = device_link
+        .decode_bytes(repeated_frame.frame().bytes())
+        .expect("repeated application decode");
+    assert_eq!(repeated_decoded.packet(), first_packet.as_bytes());
+    assert_eq!(
+        repeated_frame.report().rule_id,
+        first_frame.report().rule_id
+    );
+
+    let changed_frame = core_link
+        .encode_bytes(TrafficOrigin::Application, changed_packet.as_bytes())
+        .expect("changed application frame");
+    let changed_decoded = device_link
+        .decode_bytes(changed_frame.frame().bytes())
+        .expect("changed application decode");
+    assert_eq!(changed_decoded.packet(), changed_packet.as_bytes());
+    assert_eq!(
+        changed_decoded.report().rule_id,
+        changed_frame.report().rule_id
+    );
+    assert_ne!(changed_frame.report().rule_id, first_frame.report().rule_id);
 }
 
 #[test]
@@ -459,32 +564,32 @@ fn current_management_shapes_round_trip_with_complete_bit_accounting() {
     let requests = [
         (
             "context check",
-            context_check_request(core.active_context().tag(), 1, &[0xaa]),
+            context_check_request(core.active_context().tag(), 1),
             RuleId::new(16, 8),
             67,
-            91,
-            12,
+            87,
+            11,
         ),
         (
             "rule list",
-            rule_list_request(2, &[0xaa]).expect("rule list request"),
+            rule_list_request(SID, 2).expect("rule list request"),
             RuleId::new(26, 8),
             63,
-            43,
-            6,
+            39,
+            5,
         ),
         (
             "rule detail",
             rule_get_request(
+                SID,
                 schc_coreconf::parse_rule_selector("20/8").expect("selector"),
                 3,
-                &[0xaa],
             )
             .expect("rule detail request"),
             RuleId::new(26, 8),
             67,
-            75,
-            10,
+            71,
+            9,
         ),
         (
             "rule update",
@@ -504,8 +609,8 @@ fn current_management_shapes_round_trip_with_complete_bit_accounting() {
             .to_vec(),
             RuleId::new(27, 8),
             82,
-            203,
-            26,
+            191,
+            24,
         ),
         (
             "rule update with If-Match",
@@ -526,8 +631,8 @@ fn current_management_shapes_round_trip_with_complete_bit_accounting() {
             .to_vec(),
             RuleId::new(28, 8),
             91,
-            267,
-            34,
+            255,
+            32,
         ),
     ];
     for (label, datagram, expected_rule, expected_packet, expected_bits, expected_padded) in
@@ -581,9 +686,9 @@ fn current_management_shapes_round_trip_with_complete_bit_accounting() {
             .encode(TrafficOrigin::Management, &response)
             .unwrap_or_else(|error| panic!("{label} response encode failed: {error}"));
         let (expected_packet, expected_bits, expected_padded) = match label {
-            "content" => (60, 79, 10),
-            "changed" => (52, 23, 3),
-            "error" => (58, 63, 8),
+            "content" => (60, 75, 10),
+            "changed" => (52, 19, 3),
+            "error" => (58, 59, 8),
             _ => unreachable!("known response shape"),
         };
         assert_report(
@@ -635,7 +740,7 @@ fn current_management_shapes_round_trip_with_complete_bit_accounting() {
         let encoded = device
             .encode(TrafficOrigin::Management, &response)
             .unwrap_or_else(|error| panic!("response code {code} encode failed: {error}"));
-        assert_report(encoded.report(), RuleId::new(17, 8), 52, 23, 3);
+        assert_report(encoded.report(), RuleId::new(17, 8), 52, 19, 3);
         let decoded = core
             .decode(encoded.frame().bytes())
             .unwrap_or_else(|error| panic!("response code {code} decode failed: {error}"));
@@ -699,7 +804,7 @@ fn management_mid_msb_lsb_round_trips_bounded_out_of_order_and_rejects_128() {
     let device = SchcLink::new(active("device-management-mid"), LinkRole::Device);
     let mut frames = Vec::new();
     for message_id in [127_u16, 1] {
-        let datagram = context_check_request(core.active_context().tag(), message_id, &[0xff]);
+        let datagram = context_check_request(core.active_context().tag(), message_id);
         let request = packet(
             CORE_LOGICAL_ADDRESS,
             DEVICE_LOGICAL_ADDRESS,
@@ -719,7 +824,7 @@ fn management_mid_msb_lsb_round_trips_bounded_out_of_order_and_rejects_128() {
     }
     assert_ne!(frames[0].frame().bytes(), frames[1].frame().bytes());
 
-    let datagram = context_check_request(core.active_context().tag(), 128, &[]);
+    let datagram = context_check_request(core.active_context().tag(), 128);
     let request = packet(
         CORE_LOGICAL_ADDRESS,
         DEVICE_LOGICAL_ADDRESS,
@@ -856,10 +961,13 @@ fn malformed_frames_are_rejected_and_rule_identity_includes_bit_length() {
     let management_frame = core
         .encode(TrafficOrigin::Management, &management_request)
         .expect("management request");
-    let mut extra_padding = management_frame.frame().bytes().to_vec();
-    extra_padding.push(0);
-    assert!(device.decode(&extra_padding).is_err());
-    let response = temporary_ordinary_response(&request).expect("response");
+    let mut extended_payload = management_frame.frame().bytes().to_vec();
+    extended_payload.push(0);
+    let extended = device
+        .decode(&extended_payload)
+        .expect("fl-remaining consumes the complete byte-aligned remainder");
+    assert_eq!(extended.packet().coap_message().payload(), b"\0");
+    let response = support::ordinary_response(&request).expect("response");
     let non_aligned = device
         .encode(TrafficOrigin::Application, &response)
         .expect("response");
@@ -868,11 +976,14 @@ fn malformed_frames_are_rejected_and_rule_identity_includes_bit_length() {
     *malformed.last_mut().expect("frame byte") |= 1;
     assert!(device.decode(&malformed).is_err());
 
-    let policy = ProtectionPolicy::from_rule_ids([RuleId::new(16, 8)]);
-    let context =
-        schc_core::RuleContext::from_cbor_slice(SOR, SidRegistry::from_json_str(SID).expect("SID"))
-            .expect("context");
-    let protected = schc_coreconf::ProtectedRules::derive(&context, &policy).expect("policy");
+    let context = PreparedContext::from_sor(
+        SID,
+        SOR,
+        DeviceId::new("link-check").expect("device"),
+        DeviceProfile::default(),
+    )
+    .expect("context");
+    let protected = context.protected_rules();
     assert!(protected.contains(RuleId::new(16, 8)));
     assert!(!protected.contains(RuleId::new(16, 7)));
 }
@@ -912,7 +1023,7 @@ fn raw_udp_link_delivers_only_frame_bytes_in_both_directions() {
     let reconstructed = device.decode(received.bytes()).expect("forward decode");
     assert_eq!(reconstructed.packet().as_bytes(), request.as_bytes());
 
-    let response = temporary_ordinary_response(reconstructed.packet()).expect("response");
+    let response = support::ordinary_response(reconstructed.packet()).expect("response");
     let reverse = device
         .encode(TrafficOrigin::Application, &response)
         .expect("reverse frame");
